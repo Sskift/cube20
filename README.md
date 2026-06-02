@@ -28,3 +28,8 @@ cube accounts login work-plus
 cube dashboard
 ```
 
+## Build
+
+```shell
+go build -o bin/cube ./cmd/cube
+```
