@@ -37,6 +37,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/accounts", s.handleAccounts)
 	mux.HandleFunc("/api/accounts/", s.handleAccountAction)
 	mux.HandleFunc("/api/meta", s.handleMeta)
+	mux.HandleFunc("/api/settings", s.handleSettings)
 
 	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
 	fmt.Printf("cube dashboard: http://%s\n", addr)
@@ -58,6 +59,30 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	s.writeMeta(w)
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		LiveCodexHome string `json:"liveCodexHome"`
+		AccountsDir   string `json:"accountsDir"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if _, err := s.Manager.UpdateSettings(body.LiveCodexHome, body.AccountsDir); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.writeMeta(w)
+}
+
+func (s *Server) writeMeta(w http.ResponseWriter) {
 	live := s.Manager.LiveProfileView()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"statePath":         s.Manager.StatePath,
@@ -147,6 +172,23 @@ func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 	action := parts[1]
 
 	switch action {
+	case "label":
+		if r.Method != http.MethodPatch {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var body struct {
+			Label string `json:"label"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		if err := s.Manager.SetLabel(id, body.Label); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"label": body.Label})
 	case "status":
 		if r.Method != http.MethodPatch {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -182,6 +224,10 @@ func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err := s.Manager.FetchQuota(r.Context(), id)
 		if err != nil {
+			if result.Status != "" {
+				writeJSON(w, http.StatusOK, result)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -338,7 +384,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     }
     main {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 340px;
+      grid-template-columns: minmax(0, 1fr) 380px;
       gap: 18px;
       padding: 18px 24px 24px;
     }
@@ -394,6 +440,20 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    .account-title {
+      min-width: 180px;
+    }
+    .account-main {
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 700;
+    }
+    .account-sub {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+    }
     .badge {
       display: inline-flex;
       align-items: center;
@@ -407,7 +467,9 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     .ready { color: var(--ok); border-color: #a9d6bf; background: #eef8f2; }
     .drain { color: var(--warn); border-color: #f0c978; background: #fff6df; }
     .disabled { color: var(--danger); border-color: #efa8a1; background: #fff1f0; }
-    .missing { color: var(--danger); }
+    .ok-text { color: var(--ok); font-weight: 700; }
+    .error { color: var(--danger); font-weight: 700; }
+    .quiet { color: var(--muted); }
     .quota-cell {
       display: flex;
       gap: 6px;
@@ -510,6 +572,9 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       padding: 16px;
       color: var(--muted);
     }
+    .meta-form {
+      padding-bottom: 0;
+    }
     .meta strong {
       color: var(--ink);
     }
@@ -571,6 +636,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
         </div>
         <form id="actionForm">
           <label for="selectedAccount">Account<select id="selectedAccount"></select></label>
+          <label for="nicknameInput">Nickname<input id="nicknameInput" autocomplete="off"></label>
           <div class="form-row">
             <label for="statusSelect">Status<select id="statusSelect">
               <option value="ready">ready</option>
@@ -581,7 +647,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
           </div>
           <label for="configState">Config<input id="configState" disabled></label>
           <div class="actions">
-            <button type="button" id="saveStatus">Save Status</button>
+            <button type="button" id="saveAccount">Save Account</button>
             <button type="button" id="refreshQuota">Refresh Quota</button>
             <button type="button" id="refreshUsage">Refresh Usage</button>
             <button type="button" id="deployAuth" class="danger">Deploy Profile</button>
@@ -591,25 +657,30 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       </section>
       <section class="surface">
         <div class="surface-head">
-          <h2>Local Paths</h2>
+          <h2>Settings</h2>
         </div>
+        <form id="settingsForm" class="meta-form">
+          <label for="liveCodexHome">Live Codex Home<input id="liveCodexHome" autocomplete="off"></label>
+          <label for="accountsDir">Managed Homes<input id="accountsDir" autocomplete="off"></label>
+          <button type="submit">Save Settings</button>
+        </form>
         <div class="meta">
-          <div><strong>State</strong></div>
-          <div id="metaState" class="mono"></div>
-          <div><strong>Settings</strong></div>
+          <div><strong>settings.toml</strong></div>
           <div id="metaSettings" class="mono"></div>
-          <div><strong>Live Codex</strong></div>
+          <div><strong>state.json</strong></div>
+          <div id="metaState" class="mono"></div>
           <div id="metaLive" class="mono"></div>
-          <div><strong>Homes</strong></div>
-          <div id="metaHomes" class="mono"></div>
         </div>
+        <div id="settingsMessage" class="message"></div>
       </section>
     </aside>
   </main>
   <script>
     let accounts = [];
+    let metaCache = {};
     let quotas = {};
     let usages = {};
+    let quotaRun = 0;
 
     async function request(path, options) {
       const response = await fetch(path, options);
@@ -622,15 +693,18 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
 
     async function load() {
       const meta = await request("/api/meta");
+      metaCache = meta;
       accounts = await request("/api/accounts");
       document.getElementById("metaState").textContent = meta.statePath;
       document.getElementById("metaSettings").textContent = meta.settingsPath;
-      document.getElementById("metaLive").textContent = meta.liveCodexHome + " [" + (meta.liveAuthPresent ? "auth" : "no auth") + ", " + (meta.liveConfigPresent ? "config" : "no config") + "]";
-      document.getElementById("metaHomes").textContent = meta.accountsDir;
+      document.getElementById("metaLive").textContent = "Live Codex: " + meta.liveCodexHome + " [" + (meta.liveAuthPresent ? "auth" : "no auth") + ", " + (meta.liveConfigPresent ? "config" : "no config") + "]";
+      document.getElementById("liveCodexHome").value = meta.liveCodexHome || "";
+      document.getElementById("accountsDir").value = meta.accountsDir || "";
       document.getElementById("statePath").textContent = meta.settingsPath;
       document.getElementById("summary").textContent = accounts.length + (accounts.length === 1 ? " account" : " accounts");
       renderTable();
       renderSelector();
+      autoRefreshQuotas();
     }
 
     function renderTable() {
@@ -640,28 +714,30 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
         return;
       }
       const rows = accounts.map(account => {
-        const auth = account.authPresent ? "ready" : "missing";
-        const config = account.configPresent ? "ready" : "missing";
         const quota = quotas[account.id];
         const usage = usages[account.id];
+        const plan = quota && quota.plan ? quota.plan : account.plan || "-";
         return '<tr>' +
-          '<td class="mono">' + escapeHTML(account.id) + '</td>' +
+          '<td class="account-title" title="' + escapeHTML(account.id) + '">' +
+            '<div class="account-main">' + escapeHTML(displayName(account)) + '</div>' +
+            '<div class="account-sub mono">' + escapeHTML(shortID(account.id)) + '</div>' +
+          '</td>' +
           '<td><span class="badge ' + escapeHTML(account.status) + '">' + escapeHTML(account.status) + '</span></td>' +
-          '<td class="' + auth + '">' + auth + '</td>' +
-          '<td class="' + config + '">' + config + '</td>' +
-          '<td>' + escapeHTML(account.plan || "-") + '</td>' +
+          '<td>' + fileState(account.authPresent, false) + '</td>' +
+          '<td>' + fileState(account.configPresent, true) + '</td>' +
+          '<td>' + escapeHTML(plan) + '</td>' +
           '<td>' + quotaMarkup(quota) + '</td>' +
           '<td>' + usageMarkup(usage) + '</td>' +
           '<td class="mono path" title="' + escapeHTML(account.codexHome) + '">' + escapeHTML(account.codexHome) + '</td>' +
         '</tr>';
       }).join("");
-      mount.innerHTML = '<table><thead><tr><th>ID</th><th>Status</th><th>Auth</th><th>Config</th><th>Plan</th><th>Quota</th><th>Local Usage</th><th>CODEX_HOME</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      mount.innerHTML = '<table><thead><tr><th>Nickname</th><th>Status</th><th>Auth</th><th>Config</th><th>Plan</th><th>Quota</th><th>Local Usage</th><th>CODEX_HOME</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
 
     function renderSelector() {
       const select = document.getElementById("selectedAccount");
       const previous = select.value;
-      select.innerHTML = accounts.map(account => '<option value="' + escapeHTML(account.id) + '">' + escapeHTML(account.id) + '</option>').join("");
+      select.innerHTML = accounts.map(account => '<option value="' + escapeHTML(account.id) + '">' + escapeHTML(displayName(account)) + ' (' + escapeHTML(shortID(account.id)) + ')</option>').join("");
       if (accounts.some(account => account.id === previous)) {
         select.value = previous;
       }
@@ -671,14 +747,17 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     function syncSelected() {
       const id = document.getElementById("selectedAccount").value;
       const account = accounts.find(item => item.id === id);
+      document.getElementById("nicknameInput").value = account ? (account.label || "") : "";
       document.getElementById("statusSelect").value = account ? account.status : "ready";
       document.getElementById("authState").value = account && account.authPresent ? "ready" : "missing";
-      document.getElementById("configState").value = account && account.configPresent ? "ready" : "missing";
+      document.getElementById("configState").value = account && account.configPresent ? "ready" : "optional";
     }
 
     function quotaMarkup(quota) {
-      if (!quota) return '<span class="missing">not loaded</span>';
-      if (quota.status !== "supported") return '<span class="missing">' + escapeHTML(quota.status || "error") + '</span>';
+      if (!quota) return '<span class="quiet">pending</span>';
+      if (quota.status === "loading") return '<span class="quiet">checking...</span>';
+      if (quota.status === "error") return '<span class="error" title="' + escapeHTML(quota.detail || "") + '">' + escapeHTML(quotaErrorText(quota.detail)) + '</span>';
+      if (quota.status !== "supported") return '<span class="quiet" title="' + escapeHTML(quota.detail || "") + '">' + escapeHTML(quota.status || "unavailable") + '</span>';
       if (!Array.isArray(quota.quotas) || quota.quotas.length === 0) return '<span>no quota</span>';
       return '<div class="quota-cell">' + quota.quotas.map(item => {
         const used = Number(item.usedPercent || 0);
@@ -689,11 +768,51 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     }
 
     function usageMarkup(usage) {
-      if (!usage) return '<span class="missing">not loaded</span>';
-      if (usage.status !== "ok") return '<span class="missing">' + escapeHTML(usage.status || "error") + '</span>';
+      if (!usage) return '<span class="quiet">not checked</span>';
+      if (usage.status !== "ok") return '<span class="quiet">' + escapeHTML(usage.status || "unavailable") + '</span>';
       const today = usage.today && Number(usage.today.total || 0);
       const seven = usage.sevenDays && Number(usage.sevenDays.total || 0);
       return '<div class="usage-cell"><strong>Today ' + formatTokens(today) + '</strong><span>7d ' + formatTokens(seven) + '</span></div>';
+    }
+
+    function quotaErrorText(detail) {
+      const text = String(detail || "").toLowerCase();
+      if (text.includes("unauthorized")) return "login expired";
+      if (text.includes("timeout")) return "timeout";
+      if (text.includes("auth.json")) return "auth issue";
+      return "error";
+    }
+
+    function fileState(present, optional) {
+      if (present) return '<span class="ok-text">ready</span>';
+      if (optional) return '<span class="quiet">optional</span>';
+      return '<span class="error">missing</span>';
+    }
+
+    function displayName(account) {
+      return (account && account.label && account.label.trim()) || shortID(account && account.id);
+    }
+
+    function shortID(id) {
+      const text = String(id || "");
+      if (text.length <= 12) return text;
+      return text.slice(0, 8) + "..." + text.slice(-4);
+    }
+
+    async function autoRefreshQuotas() {
+      const run = ++quotaRun;
+      for (const account of accounts) {
+        if (run !== quotaRun) return;
+        if (!account.authPresent || quotas[account.id]) continue;
+        quotas[account.id] = { status: "loading" };
+        renderTable();
+        try {
+          quotas[account.id] = await request("/api/accounts/" + encodeURIComponent(account.id) + "/quota");
+        } catch (error) {
+          quotas[account.id] = { status: "error", detail: error.message };
+        }
+        renderTable();
+      }
     }
 
     function formatTokens(value) {
@@ -720,7 +839,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     document.getElementById("importLive").addEventListener("click", async () => {
       try {
         const account = await request("/api/accounts/import-live", { method: "POST" });
-        document.getElementById("addMessage").textContent = "Imported " + account.id;
+        document.getElementById("addMessage").textContent = "Imported " + displayName(account);
         await load();
       } catch (error) {
         document.getElementById("addMessage").textContent = error.message;
@@ -740,7 +859,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
         });
         event.target.value = "";
         document.getElementById("fileName").textContent = "";
-        document.getElementById("addMessage").textContent = "Imported " + account.id;
+        document.getElementById("addMessage").textContent = "Imported " + displayName(account);
         await load();
       } catch (error) {
         event.target.value = "";
@@ -749,17 +868,23 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       }
     });
 
-    document.getElementById("saveStatus").addEventListener("click", async () => {
+    document.getElementById("saveAccount").addEventListener("click", async () => {
       const id = document.getElementById("selectedAccount").value;
       const status = document.getElementById("statusSelect").value;
+      const label = document.getElementById("nicknameInput").value.trim();
       if (!id) return;
       try {
+        await request("/api/accounts/" + encodeURIComponent(id) + "/label", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label })
+        });
         await request("/api/accounts/" + encodeURIComponent(id) + "/status", {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ status })
         });
-        document.getElementById("actionMessage").textContent = "Status updated";
+        document.getElementById("actionMessage").textContent = "Account saved";
         await load();
       } catch (error) {
         showActionError(error);
@@ -782,12 +907,36 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       const id = document.getElementById("selectedAccount").value;
       if (!id) return;
       try {
+        quotas[id] = { status: "loading" };
+        renderTable();
         const result = await request("/api/accounts/" + encodeURIComponent(id) + "/quota");
         quotas[id] = result;
         document.getElementById("actionMessage").textContent = quotaMessage(result);
         renderTable();
       } catch (error) {
+        quotas[id] = { status: "error", detail: error.message };
+        renderTable();
         showActionError(error);
+      }
+    });
+
+    document.getElementById("settingsForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      try {
+        const meta = await request("/api/settings", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            liveCodexHome: document.getElementById("liveCodexHome").value.trim(),
+            accountsDir: document.getElementById("accountsDir").value.trim()
+          })
+        });
+        metaCache = meta;
+        quotas = {};
+        document.getElementById("settingsMessage").textContent = "Settings saved";
+        await load();
+      } catch (error) {
+        document.getElementById("settingsMessage").textContent = error.message;
       }
     });
 

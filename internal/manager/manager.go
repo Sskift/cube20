@@ -155,6 +155,37 @@ func (m *Manager) Save(state State) error {
 	return os.Rename(tmpPath, m.StatePath)
 }
 
+func (m *Manager) UpdateSettings(liveCodexHome, accountsDir string) (Settings, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return Settings{}, err
+	}
+
+	settings := Settings{
+		LiveCodexHome: m.LiveCodexHome,
+		AccountsDir:   m.AccountsDir,
+	}
+	if strings.TrimSpace(liveCodexHome) != "" {
+		settings.LiveCodexHome = expandPath(liveCodexHome, home)
+	}
+	if strings.TrimSpace(accountsDir) != "" {
+		settings.AccountsDir = expandPath(accountsDir, home)
+	}
+	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
+		return Settings{}, errors.New("settings paths cannot be empty")
+	}
+
+	if err := writeSettings(m.SettingsPath, settings); err != nil {
+		return Settings{}, err
+	}
+	m.LiveCodexHome = settings.LiveCodexHome
+	m.AccountsDir = settings.AccountsDir
+	if err := m.Ensure(); err != nil {
+		return Settings{}, err
+	}
+	return settings, nil
+}
+
 func (m *Manager) AddAccount(id, label string) (Account, error) {
 	id = strings.TrimSpace(id)
 	label = strings.TrimSpace(label)
@@ -573,6 +604,22 @@ func (m *Manager) SetStatus(id string, status AccountStatus) error {
 	for i := range state.Accounts {
 		if state.Accounts[i].ID == id {
 			state.Accounts[i].Status = status
+			state.Accounts[i].UpdatedAt = time.Now()
+			return m.Save(state)
+		}
+	}
+	return fmt.Errorf("account %q not found", id)
+}
+
+func (m *Manager) SetLabel(id, label string) error {
+	label = strings.TrimSpace(label)
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	for i := range state.Accounts {
+		if state.Accounts[i].ID == id {
+			state.Accounts[i].Label = label
 			state.Accounts[i].UpdatedAt = time.Now()
 			return m.Save(state)
 		}

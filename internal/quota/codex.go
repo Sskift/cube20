@@ -135,6 +135,7 @@ func FetchForCodexHome(ctx context.Context, codexHome string, now time.Time) (Re
 	}
 
 	result.Status = StatusSupported
+	result.Detail = ""
 	result.Plan = response.PlanType
 	result.Account = accountFromIDToken(auth.Tokens.IDToken)
 	result.Source = "chatgpt.com/backend-api"
