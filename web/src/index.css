@@ -88,6 +88,24 @@
   font-size: 0.875rem;
 }
 
+.cube-navbar {
+  container-type: inline-size;
+}
+
+.cube-navbar-actions :where(button, [role="button"]) {
+  flex-shrink: 0;
+}
+
+.cube-mobile-account {
+  outline: none;
+}
+
+.cube-mobile-account:focus-visible {
+  box-shadow:
+    0 0 0 2px #ffffff,
+    0 0 0 4px #0f172a;
+}
+
 .app-layout__body,
 .app-layout__main,
 .app-layout__aside,
@@ -258,6 +276,10 @@ textarea {
     --cube-grid-row-min-height: 88px;
   }
 
+  .cube-content {
+    gap: 0.75rem;
+  }
+
   .account-grid [role="columnheader"],
   .account-grid [role="cell"] {
     padding-inline: 0.625rem;
@@ -278,6 +300,25 @@ textarea {
 
   .path-text {
     line-height: 1.5;
+  }
+}
+
+@media (max-width: 559px) {
+  .cube-navbar {
+    min-height: 3.75rem;
+  }
+
+  .cube-navbar-actions {
+    gap: 0.375rem;
+  }
+
+  .cube-navbar-actions :where(button, [role="button"]) {
+    min-width: 2rem;
+    padding-inline: 0.625rem;
+  }
+
+  .cube-mobile-account {
+    padding: 0.75rem;
   }
 }
 
@@ -343,5 +384,9 @@ textarea {
 
   [data-slot="progress"] {
     min-width: 6rem;
+  }
+
+  .cube-mobile-account [data-slot="progress"] {
+    min-width: 0;
   }
 }
