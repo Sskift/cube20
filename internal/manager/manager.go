@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,12 +13,16 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"cube20/internal/quota"
+	"cube20/internal/usage"
 )
 
 const (
 	defaultStateDirName    = ".cube20"
 	defaultAccountsDirName = ".codex-accounts"
 	authFileName           = "auth.json"
+	configFileName         = "config.toml"
 )
 
 var accountIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
@@ -43,9 +48,12 @@ type Account struct {
 
 type AccountView struct {
 	Account
-	AuthPresent bool      `json:"authPresent"`
-	AuthPath    string    `json:"authPath"`
-	AuthUpdated time.Time `json:"authUpdated,omitempty"`
+	AuthPresent   bool      `json:"authPresent"`
+	AuthPath      string    `json:"authPath"`
+	AuthUpdated   time.Time `json:"authUpdated,omitempty"`
+	ConfigPresent bool      `json:"configPresent"`
+	ConfigPath    string    `json:"configPath"`
+	ConfigUpdated time.Time `json:"configUpdated,omitempty"`
 }
 
 type State struct {
@@ -159,6 +167,38 @@ func (m *Manager) AddAccount(id, label string) (Account, error) {
 	return account, nil
 }
 
+func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account, error) {
+	account, err := m.AddAccount(id, label)
+	if err != nil {
+		return Account{}, err
+	}
+	if strings.TrimSpace(sourceCodexHome) == "" {
+		sourceCodexHome, err = defaultCodexHome()
+		if err != nil {
+			return Account{}, err
+		}
+	}
+
+	copied := false
+	for _, fileName := range []string{authFileName, configFileName} {
+		source := filepath.Join(sourceCodexHome, fileName)
+		target := filepath.Join(account.CodexHome, fileName)
+		if _, err := os.Stat(source); err == nil {
+			if err := copyFile(source, target, fileModeFor(fileName)); err != nil {
+				return Account{}, err
+			}
+			copied = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return Account{}, err
+		}
+	}
+
+	if !copied {
+		return Account{}, fmt.Errorf("no auth.json or config.toml found in %s", sourceCodexHome)
+	}
+	return account, nil
+}
+
 func (m *Manager) ListAccounts() ([]AccountView, error) {
 	state, err := m.Load()
 	if err != nil {
@@ -246,49 +286,87 @@ func (m *Manager) CodexCommand(id string, args []string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-func (m *Manager) DeployAuth(id, targetCodexHome string) (string, error) {
+func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, error) {
 	account, err := m.GetAccount(id)
 	if err != nil {
-		return "", err
+		return quota.Result{}, err
 	}
-	source := filepath.Join(account.CodexHome, authFileName)
-	if _, err := os.Stat(source); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("account %q has no auth.json yet", id)
-		}
-		return "", err
+	return quota.FetchForCodexHome(ctx, account.CodexHome, time.Now())
+}
+
+func (m *Manager) FetchUsage(id string) (usage.Summary, error) {
+	account, err := m.GetAccount(id)
+	if err != nil {
+		return usage.Summary{}, err
+	}
+	return usage.SummarizeCodexHome(account.CodexHome, time.Now()), nil
+}
+
+func (m *Manager) DeployProfile(id, targetCodexHome string) ([]string, error) {
+	account, err := m.GetAccount(id)
+	if err != nil {
+		return nil, err
 	}
 
 	if strings.TrimSpace(targetCodexHome) == "" {
-		home, err := os.UserHomeDir()
+		targetCodexHome, err = defaultCodexHome()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		targetCodexHome = filepath.Join(home, ".codex")
 	}
 	if err := os.MkdirAll(targetCodexHome, 0o700); err != nil {
-		return "", err
+		return nil, err
 	}
 
-	target := filepath.Join(targetCodexHome, authFileName)
-	if _, err := os.Stat(target); err == nil {
-		backup := target + ".backup-" + time.Now().Format("20060102-150405")
-		if err := copyFile(target, backup, 0o600); err != nil {
-			return "", fmt.Errorf("backup existing auth: %w", err)
+	written := []string{}
+	missing := []string{}
+	for _, fileName := range []string{authFileName, configFileName} {
+		source := filepath.Join(account.CodexHome, fileName)
+		if _, err := os.Stat(source); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				missing = append(missing, fileName)
+				continue
+			}
+			return nil, err
 		}
+
+		target := filepath.Join(targetCodexHome, fileName)
+		if _, err := os.Stat(target); err == nil {
+			backup := target + ".backup-" + time.Now().Format("20060102-150405")
+			if err := copyFile(target, backup, fileModeFor(fileName)); err != nil {
+				return nil, fmt.Errorf("backup existing %s: %w", fileName, err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+
+		if err := copyFile(source, target, fileModeFor(fileName)); err != nil {
+			return nil, err
+		}
+		written = append(written, target)
 	}
 
-	if err := copyFile(source, target, 0o600); err != nil {
+	if len(written) == 0 {
+		return nil, fmt.Errorf("account %q has no managed files; missing %s", id, strings.Join(missing, ", "))
+	}
+	return written, nil
+}
+
+func (m *Manager) DeployAuth(id, targetCodexHome string) (string, error) {
+	written, err := m.DeployProfile(id, targetCodexHome)
+	if err != nil {
 		return "", err
 	}
-	return target, nil
+	return strings.Join(written, ", "), nil
 }
 
 func (m *Manager) accountView(account Account) AccountView {
 	authPath := filepath.Join(account.CodexHome, authFileName)
+	configPath := filepath.Join(account.CodexHome, configFileName)
 	view := AccountView{
-		Account:  account,
-		AuthPath: authPath,
+		Account:    account,
+		AuthPath:   authPath,
+		ConfigPath: configPath,
 	}
 
 	info, err := os.Stat(authPath)
@@ -296,7 +374,27 @@ func (m *Manager) accountView(account Account) AccountView {
 		view.AuthPresent = true
 		view.AuthUpdated = info.ModTime()
 	}
+	info, err = os.Stat(configPath)
+	if err == nil {
+		view.ConfigPresent = true
+		view.ConfigUpdated = info.ModTime()
+	}
 	return view
+}
+
+func defaultCodexHome() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".codex"), nil
+}
+
+func fileModeFor(fileName string) os.FileMode {
+	if fileName == authFileName {
+		return 0o600
+	}
+	return 0o600
 }
 
 func copyFile(source, target string, mode os.FileMode) error {

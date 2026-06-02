@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -31,8 +32,11 @@ func (a *App) Run() error {
 		fmt.Println()
 		fmt.Println("Actions")
 		fmt.Println("  a  add account")
+		fmt.Println("  i  import current ~/.codex profile")
 		fmt.Println("  l  login account with Codex device auth")
-		fmt.Println("  d  deploy account auth.json to ~/.codex/auth.json")
+		fmt.Println("  d  deploy account profile to ~/.codex")
+		fmt.Println("  o  refresh subscription quota")
+		fmt.Println("  u  summarize local token usage")
 		fmt.Println("  r  run Codex using an account CODEX_HOME")
 		fmt.Println("  s  set account status")
 		fmt.Println("  q  quit")
@@ -44,12 +48,24 @@ func (a *App) Run() error {
 			if err := a.addAccount(); err != nil {
 				a.pause(err.Error())
 			}
+		case "i":
+			if err := a.importProfile(); err != nil {
+				a.pause(err.Error())
+			}
 		case "l":
 			if err := a.loginAccount(); err != nil {
 				a.pause(err.Error())
 			}
 		case "d":
 			if err := a.deployAuth(); err != nil {
+				a.pause(err.Error())
+			}
+		case "o":
+			if err := a.showQuota(); err != nil {
+				a.pause(err.Error())
+			}
+		case "u":
+			if err := a.showUsage(); err != nil {
 				a.pause(err.Error())
 			}
 		case "r":
@@ -85,18 +101,22 @@ func (a *App) renderAccounts() error {
 		return nil
 	}
 
-	fmt.Printf("%-18s %-10s %-8s %-6s %s\n", "ID", "STATUS", "AUTH", "PLAN", "CODEX_HOME")
+	fmt.Printf("%-18s %-10s %-8s %-8s %-6s %s\n", "ID", "STATUS", "AUTH", "CONFIG", "PLAN", "CODEX_HOME")
 	fmt.Println(strings.Repeat("-", 86))
 	for _, account := range accounts {
 		auth := "missing"
 		if account.AuthPresent {
 			auth = "ready"
 		}
+		config := "missing"
+		if account.ConfigPresent {
+			config = "ready"
+		}
 		plan := account.Plan
 		if plan == "" {
 			plan = "-"
 		}
-		fmt.Printf("%-18s %-10s %-8s %-6s %s\n", account.ID, account.Status, auth, plan, account.CodexHome)
+		fmt.Printf("%-18s %-10s %-8s %-8s %-6s %s\n", account.ID, account.Status, auth, config, plan, account.CodexHome)
 	}
 	return nil
 }
@@ -109,6 +129,17 @@ func (a *App) addAccount() error {
 		return err
 	}
 	a.pause(fmt.Sprintf("added %s at %s", account.ID, account.CodexHome))
+	return nil
+}
+
+func (a *App) importProfile() error {
+	id := a.prompt("Account id")
+	label := a.prompt("Label (optional)")
+	account, err := a.Manager.ImportLiveProfile(id, label, "")
+	if err != nil {
+		return err
+	}
+	a.pause(fmt.Sprintf("imported current ~/.codex into %s at %s", account.ID, account.CodexHome))
 	return nil
 }
 
@@ -133,7 +164,45 @@ func (a *App) deployAuth() error {
 	if err != nil {
 		return err
 	}
-	a.pause(fmt.Sprintf("deployed auth to %s", target))
+	a.pause(fmt.Sprintf("deployed profile files to %s", target))
+	return nil
+}
+
+func (a *App) showQuota() error {
+	id := a.prompt("Account id")
+	result, err := a.Manager.FetchQuota(context.Background(), id)
+	if err != nil {
+		return err
+	}
+	lines := []string{fmt.Sprintf("quota status: %s", result.Status)}
+	if result.Plan != "" {
+		lines = append(lines, fmt.Sprintf("plan: %s", result.Plan))
+	}
+	if result.Detail != "" {
+		lines = append(lines, fmt.Sprintf("detail: %s", result.Detail))
+	}
+	for _, quota := range result.Quotas {
+		lines = append(lines, fmt.Sprintf("%s used=%s remaining=%s", quota.Label, quota.UsedDisplay, quota.RemainingDisplay))
+	}
+	a.pause(strings.Join(lines, "\n"))
+	return nil
+}
+
+func (a *App) showUsage() error {
+	id := a.prompt("Account id")
+	result, err := a.Manager.FetchUsage(id)
+	if err != nil {
+		return err
+	}
+	a.pause(fmt.Sprintf(
+		"usage status: %s\nfiles: %d events: %d\ntoday: %d tokens\n7d: %d tokens\nall: %d tokens",
+		result.Status,
+		result.FilesScanned,
+		result.Events,
+		result.Today.Total,
+		result.SevenDays.Total,
+		result.AllTime.Total,
+	))
 	return nil
 }
 

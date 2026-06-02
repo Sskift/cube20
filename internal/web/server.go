@@ -129,6 +129,28 @@ func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"target": target})
+	case "quota":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		result, err := s.Manager.FetchQuota(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	case "usage":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		result, err := s.Manager.FetchUsage(id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	default:
 		http.NotFound(w, r)
 	}
@@ -302,6 +324,33 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     .drain { color: var(--warn); border-color: #f0c978; background: #fff6df; }
     .disabled { color: var(--danger); border-color: #efa8a1; background: #fff1f0; }
     .missing { color: var(--danger); }
+    .quota-cell {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      min-width: 160px;
+    }
+    .quota-pill {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      min-height: 24px;
+      padding: 2px 7px;
+      font-size: 12px;
+      font-weight: 700;
+      background: #fff;
+    }
+    .quota-warn { color: var(--warn); border-color: #f0c978; background: #fff6df; }
+    .quota-crit { color: var(--danger); border-color: #efa8a1; background: #fff1f0; }
+    .usage-cell {
+      display: grid;
+      gap: 2px;
+      color: var(--muted);
+      min-width: 132px;
+    }
+    .usage-cell strong {
+      color: var(--ink);
+      font-weight: 700;
+    }
     .side {
       display: grid;
       gap: 18px;
@@ -403,9 +452,12 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
             </select></label>
             <label for="authState">Auth<input id="authState" disabled></label>
           </div>
+          <label for="configState">Config<input id="configState" disabled></label>
           <div class="actions">
             <button type="button" id="saveStatus">Save Status</button>
-            <button type="button" id="deployAuth" class="danger">Deploy Auth</button>
+            <button type="button" id="refreshQuota">Refresh Quota</button>
+            <button type="button" id="refreshUsage">Refresh Usage</button>
+            <button type="button" id="deployAuth" class="danger">Deploy Profile</button>
           </div>
         </form>
         <div id="actionMessage" class="message"></div>
@@ -425,6 +477,8 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
   </main>
   <script>
     let accounts = [];
+    let quotas = {};
+    let usages = {};
 
     async function request(path, options) {
       const response = await fetch(path, options);
@@ -454,15 +508,21 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       }
       const rows = accounts.map(account => {
         const auth = account.authPresent ? "ready" : "missing";
+        const config = account.configPresent ? "ready" : "missing";
+        const quota = quotas[account.id];
+        const usage = usages[account.id];
         return '<tr>' +
           '<td class="mono">' + escapeHTML(account.id) + '</td>' +
           '<td><span class="badge ' + escapeHTML(account.status) + '">' + escapeHTML(account.status) + '</span></td>' +
           '<td class="' + auth + '">' + auth + '</td>' +
+          '<td class="' + config + '">' + config + '</td>' +
           '<td>' + escapeHTML(account.plan || "-") + '</td>' +
+          '<td>' + quotaMarkup(quota) + '</td>' +
+          '<td>' + usageMarkup(usage) + '</td>' +
           '<td class="mono path" title="' + escapeHTML(account.codexHome) + '">' + escapeHTML(account.codexHome) + '</td>' +
         '</tr>';
       }).join("");
-      mount.innerHTML = '<table><thead><tr><th>ID</th><th>Status</th><th>Auth</th><th>Plan</th><th>CODEX_HOME</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      mount.innerHTML = '<table><thead><tr><th>ID</th><th>Status</th><th>Auth</th><th>Config</th><th>Plan</th><th>Quota</th><th>Local Usage</th><th>CODEX_HOME</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
 
     function renderSelector() {
@@ -480,6 +540,35 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       const account = accounts.find(item => item.id === id);
       document.getElementById("statusSelect").value = account ? account.status : "ready";
       document.getElementById("authState").value = account && account.authPresent ? "ready" : "missing";
+      document.getElementById("configState").value = account && account.configPresent ? "ready" : "missing";
+    }
+
+    function quotaMarkup(quota) {
+      if (!quota) return '<span class="missing">not loaded</span>';
+      if (quota.status !== "supported") return '<span class="missing">' + escapeHTML(quota.status || "error") + '</span>';
+      if (!Array.isArray(quota.quotas) || quota.quotas.length === 0) return '<span>no quota</span>';
+      return '<div class="quota-cell">' + quota.quotas.map(item => {
+        const used = Number(item.usedPercent || 0);
+        const sev = used >= 90 ? ' quota-crit' : used >= 75 ? ' quota-warn' : '';
+        const reset = item.resetsAt ? ' title="resets ' + escapeHTML(item.resetsAt) + '"' : '';
+        return '<span class="quota-pill' + sev + '"' + reset + '>' + escapeHTML(item.label) + ' ' + escapeHTML(item.usedDisplay || Math.round(used) + "%") + '</span>';
+      }).join("") + '</div>';
+    }
+
+    function usageMarkup(usage) {
+      if (!usage) return '<span class="missing">not loaded</span>';
+      if (usage.status !== "ok") return '<span class="missing">' + escapeHTML(usage.status || "error") + '</span>';
+      const today = usage.today && Number(usage.today.total || 0);
+      const seven = usage.sevenDays && Number(usage.sevenDays.total || 0);
+      return '<div class="usage-cell"><strong>Today ' + formatTokens(today) + '</strong><span>7d ' + formatTokens(seven) + '</span></div>';
+    }
+
+    function formatTokens(value) {
+      const n = Number(value || 0);
+      if (n >= 1000000000) return (n / 1000000000).toFixed(1) + 'B';
+      if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+      if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+      return String(Math.round(n));
     }
 
     function escapeHTML(value) {
@@ -542,6 +631,43 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
         showActionError(error);
       }
     });
+
+    document.getElementById("refreshQuota").addEventListener("click", async () => {
+      const id = document.getElementById("selectedAccount").value;
+      if (!id) return;
+      try {
+        const result = await request("/api/accounts/" + encodeURIComponent(id) + "/quota");
+        quotas[id] = result;
+        document.getElementById("actionMessage").textContent = quotaMessage(result);
+        renderTable();
+      } catch (error) {
+        showActionError(error);
+      }
+    });
+
+    document.getElementById("refreshUsage").addEventListener("click", async () => {
+      const id = document.getElementById("selectedAccount").value;
+      if (!id) return;
+      try {
+        const result = await request("/api/accounts/" + encodeURIComponent(id) + "/usage");
+        usages[id] = result;
+        document.getElementById("actionMessage").textContent = usageMessage(result);
+        renderTable();
+      } catch (error) {
+        showActionError(error);
+      }
+    });
+
+    function quotaMessage(result) {
+      if (!result || result.status !== "supported") return result && result.detail ? result.detail : "Quota unavailable";
+      const parts = (result.quotas || []).map(q => q.label + " " + (q.usedDisplay || Math.round(q.usedPercent || 0) + "%"));
+      return "Quota refreshed" + (result.plan ? " (" + result.plan + ")" : "") + ": " + parts.join(", ");
+    }
+
+    function usageMessage(result) {
+      if (!result) return "Usage unavailable";
+      return "Usage refreshed: today " + formatTokens(result.today && result.today.total) + ", 7d " + formatTokens(result.sevenDays && result.sevenDays.total);
+    }
 
     function showActionError(error) {
       document.getElementById("actionMessage").textContent = error.message;
