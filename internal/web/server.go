@@ -33,6 +33,7 @@ func (s *Server) ListenAndServe() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/accounts/import-json", s.handleImportJSON)
+	mux.HandleFunc("/api/accounts/import-live", s.handleImportLive)
 	mux.HandleFunc("/api/accounts", s.handleAccounts)
 	mux.HandleFunc("/api/accounts/", s.handleAccountAction)
 	mux.HandleFunc("/api/meta", s.handleMeta)
@@ -57,9 +58,14 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"statePath":   s.Manager.StatePath,
-		"accountsDir": s.Manager.AccountsDir,
+	live := s.Manager.LiveProfileView()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"statePath":         s.Manager.StatePath,
+		"settingsPath":      s.Manager.SettingsPath,
+		"accountsDir":       s.Manager.AccountsDir,
+		"liveCodexHome":     s.Manager.LiveCodexHome,
+		"liveAuthPresent":   live.AuthPresent,
+		"liveConfigPresent": live.ConfigPresent,
 	})
 }
 
@@ -110,6 +116,19 @@ func (s *Server) handleImportJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	account, err := s.Manager.ImportJSONProfile(profile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, s.ManagerAccountView(account))
+}
+
+func (s *Server) handleImportLive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	account, err := s.Manager.ImportLiveProfile("", "", "")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -438,6 +457,43 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       grid-template-columns: 1fr 1fr;
       gap: 10px;
     }
+    .import-panel {
+      display: grid;
+      gap: 10px;
+      padding: 16px;
+    }
+    .file-picker {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      text-transform: none;
+    }
+    .file-picker:hover { border-color: var(--accent); }
+    .file-picker input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .file-name {
+      min-height: 18px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .actions {
       display: flex;
       gap: 8px;
@@ -453,6 +509,9 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       gap: 8px;
       padding: 16px;
       color: var(--muted);
+    }
+    .meta strong {
+      color: var(--ink);
     }
     .empty {
       padding: 28px 16px;
@@ -494,14 +553,16 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     <aside class="side">
       <section class="surface">
         <div class="surface-head">
-          <h2>Add Account</h2>
+          <h2>Import</h2>
         </div>
-        <form id="addForm">
-          <label for="accountId">ID<input id="accountId" autocomplete="off" placeholder="work-plus"></label>
-          <label for="accountLabel">Label<input id="accountLabel" autocomplete="off" placeholder="Plus seat"></label>
-          <button class="primary" type="submit">Add</button>
-          <label for="profileJson">Import JSON<input id="profileJson" type="file" accept=".json,application/json"></label>
-        </form>
+        <div class="import-panel">
+          <button class="primary" type="button" id="importLive">Import Current Codex</button>
+          <label class="file-picker" for="profileJson">
+            <span>Upload auth.json</span>
+            <input id="profileJson" type="file" accept=".json,application/json">
+          </label>
+          <div id="fileName" class="file-name"></div>
+        </div>
         <div id="addMessage" class="message"></div>
       </section>
       <section class="surface">
@@ -535,6 +596,10 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
         <div class="meta">
           <div><strong>State</strong></div>
           <div id="metaState" class="mono"></div>
+          <div><strong>Settings</strong></div>
+          <div id="metaSettings" class="mono"></div>
+          <div><strong>Live Codex</strong></div>
+          <div id="metaLive" class="mono"></div>
           <div><strong>Homes</strong></div>
           <div id="metaHomes" class="mono"></div>
         </div>
@@ -559,8 +624,10 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
       const meta = await request("/api/meta");
       accounts = await request("/api/accounts");
       document.getElementById("metaState").textContent = meta.statePath;
+      document.getElementById("metaSettings").textContent = meta.settingsPath;
+      document.getElementById("metaLive").textContent = meta.liveCodexHome + " [" + (meta.liveAuthPresent ? "auth" : "no auth") + ", " + (meta.liveConfigPresent ? "config" : "no config") + "]";
       document.getElementById("metaHomes").textContent = meta.accountsDir;
-      document.getElementById("statePath").textContent = meta.statePath;
+      document.getElementById("statePath").textContent = meta.settingsPath;
       document.getElementById("summary").textContent = accounts.length + (accounts.length === 1 ? " account" : " accounts");
       renderTable();
       renderSelector();
@@ -650,19 +717,10 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     document.getElementById("refresh").addEventListener("click", () => load().catch(showActionError));
     document.getElementById("selectedAccount").addEventListener("change", syncSelected);
 
-    document.getElementById("addForm").addEventListener("submit", async event => {
-      event.preventDefault();
-      const id = document.getElementById("accountId").value.trim();
-      const label = document.getElementById("accountLabel").value.trim();
+    document.getElementById("importLive").addEventListener("click", async () => {
       try {
-        await request("/api/accounts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id, label })
-        });
-        document.getElementById("accountId").value = "";
-        document.getElementById("accountLabel").value = "";
-        document.getElementById("addMessage").textContent = "Account added";
+        const account = await request("/api/accounts/import-live", { method: "POST" });
+        document.getElementById("addMessage").textContent = "Imported " + account.id;
         await load();
       } catch (error) {
         document.getElementById("addMessage").textContent = error.message;
@@ -672,6 +730,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
     document.getElementById("profileJson").addEventListener("change", async event => {
       const file = event.target.files && event.target.files[0];
       if (!file) return;
+      document.getElementById("fileName").textContent = file.name;
       try {
         const text = await file.text();
         const account = await request("/api/accounts/import-json", {
@@ -680,10 +739,12 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
           body: text
         });
         event.target.value = "";
+        document.getElementById("fileName").textContent = "";
         document.getElementById("addMessage").textContent = "Imported " + account.id;
         await load();
       } catch (error) {
         event.target.value = "";
+        document.getElementById("fileName").textContent = "";
         document.getElementById("addMessage").textContent = error.message;
       }
     });

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 const (
 	defaultStateDirName    = ".cube20"
 	defaultAccountsDirName = ".codex-accounts"
+	settingsFileName       = "settings.toml"
 	authFileName           = "auth.json"
 	configFileName         = "config.toml"
 )
@@ -62,6 +64,11 @@ type State struct {
 	Accounts []Account `json:"accounts"`
 }
 
+type Settings struct {
+	LiveCodexHome string `json:"liveCodexHome"`
+	AccountsDir   string `json:"accountsDir"`
+}
+
 type JSONProfile struct {
 	ID     string          `json:"id"`
 	Label  string          `json:"label"`
@@ -70,9 +77,11 @@ type JSONProfile struct {
 }
 
 type Manager struct {
-	StateDir    string
-	StatePath   string
-	AccountsDir string
+	StateDir      string
+	StatePath     string
+	SettingsPath  string
+	AccountsDir   string
+	LiveCodexHome string
 }
 
 func New() (*Manager, error) {
@@ -82,12 +91,21 @@ func New() (*Manager, error) {
 	}
 
 	stateDir := filepath.Join(home, defaultStateDirName)
-	accountsDir := filepath.Join(home, defaultAccountsDirName)
+	settingsPath := filepath.Join(stateDir, settingsFileName)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return nil, err
+	}
+	settings, err := loadSettings(settingsPath, defaultSettings(home), home)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Manager{
-		StateDir:    stateDir,
-		StatePath:   filepath.Join(stateDir, "state.json"),
-		AccountsDir: accountsDir,
+		StateDir:      stateDir,
+		StatePath:     filepath.Join(stateDir, "state.json"),
+		SettingsPath:  settingsPath,
+		AccountsDir:   settings.AccountsDir,
+		LiveCodexHome: settings.LiveCodexHome,
 	}, nil
 }
 
@@ -176,9 +194,9 @@ func (m *Manager) AddAccount(id, label string) (Account, error) {
 }
 
 func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account, error) {
-	account, err := m.AddAccount(id, label)
-	if err != nil {
-		return Account{}, err
+	var err error
+	if strings.TrimSpace(sourceCodexHome) == "" {
+		sourceCodexHome = m.LiveCodexHome
 	}
 	if strings.TrimSpace(sourceCodexHome) == "" {
 		sourceCodexHome, err = defaultCodexHome()
@@ -187,22 +205,41 @@ func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account,
 		}
 	}
 
-	copied := false
+	filesToCopy := []string{}
 	for _, fileName := range []string{authFileName, configFileName} {
 		source := filepath.Join(sourceCodexHome, fileName)
-		target := filepath.Join(account.CodexHome, fileName)
 		if _, err := os.Stat(source); err == nil {
-			if err := copyFile(source, target, fileModeFor(fileName)); err != nil {
-				return Account{}, err
-			}
-			copied = true
+			filesToCopy = append(filesToCopy, fileName)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return Account{}, err
 		}
 	}
 
-	if !copied {
+	if len(filesToCopy) == 0 {
 		return Account{}, fmt.Errorf("no auth.json or config.toml found in %s", sourceCodexHome)
+	}
+
+	auth := readAuthMetadata(filepath.Join(sourceCodexHome, authFileName))
+	if strings.TrimSpace(id) == "" {
+		id = m.uniqueAccountID(deriveIDFromAuth(auth, label))
+	}
+	if strings.TrimSpace(label) == "" {
+		label = deriveLabelFromAuth(auth)
+		if strings.TrimSpace(label) == "" {
+			label = filepath.Base(filepath.Clean(sourceCodexHome))
+		}
+	}
+
+	account, err := m.AddAccount(id, label)
+	if err != nil {
+		return Account{}, err
+	}
+	for _, fileName := range filesToCopy {
+		source := filepath.Join(sourceCodexHome, fileName)
+		target := filepath.Join(account.CodexHome, fileName)
+		if err := copyFile(source, target, fileModeFor(fileName)); err != nil {
+			return Account{}, err
+		}
 	}
 	return account, nil
 }
@@ -252,6 +289,14 @@ func (m *Manager) ListAccounts() ([]AccountView, error) {
 	if err != nil {
 		return nil, err
 	}
+	if nextState, changed, err := m.syncManagedAccounts(state); err != nil {
+		return nil, err
+	} else if changed {
+		state = nextState
+		if err := m.Save(state); err != nil {
+			return nil, err
+		}
+	}
 
 	views := make([]AccountView, 0, len(state.Accounts))
 	for _, account := range state.Accounts {
@@ -261,6 +306,74 @@ func (m *Manager) ListAccounts() ([]AccountView, error) {
 		return views[i].ID < views[j].ID
 	})
 	return views, nil
+}
+
+func (m *Manager) LiveProfileView() AccountView {
+	return m.accountView(Account{
+		ID:        "current-codex",
+		Label:     "Current Codex",
+		Status:    StatusReady,
+		CodexHome: m.LiveCodexHome,
+	})
+}
+
+func (m *Manager) syncManagedAccounts(state State) (State, bool, error) {
+	entries, err := os.ReadDir(m.AccountsDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return state, false, nil
+	}
+	if err != nil {
+		return state, false, err
+	}
+
+	used := map[string]bool{}
+	knownPaths := map[string]bool{}
+	for _, account := range state.Accounts {
+		used[account.ID] = true
+		knownPaths[filepath.Clean(account.CodexHome)] = true
+	}
+
+	changed := false
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		codexHome := filepath.Join(m.AccountsDir, entry.Name())
+		if knownPaths[filepath.Clean(codexHome)] || !hasManagedFiles(codexHome) {
+			continue
+		}
+		id := sanitizeAccountID(entry.Name())
+		if id == "" || used[id] {
+			id = uniqueFromUsed("profile-"+entry.Name(), used)
+		}
+		auth := readAuthMetadata(filepath.Join(codexHome, authFileName))
+		label := deriveLabelFromAuth(auth)
+		if label == "" {
+			label = entry.Name()
+		}
+		now := time.Now()
+		state.Accounts = append(state.Accounts, Account{
+			ID:        id,
+			Label:     label,
+			Status:    StatusReady,
+			CodexHome: codexHome,
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+		used[id] = true
+		knownPaths[filepath.Clean(codexHome)] = true
+		changed = true
+	}
+	return state, changed, nil
+}
+
+func hasManagedFiles(codexHome string) bool {
+	for _, fileName := range []string{authFileName, configFileName} {
+		if _, err := os.Stat(filepath.Join(codexHome, fileName)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) uniqueAccountID(base string) string {
@@ -284,6 +397,28 @@ func (m *Manager) uniqueAccountID(base string) string {
 		if len(candidate) > 64 {
 			candidate = fmt.Sprintf("%s-%d", base[:64-len(fmt.Sprintf("-%d", i))], i)
 		}
+		if !used[candidate] {
+			return candidate
+		}
+	}
+	return "profile-" + time.Now().Format("20060102-150405")
+}
+
+func uniqueFromUsed(base string, used map[string]bool) string {
+	base = sanitizeAccountID(base)
+	if base == "" {
+		base = "profile"
+	}
+	if !used[base] {
+		return base
+	}
+	for i := 2; i < 1000; i++ {
+		suffix := fmt.Sprintf("-%d", i)
+		candidate := base
+		if len(candidate)+len(suffix) > 64 {
+			candidate = candidate[:64-len(suffix)]
+		}
+		candidate += suffix
 		if !used[candidate] {
 			return candidate
 		}
@@ -385,6 +520,18 @@ func claimsFromIDToken(idToken string) map[string]any {
 		return map[string]any{}
 	}
 	return claims
+}
+
+func readAuthMetadata(path string) map[string]any {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]any{}
+	}
+	var auth map[string]any
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return map[string]any{}
+	}
+	return auth
 }
 
 func prettyJSON(raw json.RawMessage) []byte {
@@ -493,6 +640,9 @@ func (m *Manager) DeployProfile(id, targetCodexHome string) ([]string, error) {
 	}
 
 	if strings.TrimSpace(targetCodexHome) == "" {
+		targetCodexHome = m.LiveCodexHome
+	}
+	if strings.TrimSpace(targetCodexHome) == "" {
 		targetCodexHome, err = defaultCodexHome()
 		if err != nil {
 			return nil, err
@@ -571,7 +721,124 @@ func defaultCodexHome() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if value := strings.TrimSpace(os.Getenv("CODEX_HOME")); value != "" {
+		return expandPath(value, home), nil
+	}
 	return filepath.Join(home, ".codex"), nil
+}
+
+func defaultSettings(home string) Settings {
+	liveCodexHome := filepath.Join(home, ".codex")
+	if value := strings.TrimSpace(os.Getenv("CODEX_HOME")); value != "" {
+		liveCodexHome = expandPath(value, home)
+	}
+	return Settings{
+		LiveCodexHome: liveCodexHome,
+		AccountsDir:   filepath.Join(home, defaultAccountsDirName),
+	}
+}
+
+func loadSettings(path string, defaults Settings, home string) (Settings, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := writeSettings(path, defaults); err != nil {
+			return Settings{}, err
+		}
+		return defaults, nil
+	}
+	if err != nil {
+		return Settings{}, err
+	}
+
+	settings := defaults
+	for lineNo, line := range strings.Split(string(data), "\n") {
+		line = stripTomlComment(line)
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value, err := parseTomlString(parts[1])
+		if err != nil {
+			return Settings{}, fmt.Errorf("%s:%d: %w", path, lineNo+1, err)
+		}
+		switch key {
+		case "live_codex_home":
+			if strings.TrimSpace(value) != "" {
+				settings.LiveCodexHome = expandPath(value, home)
+			}
+		case "accounts_dir":
+			if strings.TrimSpace(value) != "" {
+				settings.AccountsDir = expandPath(value, home)
+			}
+		}
+	}
+	return settings, nil
+}
+
+func writeSettings(path string, settings Settings) error {
+	data := fmt.Sprintf(`# cube20 local settings
+# Codex itself uses CODEX_HOME, auth.json, config.toml, and sessions/.
+live_codex_home = %s
+accounts_dir = %s
+`, strconv.Quote(settings.LiveCodexHome), strconv.Quote(settings.AccountsDir))
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(data), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func parseTomlString(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(value, `"`) {
+		out, err := strconv.Unquote(value)
+		if err != nil {
+			return "", fmt.Errorf("invalid TOML string: %w", err)
+		}
+		return strings.TrimSpace(out), nil
+	}
+	return strings.Trim(strings.TrimSpace(value), `"`), nil
+}
+
+func stripTomlComment(line string) string {
+	inString := false
+	escaped := false
+	for i, ch := range line {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if ch == '#' && !inString {
+			return strings.TrimSpace(line[:i])
+		}
+	}
+	return strings.TrimSpace(line)
+}
+
+func expandPath(value, home string) string {
+	value = strings.TrimSpace(value)
+	if value == "~" {
+		return home
+	}
+	if strings.HasPrefix(value, "~/") {
+		return filepath.Join(home, value[2:])
+	}
+	return filepath.Clean(value)
 }
 
 func fileModeFor(fileName string) os.FileMode {

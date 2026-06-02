@@ -32,9 +32,9 @@ func (a *App) Run() error {
 		fmt.Println()
 		fmt.Println("Actions")
 		fmt.Println("  a  add account")
-		fmt.Println("  i  import current ~/.codex profile")
+		fmt.Println("  i  import current Codex profile")
 		fmt.Println("  l  login account with Codex device auth")
-		fmt.Println("  d  deploy account profile to ~/.codex")
+		fmt.Println("  d  deploy account profile to live Codex")
 		fmt.Println("  o  refresh subscription quota")
 		fmt.Println("  u  summarize local token usage")
 		fmt.Println("  r  run Codex using an account CODEX_HOME")
@@ -93,6 +93,8 @@ func (a *App) renderAccounts() error {
 	fmt.Println("cube20 account pool")
 	fmt.Println("===================")
 	fmt.Printf("state: %s\n", a.Manager.StatePath)
+	fmt.Printf("settings: %s\n", a.Manager.SettingsPath)
+	fmt.Printf("live: %s\n", a.Manager.LiveCodexHome)
 	fmt.Printf("homes: %s\n", a.Manager.AccountsDir)
 	fmt.Println()
 
@@ -133,13 +135,13 @@ func (a *App) addAccount() error {
 }
 
 func (a *App) importProfile() error {
-	id := a.prompt("Account id")
+	id := a.prompt("Account id (empty to auto)")
 	label := a.prompt("Label (optional)")
 	account, err := a.Manager.ImportLiveProfile(id, label, "")
 	if err != nil {
 		return err
 	}
-	a.pause(fmt.Sprintf("imported current ~/.codex into %s at %s", account.ID, account.CodexHome))
+	a.pause(fmt.Sprintf("imported current Codex profile into %s at %s", account.ID, account.CodexHome))
 	return nil
 }
 

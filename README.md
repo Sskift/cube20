@@ -12,12 +12,17 @@ The first milestone focuses on two local surfaces:
 `cube` keeps dashboard metadata outside the repository:
 
 - State file: `~/.cube20/state.json`
+- Settings file: `~/.cube20/settings.toml`
 - Account homes: `~/.codex-accounts/<account-id>`
 
 Each account home is intended to hold a Codex profile snapshot:
 
 - `auth.json`
 - `config.toml`
+
+`settings.toml` defaults to the official Codex home rules: `$CODEX_HOME` when
+set, otherwise `~/.codex`. It also records the managed account directory so the
+dashboard can discover existing managed profiles.
 
 Treat every account home like a secret-bearing directory.
 
@@ -27,7 +32,7 @@ Treat every account home like a secret-bearing directory.
 cube
 cube accounts list
 cube accounts add work-plus
-cube accounts import work-plus
+cube accounts import
 cube accounts login work-plus
 cube accounts quota work-plus
 cube accounts usage work-plus

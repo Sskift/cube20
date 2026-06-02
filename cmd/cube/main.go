@@ -71,14 +71,15 @@ func runAccounts(m *manager.Manager, args []string) error {
 		fmt.Printf("added %s at %s\n", account.ID, account.CodexHome)
 		return nil
 	case "import":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: cube accounts import <id> [label]")
-		}
+		id := ""
 		label := ""
-		if len(args) > 2 {
-			label = strings.Join(args[2:], " ")
+		if len(args) > 0 {
+			id = args[0]
 		}
-		account, err := m.ImportLiveProfile(args[1], label, "")
+		if len(args) > 1 {
+			label = strings.Join(args[1:], " ")
+		}
+		account, err := m.ImportLiveProfile(id, label, "")
 		if err != nil {
 			return err
 		}
@@ -257,7 +258,7 @@ func printHelp() {
 	fmt.Println("  cube")
 	fmt.Println("  cube accounts list")
 	fmt.Println("  cube accounts add <id> [label]")
-	fmt.Println("  cube accounts import <id> [label]")
+	fmt.Println("  cube accounts import [id] [label]")
 	fmt.Println("  cube accounts login <id>")
 	fmt.Println("  cube accounts quota <id>")
 	fmt.Println("  cube accounts usage <id>")
