@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ func (s *Server) ListenAndServe() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/api/accounts/import-json", s.handleImportJSON)
 	mux.HandleFunc("/api/accounts", s.handleAccounts)
 	mux.HandleFunc("/api/accounts/", s.handleAccountAction)
 	mux.HandleFunc("/api/meta", s.handleMeta)
@@ -88,6 +90,31 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *Server) handleImportJSON(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "could not read json")
+		return
+	}
+
+	profile, err := parseProfileUpload(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	account, err := s.Manager.ImportJSONProfile(profile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, s.ManagerAccountView(account))
 }
 
 func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
@@ -167,6 +194,44 @@ func (s *Server) ManagerAccountView(account manager.Account) manager.AccountView
 		}
 	}
 	return manager.AccountView{Account: account}
+}
+
+func parseProfileUpload(raw []byte) (manager.JSONProfile, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return manager.JSONProfile{}, fmt.Errorf("invalid JSON: %w", err)
+	}
+
+	if authRaw, ok := root["auth"]; ok {
+		profile := manager.JSONProfile{Auth: authRaw}
+		profile.ID = rawString(root["id"])
+		profile.Label = rawString(root["label"])
+		profile.Config = rawString(root["config"])
+		if profile.Config == "" {
+			profile.Config = rawString(root["configToml"])
+		}
+		if profile.Config == "" {
+			profile.Config = rawString(root["config_toml"])
+		}
+		return profile, nil
+	}
+
+	return manager.JSONProfile{
+		ID:    rawString(root["id"]),
+		Label: rawString(root["label"]),
+		Auth:  json.RawMessage(raw),
+	}, nil
+}
+
+func rawString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(text)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -435,6 +500,7 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
           <label for="accountId">ID<input id="accountId" autocomplete="off" placeholder="work-plus"></label>
           <label for="accountLabel">Label<input id="accountLabel" autocomplete="off" placeholder="Plus seat"></label>
           <button class="primary" type="submit">Add</button>
+          <label for="profileJson">Import JSON<input id="profileJson" type="file" accept=".json,application/json"></label>
         </form>
         <div id="addMessage" class="message"></div>
       </section>
@@ -599,6 +665,25 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
         document.getElementById("addMessage").textContent = "Account added";
         await load();
       } catch (error) {
+        document.getElementById("addMessage").textContent = error.message;
+      }
+    });
+
+    document.getElementById("profileJson").addEventListener("change", async event => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const account = await request("/api/accounts/import-json", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: text
+        });
+        event.target.value = "";
+        document.getElementById("addMessage").textContent = "Imported " + account.id;
+        await load();
+      } catch (error) {
+        event.target.value = "";
         document.getElementById("addMessage").textContent = error.message;
       }
     });

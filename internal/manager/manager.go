@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,6 +60,13 @@ type AccountView struct {
 type State struct {
 	Version  int       `json:"version"`
 	Accounts []Account `json:"accounts"`
+}
+
+type JSONProfile struct {
+	ID     string          `json:"id"`
+	Label  string          `json:"label"`
+	Auth   json.RawMessage `json:"auth"`
+	Config string          `json:"config"`
 }
 
 type Manager struct {
@@ -199,6 +207,46 @@ func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account,
 	return account, nil
 }
 
+func (m *Manager) ImportJSONProfile(profile JSONProfile) (Account, error) {
+	authRaw := profile.Auth
+	if len(authRaw) == 0 || string(authRaw) == "null" {
+		return Account{}, errors.New("profile json must include auth, or upload a raw auth.json")
+	}
+
+	var auth map[string]any
+	if err := json.Unmarshal(authRaw, &auth); err != nil {
+		return Account{}, fmt.Errorf("auth is not valid JSON: %w", err)
+	}
+
+	id := strings.TrimSpace(profile.ID)
+	if id == "" {
+		id = m.uniqueAccountID(deriveIDFromAuth(auth, profile.Label))
+	}
+	label := strings.TrimSpace(profile.Label)
+	if label == "" {
+		label = deriveLabelFromAuth(auth)
+	}
+
+	account, err := m.AddAccount(id, label)
+	if err != nil {
+		return Account{}, err
+	}
+
+	authPath := filepath.Join(account.CodexHome, authFileName)
+	if err := os.WriteFile(authPath, prettyJSON(authRaw), fileModeFor(authFileName)); err != nil {
+		return Account{}, err
+	}
+
+	if strings.TrimSpace(profile.Config) != "" {
+		configPath := filepath.Join(account.CodexHome, configFileName)
+		if err := os.WriteFile(configPath, []byte(profile.Config), fileModeFor(configFileName)); err != nil {
+			return Account{}, err
+		}
+	}
+
+	return account, nil
+}
+
 func (m *Manager) ListAccounts() ([]AccountView, error) {
 	state, err := m.Load()
 	if err != nil {
@@ -213,6 +261,142 @@ func (m *Manager) ListAccounts() ([]AccountView, error) {
 		return views[i].ID < views[j].ID
 	})
 	return views, nil
+}
+
+func (m *Manager) uniqueAccountID(base string) string {
+	base = sanitizeAccountID(base)
+	if base == "" {
+		base = "profile-" + time.Now().Format("20060102-150405")
+	}
+	state, err := m.Load()
+	if err != nil {
+		return base
+	}
+	used := map[string]bool{}
+	for _, account := range state.Accounts {
+		used[account.ID] = true
+	}
+	if !used[base] {
+		return base
+	}
+	for i := 2; i < 1000; i++ {
+		candidate := fmt.Sprintf("%s-%d", base, i)
+		if len(candidate) > 64 {
+			candidate = fmt.Sprintf("%s-%d", base[:64-len(fmt.Sprintf("-%d", i))], i)
+		}
+		if !used[candidate] {
+			return candidate
+		}
+	}
+	return "profile-" + time.Now().Format("20060102-150405")
+}
+
+func deriveIDFromAuth(auth map[string]any, label string) string {
+	if tokens, ok := auth["tokens"].(map[string]any); ok {
+		if accountID, ok := tokens["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
+			return accountID
+		}
+		if idToken, ok := tokens["id_token"].(string); ok {
+			claims := claimsFromIDToken(idToken)
+			if sub, ok := claims["sub"].(string); ok && strings.TrimSpace(sub) != "" {
+				return sub
+			}
+			if email, ok := claims["email"].(string); ok && strings.TrimSpace(email) != "" {
+				return strings.Split(email, "@")[0]
+			}
+		}
+	}
+	if strings.TrimSpace(label) != "" {
+		return label
+	}
+	if apiKey, ok := auth["OPENAI_API_KEY"].(string); ok && strings.TrimSpace(apiKey) != "" {
+		return "api-key"
+	}
+	return ""
+}
+
+func deriveLabelFromAuth(auth map[string]any) string {
+	if tokens, ok := auth["tokens"].(map[string]any); ok {
+		if idToken, ok := tokens["id_token"].(string); ok {
+			claims := claimsFromIDToken(idToken)
+			for _, key := range []string{"email", "https://api.openai.com/profile_email", "sub"} {
+				if value, ok := claims[key].(string); ok && strings.TrimSpace(value) != "" {
+					return value
+				}
+			}
+		}
+		if accountID, ok := tokens["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
+			return accountID
+		}
+	}
+	return ""
+}
+
+func sanitizeAccountID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var builder strings.Builder
+	for _, ch := range value {
+		switch {
+		case ch >= 'a' && ch <= 'z':
+			builder.WriteRune(ch)
+		case ch >= 'A' && ch <= 'Z':
+			builder.WriteRune(ch)
+		case ch >= '0' && ch <= '9':
+			builder.WriteRune(ch)
+		case ch == '-' || ch == '_':
+			builder.WriteRune(ch)
+		case ch == '.' || ch == '@' || ch == ' ':
+			builder.WriteRune('-')
+		}
+		if builder.Len() >= 64 {
+			break
+		}
+	}
+	out := strings.Trim(builder.String(), "-_")
+	if out == "" {
+		return ""
+	}
+	if !((out[0] >= 'a' && out[0] <= 'z') || (out[0] >= 'A' && out[0] <= 'Z') || (out[0] >= '0' && out[0] <= '9')) {
+		out = "profile-" + out
+	}
+	return out
+}
+
+func claimsFromIDToken(idToken string) map[string]any {
+	parts := strings.Split(strings.TrimSpace(idToken), ".")
+	if len(parts) < 2 {
+		return map[string]any{}
+	}
+	payload := parts[1]
+	payload = strings.ReplaceAll(payload, "-", "+")
+	payload = strings.ReplaceAll(payload, "_", "/")
+	for len(payload)%4 != 0 {
+		payload += "="
+	}
+	data, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return map[string]any{}
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(data, &claims); err != nil {
+		return map[string]any{}
+	}
+	return claims
+}
+
+func prettyJSON(raw json.RawMessage) []byte {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return raw
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return raw
+	}
+	return append(data, '\n')
 }
 
 func (m *Manager) GetAccount(id string) (Account, error) {
