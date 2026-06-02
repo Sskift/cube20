@@ -3,10 +3,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"cube20/internal/manager"
 	"cube20/internal/tui"
+	"cube20/internal/web"
 )
 
 func main() {
@@ -33,6 +35,8 @@ func run(args []string) error {
 		return runAuth(m, args[1:])
 	case "codex":
 		return runCodex(m, args[1:])
+	case "dashboard":
+		return runDashboard(m, args[1:])
 	case "help", "-h", "--help":
 		printHelp()
 		return nil
@@ -105,6 +109,40 @@ func runCodex(m *manager.Manager, args []string) error {
 	return cmd.Run()
 }
 
+func runDashboard(m *manager.Manager, args []string) error {
+	host := "127.0.0.1"
+	port := 8720
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--host":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --host")
+			}
+			host = args[i+1]
+			i++
+		case "--port":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --port")
+			}
+			nextPort, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return fmt.Errorf("invalid --port %q", args[i+1])
+			}
+			port = nextPort
+			i++
+		default:
+			return fmt.Errorf("unknown dashboard flag %q", args[i])
+		}
+	}
+
+	return (&web.Server{
+		Manager: m,
+		Host:    host,
+		Port:    port,
+	}).ListenAndServe()
+}
+
 func listAccounts(m *manager.Manager) error {
 	accounts, err := m.ListAccounts()
 	if err != nil {
@@ -137,4 +175,5 @@ func printHelp() {
 	fmt.Println("  cube accounts status <id> <ready|drain|disabled>")
 	fmt.Println("  cube auth deploy <id>")
 	fmt.Println("  cube codex <account-id> [codex args...]")
+	fmt.Println("  cube dashboard [--host 127.0.0.1] [--port 8720]")
 }

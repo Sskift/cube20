@@ -33,3 +33,11 @@ cube dashboard
 ```shell
 go build -o bin/cube ./cmd/cube
 ```
+
+## Dashboard
+
+```shell
+./bin/cube dashboard
+```
+
+The dashboard listens on `http://127.0.0.1:8720` by default.
