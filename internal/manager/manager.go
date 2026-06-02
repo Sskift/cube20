@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -251,8 +252,19 @@ func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account,
 	}
 
 	auth := readAuthMetadata(filepath.Join(sourceCodexHome, authFileName))
+	state, err := m.Load()
+	if err != nil {
+		return Account{}, err
+	}
+	identity := authIdentity(auth)
 	if strings.TrimSpace(id) == "" {
-		id = m.uniqueAccountID(deriveIDFromAuth(auth, label))
+		id = sanitizeAccountID(deriveIDFromAuth(auth, label))
+		if id == "" {
+			id = uniqueFromUsed("profile-"+time.Now().Format("20060102-150405"), accountIDs(state))
+		}
+	}
+	if duplicate, ok := duplicateAccount(state, id, identity); ok {
+		return Account{}, fmt.Errorf("auth.json already exists as account %q", duplicate.ID)
 	}
 	if strings.TrimSpace(label) == "" {
 		label = deriveLabelFromAuth(auth)
@@ -286,9 +298,20 @@ func (m *Manager) ImportJSONProfile(profile JSONProfile) (Account, error) {
 		return Account{}, fmt.Errorf("auth is not valid JSON: %w", err)
 	}
 
+	state, err := m.Load()
+	if err != nil {
+		return Account{}, err
+	}
+	identity := authIdentity(auth)
 	id := strings.TrimSpace(profile.ID)
 	if id == "" {
-		id = m.uniqueAccountID(deriveIDFromAuth(auth, profile.Label))
+		id = sanitizeAccountID(deriveIDFromAuth(auth, profile.Label))
+		if id == "" {
+			id = uniqueFromUsed("profile-"+time.Now().Format("20060102-150405"), accountIDs(state))
+		}
+	}
+	if duplicate, ok := duplicateAccount(state, id, identity); ok {
+		return Account{}, fmt.Errorf("auth.json already exists as account %q", duplicate.ID)
 	}
 	label := strings.TrimSpace(profile.Label)
 	if label == "" {
@@ -455,6 +478,52 @@ func uniqueFromUsed(base string, used map[string]bool) string {
 		}
 	}
 	return "profile-" + time.Now().Format("20060102-150405")
+}
+
+func accountIDs(state State) map[string]bool {
+	used := map[string]bool{}
+	for _, account := range state.Accounts {
+		used[account.ID] = true
+	}
+	return used
+}
+
+func duplicateAccount(state State, id, identity string) (Account, bool) {
+	for _, account := range state.Accounts {
+		if account.ID == id {
+			return account, true
+		}
+		if identity == "" {
+			continue
+		}
+		existing := readAuthMetadata(filepath.Join(account.CodexHome, authFileName))
+		if authIdentity(existing) == identity {
+			return account, true
+		}
+	}
+	return Account{}, false
+}
+
+func authIdentity(auth map[string]any) string {
+	if tokens, ok := auth["tokens"].(map[string]any); ok {
+		if accountID, ok := tokens["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
+			return "account_id:" + strings.TrimSpace(accountID)
+		}
+		if idToken, ok := tokens["id_token"].(string); ok {
+			claims := claimsFromIDToken(idToken)
+			if sub, ok := claims["sub"].(string); ok && strings.TrimSpace(sub) != "" {
+				return "sub:" + strings.TrimSpace(sub)
+			}
+			if email, ok := claims["email"].(string); ok && strings.TrimSpace(email) != "" {
+				return "email:" + strings.ToLower(strings.TrimSpace(email))
+			}
+		}
+	}
+	if apiKey, ok := auth["OPENAI_API_KEY"].(string); ok && strings.TrimSpace(apiKey) != "" {
+		sum := sha256.Sum256([]byte(strings.TrimSpace(apiKey)))
+		return fmt.Sprintf("api_key:%x", sum)
+	}
+	return ""
 }
 
 func deriveIDFromAuth(auth map[string]any, label string) string {

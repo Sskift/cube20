@@ -777,6 +777,9 @@ var indexTemplate = template.Must(template.New("index").Parse(`<!doctype html>
 
     function quotaErrorText(detail) {
       const text = String(detail || "").toLowerCase();
+      if (text.includes("refresh_token_invalidated")) return "re-login";
+      if (text.includes("refresh_token_expired")) return "re-login";
+      if (text.includes("refresh_token_reused")) return "re-login";
       if (text.includes("unauthorized")) return "login expired";
       if (text.includes("timeout")) return "timeout";
       if (text.includes("auth.json")) return "auth issue";
