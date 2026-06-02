@@ -1,3 +1,347 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@import "@heroui/styles";
+@import "@heroui-pro/react/css";
+
+@layer base {
+  :root {
+    color-scheme: light;
+    font-family:
+      Inter,
+      ui-sans-serif,
+      system-ui,
+      -apple-system,
+      BlinkMacSystemFont,
+      "Segoe UI",
+      "PingFang SC",
+      "Microsoft YaHei",
+      sans-serif;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html {
+    height: 100%;
+    scrollbar-gutter: stable;
+    text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100%;
+    min-width: 360px;
+    background: #f7f8fb;
+    color: #111827;
+    letter-spacing: 0;
+    overflow: hidden;
+  }
+
+  #root {
+    min-height: 100vh;
+    isolation: isolate;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+    letter-spacing: 0;
+  }
+
+  button,
+  [role="button"],
+  input,
+  select {
+    min-width: 0;
+  }
+
+  button,
+  [role="button"] {
+    align-items: center;
+    justify-content: center;
+    line-height: 1.25;
+    white-space: nowrap;
+  }
+
+  svg {
+    flex-shrink: 0;
+  }
+}
+
+.path-text {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.45;
+}
+
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.account-grid {
+  --cube-grid-row-min-height: 76px;
+  font-size: 0.875rem;
+}
+
+.app-layout__body,
+.app-layout__main,
+.app-layout__aside,
+.app-layout__header,
+.app-layout__toolbar {
+  min-width: 0;
+}
+
+.app-layout__body,
+.app-layout__main,
+.app-layout__aside {
+  min-height: 0;
+}
+
+.app-layout__main {
+  overflow: hidden;
+}
+
+.account-grid [role="row"] {
+  min-height: var(--cube-grid-row-min-height);
+  align-items: stretch;
+}
+
+.account-grid [role="columnheader"],
+.account-grid [role="cell"] {
+  min-width: 0;
+  min-height: var(--cube-grid-row-min-height);
+  align-items: center;
+  overflow: hidden;
+  padding-block: 0.625rem;
+  white-space: normal;
+}
+
+.account-grid [role="columnheader"] {
+  min-height: 44px;
+  color: #475569;
+  font-size: 0.75rem;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.account-grid [role="cell"] > *,
+.account-grid [role="columnheader"] > * {
+  min-width: 0;
+}
+
+.account-grid code,
+.account-grid .path-text {
+  display: block;
+  max-width: 100%;
+  white-space: normal;
+}
+
+.account-grid [data-slot="base"],
+.account-grid [data-slot="wrapper"],
+.account-grid [data-slot="table"],
+.account-grid [data-slot="content"],
+.data-grid {
+  min-width: 0;
+}
+
+.data-grid {
+  color: #1f2937;
+}
+
+.data-grid__selection-cell,
+.data-grid__selection-column,
+.data-grid__drag-handle-cell,
+.data-grid__drag-handle-column {
+  align-items: center;
+}
+
+[data-slot="input-wrapper"],
+[data-slot="inner-wrapper"],
+[data-slot="label"],
+[data-slot="description"],
+[data-slot="helper-wrapper"] {
+  min-width: 0;
+}
+
+[data-slot="label"],
+[data-slot="description"],
+[data-slot="helper-wrapper"] {
+  overflow-wrap: anywhere;
+}
+
+[data-slot="input"],
+textarea {
+  line-height: 1.45;
+}
+
+[data-slot="input-wrapper"] {
+  align-items: center;
+}
+
+[data-slot="trigger"],
+[data-slot="button"],
+[data-slot="base"][role="button"] {
+  min-width: 0;
+}
+
+[data-slot="base"] :where(button, [role="button"]) {
+  gap: 0.5rem;
+}
+
+[data-slot="content"] {
+  min-width: 0;
+}
+
+.drop-zone,
+.drop-zone__area,
+.drop-zone__file-list,
+.drop-zone__file-item,
+[data-slot="dropzone"],
+[data-slot="drop-zone"] {
+  min-width: 0;
+}
+
+.drop-zone__area {
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.drop-zone__label,
+.drop-zone__description,
+.drop-zone__file-name,
+.drop-zone__file-meta,
+[data-slot="dropzone"] *,
+[data-slot="drop-zone"] * {
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.drop-zone__label,
+.drop-zone__file-name {
+  overflow-wrap: anywhere;
+}
+
+.drop-zone__description,
+.drop-zone__file-meta {
+  color: #64748b;
+}
+
+.drop-zone__input,
+[data-slot="dropzone"] input,
+[data-slot="drop-zone"] input {
+  line-height: normal;
+}
+
+@media (max-width: 1024px) {
+  .account-grid {
+    --cube-grid-row-min-height: 82px;
+  }
+
+  .account-grid [role="columnheader"],
+  .account-grid [role="cell"] {
+    padding-inline: 0.75rem;
+  }
+}
+
+@media (max-width: 768px) {
+  body {
+    min-width: 320px;
+  }
+
+  .account-grid {
+    --cube-grid-row-min-height: 88px;
+  }
+
+  .account-grid [role="columnheader"],
+  .account-grid [role="cell"] {
+    padding-inline: 0.625rem;
+  }
+
+  .account-grid [role="cell"] {
+    font-size: 0.8125rem;
+  }
+
+  .app-layout__header,
+  .app-layout__toolbar {
+    min-height: 3.5rem;
+  }
+
+  :where(button, [role="button"]) {
+    min-height: 2.25rem;
+  }
+
+  .path-text {
+    line-height: 1.5;
+  }
+}
+
+@layer components {
+  body {
+    background:
+      linear-gradient(180deg, rgba(241, 245, 249, 0.92) 0, rgba(247, 248, 251, 0) 240px),
+      #f7f8fb;
+    font-feature-settings:
+      "cv11",
+      "ss01";
+  }
+
+  [data-slot="base"][class*="border-slate-200"],
+  .account-grid {
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  }
+
+  [data-slot="card"] h1,
+  [data-slot="card"] h2,
+  [data-slot="card"] h3 {
+    letter-spacing: 0;
+  }
+
+  [data-slot="card"] h1 {
+    font-size: 1.125rem;
+    line-height: 1.3;
+  }
+
+  [data-slot="card"] h2 {
+    font-size: 0.9375rem;
+    line-height: 1.35;
+  }
+
+  [data-slot="card"] h3 {
+    font-size: 0.8125rem;
+    line-height: 1.4;
+  }
+
+  [data-slot="label"] {
+    color: #475569;
+    font-size: 0.75rem;
+    font-weight: 650;
+  }
+
+  [data-slot="input"],
+  [data-slot="textarea"],
+  textarea {
+    color: #0f172a;
+    font-size: 0.8125rem;
+    font-variant-ligatures: none;
+  }
+
+  [data-slot="description"],
+  [data-slot="helper-wrapper"] {
+    color: #64748b;
+    font-size: 0.75rem;
+  }
+
+  [data-slot="chip"] {
+    max-width: 100%;
+  }
+
+  [data-slot="progress"] {
+    min-width: 6rem;
+  }
+}

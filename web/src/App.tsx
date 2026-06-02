@@ -1,31 +1,46 @@
-import type { ChangeEvent, FormEvent } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  Avatar,
   Button,
   Card,
-  CardBody,
-  CardHeader,
   Chip,
-  Divider,
   Input,
-  Select,
-  SelectItem,
-  Spinner,
-  Textarea,
+  ProgressBar,
+  Separator,
+  Skeleton,
+  TextArea,
+  Tooltip,
 } from "@heroui/react";
 import {
-  CheckCircle,
+  CheckCircle2,
+  CircleSlash,
   Database,
-  FolderOpen,
+  FileJson,
+  FolderCog,
   Gauge,
+  Info,
+  PanelRightOpen,
   Play,
   RefreshCw,
   RotateCcw,
+  Route,
   Save,
+  Settings,
   ShieldCheck,
   Trash2,
-  Upload,
+  UploadCloud,
 } from "lucide-react";
+import {
+  AppLayout,
+  DataGrid,
+  DropZone,
+  EmptyState,
+  KPI,
+  NativeSelect,
+  type DataGridColumn,
+  type DataGridSelection,
+} from "@heroui-pro/react";
 
 type AccountStatus = "ready" | "drain" | "disabled";
 
@@ -36,7 +51,9 @@ interface Account {
   status: AccountStatus;
   codexHome: string;
   authPresent: boolean;
+  authPath: string;
   configPresent: boolean;
+  configPath: string;
   active: boolean;
 }
 
@@ -108,20 +125,16 @@ interface LoadBalanceStatus {
 
 async function apiJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
-  if (!headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json");
-  }
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...init, headers });
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
-  if (!response.ok) {
-    throw new Error(data.error || response.statusText);
-  }
+  if (!response.ok) throw new Error(data.error || response.statusText);
   return data as T;
 }
 
-function shortID(id: string) {
-  return id.length > 14 ? `${id.slice(0, 10)}...` : id;
+function shortID(value: string) {
+  return value.length > 12 ? `${value.slice(0, 8)}...${value.slice(-4)}` : value;
 }
 
 function tokens(value?: number) {
@@ -132,14 +145,25 @@ function tokens(value?: number) {
   return Math.round(value).toString();
 }
 
-function quotaLabel(quota?: QuotaResult) {
-  if (!quota) return "not checked";
-  if (quota.status === "loading") return "checking";
+function accountName(account?: Account) {
+  if (!account) return "-";
+  return account.label || shortID(account.id);
+}
+
+function quotaSummary(quota?: QuotaResult) {
+  if (!quota) return { label: "Not checked", value: 0, color: "default" as const };
+  if (quota.status === "loading") return { label: "Checking", value: 0, color: "accent" as const };
   if (quota.status === "supported" && quota.quotas?.length) {
-    const first = quota.quotas[0];
-    return `${first.remainingDisplay} left`;
+    const primary = quota.quotas[0];
+    return {
+      label: `${primary.remainingDisplay} left`,
+      value: Math.max(0, Math.min(100, 100 - primary.usedPercent)),
+      color: primary.usedPercent > 80 ? ("danger" as const) : primary.usedPercent > 55 ? ("warning" as const) : ("success" as const),
+    };
   }
-  return quota.status;
+  if (quota.status === "unsupported_api_key") return { label: "API key", value: 0, color: "warning" as const };
+  if (quota.status === "refresh_token_invalidated") return { label: "Re-login", value: 0, color: "danger" as const };
+  return { label: quota.status, value: 0, color: "default" as const };
 }
 
 export default function App() {
@@ -157,14 +181,14 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const fileInput = useRef<HTMLInputElement>(null);
 
-  const selected = useMemo(
-    () => accounts.find((account) => account.id === selectedId),
-    [accounts, selectedId],
-  );
+  const selected = useMemo(() => accounts.find((account) => account.id === selectedId), [accounts, selectedId]);
+  const selectedKeys = useMemo<DataGridSelection>(() => (selectedId ? new Set<string>([selectedId]) : new Set<string>()), [selectedId]);
   const readyCount = accounts.filter((account) => account.status === "ready").length;
+  const missingConfigCount = accounts.filter((account) => !account.configPresent).length;
+  const activeAccount = accounts.find((account) => account.active);
   const eligibleCount = lb?.eligible.length ?? 0;
+  const [asideOpen, setAsideOpen] = useState(() => (typeof window === "undefined" ? true : window.innerWidth >= 1180));
 
   async function loadAll(preferredId = selectedId) {
     setLoading(true);
@@ -185,7 +209,7 @@ export default function App() {
         setSelectedId(accountData.find((account) => account.active)?.id || accountData[0]?.id || "");
       }
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "load failed");
+      setMessage(error instanceof Error ? error.message : "Load failed");
     } finally {
       setLoading(false);
     }
@@ -206,7 +230,7 @@ export default function App() {
     try {
       await action();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "action failed");
+      setMessage(error instanceof Error ? error.message : "Action failed");
     } finally {
       setBusy(false);
     }
@@ -232,19 +256,18 @@ export default function App() {
     if (!selected) return;
     await withBusy(async () => {
       await apiJSON(`/api/accounts/${encodeURIComponent(selected.id)}/activate`, { method: "POST" });
-      setMessage("auth.json and config.toml activated");
+      setMessage(`${accountName(selected)} activated`);
       await loadAll(selected.id);
     });
   }
 
   async function deleteAccount() {
     if (!selected) return;
-    const name = selected.label || selected.id;
-    if (!window.confirm(`Delete ${name}? This removes the managed Codex home snapshot.`)) return;
+    if (!window.confirm(`Delete ${accountName(selected)}? This removes the managed snapshot only.`)) return;
     await withBusy(async () => {
       await apiJSON(`/api/accounts/${encodeURIComponent(selected.id)}`, { method: "DELETE" });
-      setMessage("Account deleted");
       setSelectedId("");
+      setMessage("Account deleted");
       await loadAll("");
     });
   }
@@ -252,14 +275,14 @@ export default function App() {
   async function importLive() {
     await withBusy(async () => {
       const account = await apiJSON<Account>("/api/accounts/import-live", { method: "POST" });
-      setMessage(`Imported ${account.label || account.id}`);
-      await loadAll(account.id);
       setSelectedId(account.id);
+      setMessage(`Imported ${accountName(account)}`);
+      await loadAll(account.id);
     });
   }
 
-  async function uploadJSON(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
+  async function uploadFiles(files: FileList) {
+    const file = files[0];
     if (!file) return;
     await withBusy(async () => {
       const text = await file.text();
@@ -267,11 +290,10 @@ export default function App() {
         method: "POST",
         body: text,
       });
-      setMessage(`Imported ${account.label || account.id}`);
       setSelectedId(account.id);
+      setMessage(`Imported ${accountName(account)}`);
       await loadAll(account.id);
     });
-    if (fileInput.current) fileInput.current.value = "";
   }
 
   async function fetchQuota(id: string, quiet = false) {
@@ -281,26 +303,24 @@ export default function App() {
       setQuotas((current) => ({ ...current, [id]: result }));
       if (!quiet) setMessage("Quota refreshed");
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "quota failed";
+      const detail = error instanceof Error ? error.message : "Quota failed";
       setQuotas((current) => ({ ...current, [id]: { status: "error", detail } }));
       if (!quiet) setMessage(detail);
     }
+  }
+
+  async function refreshAllQuotas() {
+    await withBusy(async () => {
+      await Promise.all(accounts.map((account) => fetchQuota(account.id, true)));
+      setMessage("All quotas refreshed");
+    });
   }
 
   async function fetchUsage(id: string) {
     await withBusy(async () => {
       const result = await apiJSON<UsageSummary>(`/api/accounts/${encodeURIComponent(id)}/usage`);
       setUsages((current) => ({ ...current, [id]: result }));
-      setMessage("Usage refreshed");
-    });
-  }
-
-  async function refreshAllQuotas() {
-    await withBusy(async () => {
-      for (const account of accounts) {
-        await fetchQuota(account.id, true);
-      }
-      setMessage("All quotas refreshed");
+      setMessage("Local usage refreshed");
     });
   }
 
@@ -334,7 +354,7 @@ export default function App() {
     await withBusy(async () => {
       const account = await apiJSON<Account>("/api/lb/pick", { method: "POST" });
       setSelectedId(account.id);
-      setMessage(`Selected ${account.label || account.id}`);
+      setMessage(`Selected ${accountName(account)}`);
       await loadAll(account.id);
     });
   }
@@ -347,256 +367,536 @@ export default function App() {
     });
   }
 
-  return (
-    <div className="min-h-screen bg-[#f5f7fb] text-[#182230]">
-      <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex min-h-16 max-w-[1440px] items-center justify-between gap-4 px-5 lg:px-8">
-          <div className="flex items-center gap-3">
-            <div className="grid h-10 w-10 place-items-center rounded-lg bg-teal-600 text-white">
-              <ShieldCheck size={20} />
-            </div>
-            <div>
-              <div className="text-lg font-semibold tracking-normal">cube20</div>
-              <div className="text-xs text-slate-500">Codex account pool</div>
+  const columns = useMemo<DataGridColumn<Account>[]>(
+    () => [
+      {
+        id: "account",
+        header: "Account",
+        isRowHeader: true,
+        allowsSorting: true,
+        width: 300,
+        minWidth: 260,
+        pinned: "start",
+        sortFn: (a, b) => accountName(a).localeCompare(accountName(b)),
+        cell: (account) => (
+          <div className="flex min-w-0 items-center gap-3">
+            <Avatar className="shrink-0" color="accent" size="md" variant="soft">
+              <Avatar.Fallback>{(account.label || account.id).slice(0, 2).toUpperCase()}</Avatar.Fallback>
+            </Avatar>
+            <div className="min-w-0">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="truncate text-sm font-semibold text-slate-950">{accountName(account)}</span>
+                {account.active && (
+                  <Chip color="accent" size="sm" variant="soft">
+                    active
+                  </Chip>
+                )}
+              </div>
+              <Tooltip>
+                <Tooltip.Trigger className="inline-flex max-w-full">
+                  <span className="truncate font-mono text-xs text-slate-500">{shortID(account.id)}</span>
+                </Tooltip.Trigger>
+                <Tooltip.Content>{account.id}</Tooltip.Content>
+              </Tooltip>
             </div>
           </div>
-          <div className="flex flex-wrap items-center justify-end gap-2">
-            <Chip color={meta?.liveAuthPresent ? "success" : "warning"} variant="flat">
-              live auth {meta?.liveAuthPresent ? "ready" : "missing"}
+        ),
+      },
+      {
+        id: "status",
+        header: "Status",
+        width: 130,
+        minWidth: 120,
+        allowsSorting: true,
+        accessorKey: "status",
+        cell: (account) => (
+          <Chip
+            color={account.status === "ready" ? "success" : account.status === "drain" ? "warning" : "danger"}
+            size="sm"
+            variant="soft"
+          >
+            {account.status}
+          </Chip>
+        ),
+      },
+      {
+        id: "files",
+        header: "Files",
+        width: 190,
+        minWidth: 180,
+        cell: (account) => (
+          <div className="flex flex-wrap gap-1.5">
+            <Chip color={account.authPresent ? "success" : "danger"} size="sm" variant="soft">
+              auth.json
             </Chip>
-            <Button size="sm" variant="flat" startContent={<RefreshCw size={15} />} onPress={() => loadAll()}>
-              Refresh
-            </Button>
-            <Button size="sm" color="primary" startContent={<Gauge size={15} />} onPress={refreshAllQuotas}>
-              Check Quotas
-            </Button>
+            <Chip color={account.configPresent ? "accent" : "warning"} size="sm" variant="soft">
+              settings
+            </Chip>
           </div>
+        ),
+      },
+      {
+        id: "quota",
+        header: "Quota",
+        width: 250,
+        minWidth: 230,
+        cell: (account) => {
+          const summary = quotaSummary(quotas[account.id]);
+          return (
+            <div className="flex min-w-0 flex-col gap-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="truncate text-xs font-medium text-slate-700">{summary.label}</span>
+                <Button size="sm" variant="ghost" onPress={() => fetchQuota(account.id)}>
+                  Check
+                </Button>
+              </div>
+              <ProgressBar aria-label="Quota remaining" color={summary.color} size="sm" value={summary.value} />
+            </div>
+          );
+        },
+      },
+      {
+        id: "usage",
+        header: "Local Usage",
+        width: 190,
+        minWidth: 180,
+        cell: (account) => {
+          const usage = usages[account.id];
+          if (!usage) {
+            return (
+              <Button size="sm" variant="ghost" onPress={() => fetchUsage(account.id)}>
+                Load usage
+              </Button>
+            );
+          }
+          return (
+            <div className="text-xs text-slate-600">
+              <div className="font-semibold text-slate-900">{tokens(usage.today?.total)} today</div>
+              <div>{tokens(usage.sevenDays?.total)} over 7d</div>
+            </div>
+          );
+        },
+      },
+      {
+        id: "home",
+        header: "CODEX_HOME",
+        width: 420,
+        minWidth: 360,
+        cell: (account) => (
+          <Tooltip>
+            <Tooltip.Trigger className="block max-w-full text-left">
+              <code className="path-text line-clamp-2 text-xs leading-5 text-slate-500">{account.codexHome}</code>
+            </Tooltip.Trigger>
+            <Tooltip.Content>{account.codexHome}</Tooltip.Content>
+          </Tooltip>
+        ),
+      },
+    ],
+    [quotas, usages],
+  );
+
+  const sidebar = (
+    <div className="flex h-full min-h-0 flex-col border-r border-slate-200 bg-white">
+      <div className="flex items-center gap-3 border-b border-slate-200 px-4 py-4">
+        <div className="grid h-10 w-10 place-items-center rounded-xl bg-slate-950 text-white">
+          <ShieldCheck size={20} />
         </div>
-      </header>
+        <div className="min-w-0">
+          <div className="text-base font-semibold text-slate-950">cube20</div>
+          <div className="text-xs text-slate-500">Codex pool manager</div>
+        </div>
+      </div>
+      <div className="flex flex-1 flex-col gap-1 px-3 py-4 text-sm">
+        <NavItem icon={<Database size={17} />} label="Accounts" active badge={accounts.length.toString()} />
+        <NavItem icon={<Route size={17} />} label="Load Balancer" badge={eligibleCount.toString()} />
+        <NavItem icon={<FolderCog size={17} />} label="Settings" />
+      </div>
+      <div className="border-t border-slate-200 p-3">
+        <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
+          <div className="mb-1 font-medium text-slate-900">Live Codex</div>
+          <div className="path-text font-mono">{meta?.liveCodexHome || "-"}</div>
+        </div>
+      </div>
+    </div>
+  );
 
-      <main className="mx-auto grid max-w-[1440px] grid-cols-1 gap-5 px-5 py-6 lg:grid-cols-[minmax(0,1fr)_420px] lg:px-8">
-        <section className="flex flex-col gap-5">
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-            <Metric label="Accounts" value={accounts.length.toString()} accent="bg-teal-50 text-teal-700" />
-            <Metric label="Ready" value={readyCount.toString()} accent="bg-emerald-50 text-emerald-700" />
-            <Metric label="LB Pool" value={eligibleCount.toString()} accent="bg-amber-50 text-amber-700" />
-            <Metric label="Active" value={accounts.find((account) => account.active)?.label || "-"} accent="bg-indigo-50 text-indigo-700" />
-          </div>
+  const navbar = (
+    <div className="flex min-h-14 w-full items-center justify-between gap-4 border-b border-slate-200 bg-white px-4">
+      <div className="flex min-w-0 items-center gap-3">
+        <AppLayout.MenuToggle className="lg:hidden" tooltip="Menu" />
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-slate-950">Account inventory</div>
+          <div className="path-text text-xs text-slate-500">{meta?.accountsDir || "Loading accounts directory"}</div>
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <Chip className="hidden min-[760px]:inline-flex" color={meta?.liveAuthPresent ? "success" : "warning"} size="sm" variant="soft">
+          live auth {meta?.liveAuthPresent ? "ready" : "missing"}
+        </Chip>
+        <button
+          aria-label={asideOpen ? "Hide details" : "Details"}
+          className="inline-flex h-8 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
+          type="button"
+          onClick={() => setAsideOpen((open) => !open)}
+        >
+          <PanelRightOpen size={15} />
+          <span>Details</span>
+        </button>
+        <Button className="gap-2" size="sm" variant="secondary" onPress={() => loadAll()}>
+          <RefreshCw size={15} />
+          Refresh
+        </Button>
+        <Button className="gap-2" size="sm" variant="primary" onPress={refreshAllQuotas}>
+          <Gauge size={15} />
+          Quotas
+        </Button>
+      </div>
+    </div>
+  );
 
-          <Card radius="sm" shadow="sm" className="border border-slate-200 bg-white">
-            <CardHeader className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-4">
+  return (
+    <AppLayout
+      aside={<DetailsPanel />}
+      asideDefaultSize={30}
+      asideMaxSize={38}
+      asideMinSize={24}
+      asideMobile="sheet"
+      asideResizable
+      className="h-screen bg-slate-50"
+      asideOpen={asideOpen}
+      onAsideOpenChange={setAsideOpen}
+      defaultSidebarOpen
+      navbar={navbar}
+      scrollMode="content"
+      sidebar={sidebar}
+      sidebarCollapsible="offcanvas"
+      sidebarDefaultSize={16}
+      sidebarMaxSize={22}
+      sidebarMinSize={14}
+      sidebarResizable
+      sidebarVariant="sidebar"
+    >
+      <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-5 p-4 lg:p-6">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <MetricCard icon={<Database size={18} />} label="Accounts" value={accounts.length.toString()} status="success" />
+          <MetricCard icon={<CheckCircle2 size={18} />} label="Ready Pool" value={readyCount.toString()} status="success" />
+          <MetricCard icon={<Route size={18} />} label="LB Eligible" value={eligibleCount.toString()} status="warning" />
+          <MetricCard icon={<CircleSlash size={18} />} label="Missing Settings" value={missingConfigCount.toString()} status="danger" />
+        </div>
+
+        <Card className="overflow-hidden border border-slate-200 bg-white shadow-sm">
+          <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+            <div className="min-w-0">
+              <h1 className="text-lg font-semibold leading-6 text-slate-950">Accounts</h1>
+              <p className="path-text text-xs text-slate-500">Active: {accountName(activeAccount)}</p>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <Button className="gap-2" isDisabled={!selected || busy} variant="primary" onPress={activateAccount}>
+                <Play size={15} />
+                Switch
+              </Button>
+              <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={importLive}>
+                <UploadCloud size={15} />
+                Import live
+              </Button>
+            </div>
+          </Card.Header>
+          <Card.Content className="p-0">
+            {loading ? (
+              <div className="space-y-3 p-5">
+                <Skeleton className="h-16 rounded-xl" />
+                <Skeleton className="h-16 rounded-xl" />
+                <Skeleton className="h-16 rounded-xl" />
+              </div>
+            ) : (
+              <DataGrid
+                aria-label="Codex accounts"
+                allowsColumnResize
+                className="account-grid"
+                columns={columns}
+                contentClassName="min-w-[1480px]"
+                data={accounts}
+                getRowId={(account) => account.id}
+                onRowAction={(key) => setSelectedId(String(key))}
+                onSelectionChange={(keys) => {
+                  if (keys === "all") return;
+                  const first = Array.from(keys)[0];
+                  if (first) setSelectedId(String(first));
+                }}
+                renderEmptyState={() => (
+                  <EmptyState size="lg" className="py-12">
+                    <EmptyState.Media variant="icon">
+                      <Database size={28} />
+                    </EmptyState.Media>
+                    <EmptyState.Title>No accounts yet</EmptyState.Title>
+                    <EmptyState.Description>Import your current Codex profile or upload an auth.json snapshot.</EmptyState.Description>
+                  </EmptyState>
+                )}
+                scrollContainerClassName="max-h-[calc(100vh-310px)] min-h-[360px] overflow-auto"
+                selectedKeys={selectedKeys}
+                selectionBehavior="replace"
+                selectionMode="single"
+                variant="secondary"
+              />
+            )}
+          </Card.Content>
+        </Card>
+
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+          <Card className="border border-slate-200 bg-white shadow-sm">
+            <Card.Header className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
               <div>
-                <h1 className="text-xl font-semibold tracking-normal">Accounts</h1>
-                <p className="max-w-[720px] truncate text-xs text-slate-500">{meta?.accountsDir || "loading"}</p>
+                <h2 className="text-base font-semibold text-slate-950">Load balancer</h2>
+                <p className="text-xs text-slate-500">Round-robin account assignment for `cube run`.</p>
               </div>
-              <Button color="primary" startContent={<CheckCircle size={16} />} isDisabled={!selected || busy} onPress={activateAccount}>
-                Activate
-              </Button>
-            </CardHeader>
-            <CardBody className="p-0">
-              {loading ? (
-                <div className="grid min-h-64 place-items-center">
-                  <Spinner />
-                </div>
-              ) : accounts.length === 0 ? (
-                <div className="p-8 text-sm text-slate-500">No accounts imported.</div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full min-w-[880px] border-collapse text-left text-sm">
-                    <thead className="bg-slate-50 text-xs uppercase text-slate-500">
-                      <tr>
-                        <th className="px-5 py-3 font-semibold">Nickname</th>
-                        <th className="px-5 py-3 font-semibold">Status</th>
-                        <th className="px-5 py-3 font-semibold">Files</th>
-                        <th className="px-5 py-3 font-semibold">Quota</th>
-                        <th className="px-5 py-3 font-semibold">Local Usage</th>
-                        <th className="px-5 py-3 font-semibold">Home</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {accounts.map((account) => {
-                        const quota = quotas[account.id];
-                        const usage = usages[account.id];
-                        const rowSelected = account.id === selectedId;
-                        return (
-                          <tr
-                            key={account.id}
-                            className={`cursor-pointer border-t border-slate-100 ${rowSelected ? "bg-teal-50/70" : "hover:bg-slate-50"}`}
-                            onClick={() => setSelectedId(account.id)}
-                          >
-                            <td className="px-5 py-4">
-                              <div className="flex items-center gap-2">
-                                <div>
-                                  <div className="font-medium text-slate-950">{account.label || account.id}</div>
-                                  <div className="font-mono text-xs text-slate-500" title={account.id}>{shortID(account.id)}</div>
-                                </div>
-                                {account.active && <Chip size="sm" color="primary" variant="flat">active</Chip>}
-                              </div>
-                            </td>
-                            <td className="px-5 py-4">
-                              <Chip
-                                size="sm"
-                                color={account.status === "ready" ? "success" : account.status === "drain" ? "warning" : "danger"}
-                                variant="flat"
-                              >
-                                {account.status}
-                              </Chip>
-                            </td>
-                            <td className="px-5 py-4">
-                              <div className="flex gap-1">
-                                <Chip size="sm" color={account.authPresent ? "success" : "danger"} variant="flat">auth</Chip>
-                                <Chip size="sm" color={account.configPresent ? "default" : "warning"} variant="flat">settings</Chip>
-                              </div>
-                            </td>
-                            <td className="px-5 py-4">
-                              <div className="flex items-center gap-2">
-                                <span className="text-xs text-slate-600">{quotaLabel(quota)}</span>
-                                <Button size="sm" variant="light" onPress={() => fetchQuota(account.id, false)}>Quota</Button>
-                              </div>
-                              {quota?.detail && <div className="mt-1 max-w-[220px] truncate text-xs text-rose-600">{quota.detail}</div>}
-                            </td>
-                            <td className="px-5 py-4">
-                              {usage ? (
-                                <div className="text-xs text-slate-600">
-                                  <div className="font-medium text-slate-900">{tokens(usage.today?.total)} today</div>
-                                  <div>{tokens(usage.sevenDays?.total)} 7d</div>
-                                </div>
-                              ) : (
-                                <Button size="sm" variant="light" onPress={() => fetchUsage(account.id)}>Usage</Button>
-                              )}
-                            </td>
-                            <td className="max-w-[260px] truncate px-5 py-4 font-mono text-xs text-slate-500" title={account.codexHome}>
-                              {account.codexHome}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </CardBody>
+              <Chip color="success" variant="soft">
+                {eligibleCount} eligible
+              </Chip>
+            </Card.Header>
+            <Card.Content className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto] md:items-center">
+              <div className="min-w-0 rounded-lg bg-slate-50 p-3">
+                <div className="text-xs font-medium uppercase text-slate-500">Last selected</div>
+                <div className="path-text mt-1 font-mono text-sm text-slate-800">{lb?.lastAccountId || "-"}</div>
+              </div>
+              <div className="flex gap-2">
+                <Button className="gap-2" variant="primary" onPress={pickNext}>
+                  <Play size={15} />
+                  Pick next
+                </Button>
+                <Button className="gap-2" variant="secondary" onPress={resetLB}>
+                  <RotateCcw size={15} />
+                  Reset
+                </Button>
+              </div>
+            </Card.Content>
           </Card>
-        </section>
 
-        <aside className="flex flex-col gap-5">
-          <Card radius="sm" shadow="sm" className="border border-slate-200 bg-white">
-            <CardHeader className="border-b border-slate-100 px-5 py-4">
-              <h2 className="text-base font-semibold">Selected Account</h2>
-            </CardHeader>
-            <CardBody className="gap-4 p-5">
-              {selected ? (
-                <>
-                  <Input label="Nickname" value={label} onValueChange={setLabel} />
-                  <Select
-                    label="Pool Status"
-                    selectedKeys={[status]}
-                    onSelectionChange={(keys) => {
-                      const key = Array.from(keys)[0]?.toString() as AccountStatus | undefined;
-                      if (key) setStatus(key);
-                    }}
-                  >
-                    <SelectItem key="ready">ready</SelectItem>
-                    <SelectItem key="drain">drain</SelectItem>
-                    <SelectItem key="disabled">disabled</SelectItem>
-                  </Select>
+          <Card className="border border-slate-200 bg-white shadow-sm">
+            <Card.Header className="border-b border-slate-200 px-5 py-4">
+              <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
+                <UploadCloud size={17} />
+                Import auth.json
+              </h2>
+            </Card.Header>
+            <Card.Content>
+              <DropZone>
+                <DropZone.Area className="min-h-32 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-5 text-center">
+                  <DropZone.Icon>
+                    <FileJson size={26} />
+                  </DropZone.Icon>
+                  <DropZone.Label>Drop or choose auth.json</DropZone.Label>
+                  <DropZone.Description>Raw Codex auth.json or cube20 profile JSON</DropZone.Description>
+                  <DropZone.Input accept=".json,application/json" onSelect={uploadFiles} />
+                </DropZone.Area>
+              </DropZone>
+            </Card.Content>
+          </Card>
+        </div>
+
+        {message && (
+          <Card className="border border-teal-200 bg-teal-50 text-teal-900">
+            <Card.Content className="flex flex-row items-start gap-2 p-4 text-sm">
+              <Info size={16} className="mt-0.5 shrink-0" />
+              <span>{message}</span>
+            </Card.Content>
+          </Card>
+        )}
+      </div>
+    </AppLayout>
+  );
+
+  function DetailsPanel() {
+    return (
+      <div className="flex h-full min-h-0 flex-col bg-white">
+        <div className="border-b border-slate-200 px-5 py-4">
+          <div className="text-sm font-semibold text-slate-950">Selected account</div>
+          <div className="path-text mt-1 text-xs text-slate-500">{selected ? selected.codexHome : "No account selected"}</div>
+        </div>
+        <div className="flex-1 space-y-4 overflow-auto p-5">
+          {selected ? (
+            <>
+              <Card className="border border-slate-200 shadow-none">
+                <Card.Content className="gap-4">
+                  <FieldLabel text="Nickname">
+                    <Input
+                      fullWidth
+                      value={label}
+                      variant="secondary"
+                      onChange={(event) => setLabel(event.currentTarget.value)}
+                    />
+                  </FieldLabel>
+                  <FieldLabel text="Pool status">
+                    <NativeSelect fullWidth variant="secondary">
+                      <NativeSelect.Trigger
+                        value={status}
+                        onChange={(event) => setStatus(event.currentTarget.value as AccountStatus)}
+                      >
+                        <NativeSelect.Option value="ready">ready</NativeSelect.Option>
+                        <NativeSelect.Option value="drain">drain</NativeSelect.Option>
+                        <NativeSelect.Option value="disabled">disabled</NativeSelect.Option>
+                      </NativeSelect.Trigger>
+                    </NativeSelect>
+                  </FieldLabel>
                   <div className="grid grid-cols-2 gap-2">
-                    <Button variant="flat" startContent={<Save size={15} />} isDisabled={busy} onPress={saveAccount}>Save</Button>
-                    <Button color="primary" startContent={<CheckCircle size={15} />} isDisabled={busy} onPress={activateAccount}>Switch</Button>
+                    <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={saveAccount}>
+                      <Save size={15} />
+                      Save
+                    </Button>
+                    <Button className="gap-2" isDisabled={busy} variant="primary" onPress={activateAccount}>
+                      <Play size={15} />
+                      Switch
+                    </Button>
                   </div>
-                  <Button color="danger" variant="flat" startContent={<Trash2 size={15} />} isDisabled={busy} onPress={deleteAccount}>
-                    Delete Account
+                  <Button className="gap-2" isDisabled={busy} variant="danger-soft" onPress={deleteAccount}>
+                    <Trash2 size={15} />
+                    Delete account
                   </Button>
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-600">
-                    {selected.codexHome}
-                  </div>
-                </>
-              ) : (
-                <div className="text-sm text-slate-500">Select an account.</div>
-              )}
-            </CardBody>
-          </Card>
+                </Card.Content>
+              </Card>
 
-          <Card radius="sm" shadow="sm" className="border border-slate-200 bg-white">
-            <CardHeader className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-              <h2 className="text-base font-semibold">Load Balancer</h2>
-              <Chip color="success" variant="flat">{eligibleCount} ready</Chip>
-            </CardHeader>
-            <CardBody className="gap-3 p-5">
-              <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
-                last: {lb?.lastAccountId || "-"}
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <Button color="primary" variant="flat" startContent={<Play size={15} />} onPress={pickNext}>Pick Next</Button>
-                <Button variant="flat" startContent={<RotateCcw size={15} />} onPress={resetLB}>Reset</Button>
-              </div>
-              {lb?.excluded.length ? (
-                <div className="space-y-1 text-xs text-slate-500">
-                  {lb.excluded.slice(0, 4).map((account) => (
-                    <div key={account.id} className="flex justify-between gap-2">
-                      <span>{account.label || shortID(account.id)}</span>
-                      <span>{account.reason}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-            </CardBody>
-          </Card>
-
-          <Card radius="sm" shadow="sm" className="border border-slate-200 bg-white">
-            <CardHeader className="border-b border-slate-100 px-5 py-4">
-              <h2 className="flex items-center gap-2 text-base font-semibold"><Upload size={17} /> Import</h2>
-            </CardHeader>
-            <CardBody className="gap-3 p-5">
-              <Button variant="flat" startContent={<Database size={15} />} isDisabled={busy} onPress={importLive}>
-                Import Current Codex
-              </Button>
-              <label className="flex h-12 cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 text-sm font-medium text-slate-700 hover:border-teal-500 hover:bg-teal-50">
-                <Upload size={15} />
-                Upload auth.json
-                <input ref={fileInput} type="file" accept=".json,application/json" className="hidden" onChange={uploadJSON} />
-              </label>
-            </CardBody>
-          </Card>
-
-          <Card radius="sm" shadow="sm" className="border border-slate-200 bg-white">
-            <CardHeader className="border-b border-slate-100 px-5 py-4">
-              <h2 className="flex items-center gap-2 text-base font-semibold"><FolderOpen size={17} /> settings.toml</h2>
-            </CardHeader>
-            <CardBody className="gap-4 p-5">
-              <form className="flex flex-col gap-3" onSubmit={savePathSettings}>
-                <Input label="live_codex_home" value={liveHome} onValueChange={setLiveHome} />
-                <Input label="accounts_dir" value={accountsDir} onValueChange={setAccountsDir} />
-                <Button type="submit" color="primary" variant="flat" isDisabled={busy}>Save Paths</Button>
-              </form>
-              <Divider />
-              <Textarea minRows={5} value={settingsToml} onValueChange={setSettingsToml} className="font-mono" />
-              <Button variant="flat" startContent={<Save size={15} />} isDisabled={busy} onPress={saveRawSettings}>Save TOML</Button>
-              <div className="break-all font-mono text-xs text-slate-500">{meta?.settingsPath}</div>
-            </CardBody>
-          </Card>
-
-          {message && (
-            <Card radius="sm" className="border border-teal-200 bg-teal-50 text-teal-900">
-              <CardBody className="p-4 text-sm">{message}</CardBody>
-            </Card>
+              <Card className="border border-slate-200 shadow-none">
+                <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">Files</Card.Header>
+                <Card.Content className="gap-3 text-xs">
+                  <FileLine icon={<ShieldCheck size={15} />} label="auth.json" present={selected.authPresent} path={selected.authPath} />
+                  <FileLine icon={<Settings size={15} />} label="config.toml" present={selected.configPresent} path={selected.configPath} />
+                </Card.Content>
+              </Card>
+            </>
+          ) : (
+            <EmptyState size="md" className="py-8">
+              <EmptyState.Media variant="icon">
+                <Database size={24} />
+              </EmptyState.Media>
+              <EmptyState.Title>Select an account</EmptyState.Title>
+              <EmptyState.Description>Use the account grid to inspect auth files and route status.</EmptyState.Description>
+            </EmptyState>
           )}
-        </aside>
-      </main>
+
+          <Card className="border border-slate-200 shadow-none">
+            <Card.Header className="border-b border-slate-100 px-4 py-3">
+              <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-950">
+                <FolderCog size={16} />
+                settings.toml
+              </h3>
+            </Card.Header>
+            <Card.Content className="gap-4">
+              <form className="flex flex-col gap-3" onSubmit={savePathSettings}>
+                <FieldLabel text="live_codex_home">
+                  <Input
+                    fullWidth
+                    value={liveHome}
+                    variant="secondary"
+                    onChange={(event) => setLiveHome(event.currentTarget.value)}
+                  />
+                </FieldLabel>
+                <FieldLabel text="accounts_dir">
+                  <Input
+                    fullWidth
+                    value={accountsDir}
+                    variant="secondary"
+                    onChange={(event) => setAccountsDir(event.currentTarget.value)}
+                  />
+                </FieldLabel>
+                <Button isDisabled={busy} type="submit" variant="primary">
+                  Save paths
+                </Button>
+              </form>
+              <Separator />
+              <TextArea
+                className="min-h-44 font-mono text-xs leading-5"
+                fullWidth
+                rows={9}
+                value={settingsToml}
+                variant="secondary"
+                onChange={(event) => setSettingsToml(event.currentTarget.value)}
+              />
+              <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={saveRawSettings}>
+                <Save size={15} />
+                Save TOML
+              </Button>
+              <div className="path-text font-mono text-xs text-slate-500">{meta?.settingsPath}</div>
+            </Card.Content>
+          </Card>
+        </div>
+      </div>
+    );
+  }
+}
+
+function NavItem({ active, badge, icon, label }: { active?: boolean; badge?: string; icon: ReactNode; label: string }) {
+  return (
+    <div
+      className={`flex h-10 items-center gap-3 rounded-xl px-3 text-sm ${
+        active ? "bg-slate-950 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"
+      }`}
+    >
+      <span className="grid h-6 w-6 place-items-center">{icon}</span>
+      <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
+      {badge && (
+        <span className={`rounded-full px-2 py-0.5 text-xs ${active ? "bg-white/15 text-white" : "bg-slate-200 text-slate-600"}`}>
+          {badge}
+        </span>
+      )}
     </div>
   );
 }
 
-function Metric({ label, value, accent }: { label: string; value: string; accent: string }) {
+function MetricCard({
+  icon,
+  label,
+  status,
+  value,
+}: {
+  icon: ReactNode;
+  label: string;
+  status: "success" | "warning" | "danger";
+  value: string;
+}) {
   return (
-    <Card radius="sm" shadow="sm" className="border border-slate-200 bg-white">
-      <CardBody className="flex flex-row items-center justify-between gap-3 p-4">
-        <div>
-          <div className="text-xs font-medium uppercase text-slate-500">{label}</div>
-          <div className="max-w-[150px] truncate text-2xl font-semibold tracking-normal text-slate-950">{value}</div>
+    <KPI className="border border-slate-200 bg-white shadow-sm">
+      <KPI.Header>
+        <KPI.Icon status={status}>{icon}</KPI.Icon>
+        <KPI.Title>{label}</KPI.Title>
+      </KPI.Header>
+      <KPI.Content>
+        <KPI.Value value={Number(value)}>{value}</KPI.Value>
+      </KPI.Content>
+    </KPI>
+  );
+}
+
+function FieldLabel({ children, text }: { children: ReactNode; text: string }) {
+  return (
+    <label className="flex min-w-0 flex-col gap-1.5">
+      <span className="text-xs font-medium text-slate-600">{text}</span>
+      {children}
+    </label>
+  );
+}
+
+function FileLine({
+  icon,
+  label,
+  path,
+  present,
+}: {
+  icon: ReactNode;
+  label: string;
+  path: string;
+  present: boolean;
+}) {
+  return (
+    <div className="rounded-lg bg-slate-50 p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2 font-medium text-slate-900">
+          {icon}
+          <span>{label}</span>
         </div>
-        <div className={`h-9 w-9 rounded-lg ${accent}`} />
-      </CardBody>
-    </Card>
+        <Chip color={present ? "success" : "danger"} size="sm" variant="soft">
+          {present ? "ready" : "missing"}
+        </Chip>
+      </div>
+      <div className="path-text font-mono text-slate-500">{path}</div>
+    </div>
   );
 }
