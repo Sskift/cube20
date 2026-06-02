@@ -39,6 +39,7 @@ func (a *App) Run() error {
 		fmt.Println("  u  summarize local token usage")
 		fmt.Println("  r  run Codex using an account CODEX_HOME")
 		fmt.Println("  s  set account status")
+		fmt.Println("  x  delete account")
 		fmt.Println("  q  quit")
 		fmt.Println()
 
@@ -74,6 +75,10 @@ func (a *App) Run() error {
 			}
 		case "s":
 			if err := a.setStatus(); err != nil {
+				a.pause(err.Error())
+			}
+		case "x":
+			if err := a.deleteAccount(); err != nil {
 				a.pause(err.Error())
 			}
 		case "q":
@@ -228,6 +233,21 @@ func (a *App) setStatus() error {
 		return err
 	}
 	a.pause("status updated")
+	return nil
+}
+
+func (a *App) deleteAccount() error {
+	id := a.prompt("Account id to delete")
+	confirm := a.prompt(fmt.Sprintf("Are you sure you want to delete %s? (y/n)", id))
+	if strings.ToLower(confirm) != "y" {
+		a.pause("cancelled")
+		return nil
+	}
+	account, err := a.Manager.DeleteAccount(id)
+	if err != nil {
+		return err
+	}
+	a.pause(fmt.Sprintf("deleted account %s at %s", account.ID, account.CodexHome))
 	return nil
 }
 

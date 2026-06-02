@@ -38,6 +38,10 @@ func run(args []string) error {
 		return runProfile(m, args[1:])
 	case "codex":
 		return runCodex(m, args[1:])
+	case "codex-auto", "run":
+		return runCodexAuto(m, args[1:])
+	case "lb":
+		return runLoadBalancer(m, args[1:])
 	case "dashboard":
 		return runDashboard(m, args[1:])
 	case "help", "-h", "--help":
@@ -73,11 +77,11 @@ func runAccounts(m *manager.Manager, args []string) error {
 	case "import":
 		id := ""
 		label := ""
-		if len(args) > 0 {
-			id = args[0]
-		}
 		if len(args) > 1 {
-			label = strings.Join(args[1:], " ")
+			id = args[1]
+		}
+		if len(args) > 2 {
+			label = strings.Join(args[2:], " ")
 		}
 		account, err := m.ImportLiveProfile(id, label, "")
 		if err != nil {
@@ -109,6 +113,16 @@ func runAccounts(m *manager.Manager, args []string) error {
 			return fmt.Errorf("usage: cube accounts usage <id>")
 		}
 		return printUsage(m, args[1])
+	case "delete", "remove":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: cube accounts delete <id>")
+		}
+		account, err := m.DeleteAccount(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("deleted account %s at %s\n", account.ID, account.CodexHome)
+		return nil
 	default:
 		return fmt.Errorf("unknown accounts command %q", args[0])
 	}
@@ -146,6 +160,62 @@ func runCodex(m *manager.Manager, args []string) error {
 		return err
 	}
 	return cmd.Run()
+}
+
+func runCodexAuto(m *manager.Manager, args []string) error {
+	account, err := m.SelectAccountForRun()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "cube: selected %s (%s)\n", account.ID, account.CodexHome)
+	cmd, err := m.CodexCommand(account.ID, args)
+	if err != nil {
+		return err
+	}
+	return cmd.Run()
+}
+
+func runLoadBalancer(m *manager.Manager, args []string) error {
+	if len(args) == 0 {
+		args = []string{"status"}
+	}
+	switch args[0] {
+	case "status":
+		status, err := m.LoadBalanceStatus()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("policy: %s\nstate: %s\nlast: %s\n", status.Policy, status.StatePath, emptyDash(status.LastAccountID))
+		fmt.Println("eligible:")
+		if len(status.Eligible) == 0 {
+			fmt.Println("  -")
+		}
+		for _, account := range status.Eligible {
+			fmt.Printf("  %s\t%s\t%s\n", account.ID, account.Label, account.CodexHome)
+		}
+		if len(status.Excluded) > 0 {
+			fmt.Println("excluded:")
+			for _, account := range status.Excluded {
+				fmt.Printf("  %s\t%s\t%s\n", account.ID, account.Status, account.Reason)
+			}
+		}
+		return nil
+	case "pick":
+		account, err := m.SelectAccountForRun()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s\t%s\t%s\n", account.ID, account.Label, account.CodexHome)
+		return nil
+	case "reset":
+		if err := m.ResetRoundRobin(); err != nil {
+			return err
+		}
+		fmt.Println("round-robin state reset")
+		return nil
+	default:
+		return fmt.Errorf("usage: cube lb [status|pick|reset]")
+	}
 }
 
 func runDashboard(m *manager.Manager, args []string) error {
@@ -251,6 +321,13 @@ func printUsage(m *manager.Manager, id string) error {
 	return nil
 }
 
+func emptyDash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value
+}
+
 func printHelp() {
 	fmt.Println("cube - local Codex account-pool manager")
 	fmt.Println()
@@ -263,8 +340,12 @@ func printHelp() {
 	fmt.Println("  cube accounts quota <id>")
 	fmt.Println("  cube accounts usage <id>")
 	fmt.Println("  cube accounts status <id> <ready|drain|disabled>")
+	fmt.Println("  cube accounts delete <id>")
 	fmt.Println("  cube profile deploy <id>")
 	fmt.Println("  cube auth deploy <id>")
 	fmt.Println("  cube codex <account-id> [codex args...]")
+	fmt.Println("  cube codex-auto [codex args...]")
+	fmt.Println("  cube run [codex args...]")
+	fmt.Println("  cube lb [status|pick|reset]")
 	fmt.Println("  cube dashboard [--host 127.0.0.1] [--port 8720]")
 }

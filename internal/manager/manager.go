@@ -13,18 +13,20 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"cube20/internal/quota"
 	"cube20/internal/usage"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 const (
 	defaultStateDirName    = ".cube20"
 	defaultAccountsDirName = ".codex-accounts"
 	settingsFileName       = "settings.toml"
+	roundRobinFileName     = "run-round-robin.json"
 	authFileName           = "auth.json"
 	configFileName         = "config.toml"
 )
@@ -58,6 +60,7 @@ type AccountView struct {
 	ConfigPresent bool      `json:"configPresent"`
 	ConfigPath    string    `json:"configPath"`
 	ConfigUpdated time.Time `json:"configUpdated,omitempty"`
+	Active        bool      `json:"active"`
 }
 
 type State struct {
@@ -65,9 +68,33 @@ type State struct {
 	Accounts []Account `json:"accounts"`
 }
 
+type roundRobinState struct {
+	LastAccountID string `json:"lastAccountId"`
+}
+
+type LoadBalanceAccount struct {
+	ID            string        `json:"id"`
+	Label         string        `json:"label"`
+	Status        AccountStatus `json:"status"`
+	AuthPresent   bool          `json:"authPresent"`
+	ConfigPresent bool          `json:"configPresent"`
+	Active        bool          `json:"active"`
+	CodexHome     string        `json:"codexHome"`
+	Eligible      bool          `json:"eligible"`
+	Reason        string        `json:"reason,omitempty"`
+}
+
+type LoadBalanceStatus struct {
+	Policy        string               `json:"policy"`
+	StatePath     string               `json:"statePath"`
+	LastAccountID string               `json:"lastAccountId"`
+	Eligible      []LoadBalanceAccount `json:"eligible"`
+	Excluded      []LoadBalanceAccount `json:"excluded"`
+}
+
 type Settings struct {
-	LiveCodexHome string `json:"liveCodexHome"`
-	AccountsDir   string `json:"accountsDir"`
+	LiveCodexHome string `json:"liveCodexHome" toml:"live_codex_home"`
+	AccountsDir   string `json:"accountsDir" toml:"accounts_dir"`
 }
 
 type JSONProfile struct {
@@ -174,6 +201,51 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir string) (Settings, e
 	}
 	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
 		return Settings{}, errors.New("settings paths cannot be empty")
+	}
+
+	if err := writeSettings(m.SettingsPath, settings); err != nil {
+		return Settings{}, err
+	}
+	m.LiveCodexHome = settings.LiveCodexHome
+	m.AccountsDir = settings.AccountsDir
+	if err := m.Ensure(); err != nil {
+		return Settings{}, err
+	}
+	return settings, nil
+}
+
+func (m *Manager) ReadSettingsText() (string, error) {
+	if err := m.Ensure(); err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(m.SettingsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		settings := Settings{LiveCodexHome: m.LiveCodexHome, AccountsDir: m.AccountsDir}
+		if err := writeSettings(m.SettingsPath, settings); err != nil {
+			return "", err
+		}
+		data, err = os.ReadFile(m.SettingsPath)
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return Settings{}, err
+	}
+
+	var settings Settings
+	if err := toml.Unmarshal([]byte(raw), &settings); err != nil {
+		return Settings{}, err
+	}
+	settings.LiveCodexHome = expandPath(settings.LiveCodexHome, home)
+	settings.AccountsDir = expandPath(settings.AccountsDir, home)
+	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
+		return Settings{}, errors.New("settings.toml must include live_codex_home and accounts_dir")
 	}
 
 	if err := writeSettings(m.SettingsPath, settings); err != nil {
@@ -696,6 +768,105 @@ func (m *Manager) SetLabel(id, label string) error {
 	return fmt.Errorf("account %q not found", id)
 }
 
+func (m *Manager) DeleteAccount(id string) (Account, error) {
+	state, err := m.Load()
+	if err != nil {
+		return Account{}, err
+	}
+
+	index := -1
+	var account Account
+	for i := range state.Accounts {
+		if state.Accounts[i].ID == id {
+			index = i
+			account = state.Accounts[i]
+			break
+		}
+	}
+	if index == -1 {
+		return Account{}, fmt.Errorf("account %q not found", id)
+	}
+
+	if err := m.validateManagedCodexHome(account.CodexHome); err != nil {
+		return Account{}, err
+	}
+	if err := os.RemoveAll(account.CodexHome); err != nil {
+		return Account{}, err
+	}
+
+	state.Accounts = append(state.Accounts[:index], state.Accounts[index+1:]...)
+	if err := m.Save(state); err != nil {
+		return Account{}, err
+	}
+	if roundRobin, err := m.loadRoundRobinState(); err == nil && roundRobin.LastAccountID == id {
+		_ = m.ResetRoundRobin()
+	}
+	return account, nil
+}
+
+func (m *Manager) validateManagedCodexHome(codexHome string) error {
+	if strings.TrimSpace(codexHome) == "" {
+		return errors.New("account codex home cannot be empty")
+	}
+
+	if samePath(codexHome, m.LiveCodexHome) {
+		return fmt.Errorf("refusing to delete live CodexHome %s", codexHome)
+	}
+	if defaultHome, err := defaultCodexHome(); err == nil && samePath(codexHome, defaultHome) {
+		return fmt.Errorf("refusing to delete live CodexHome %s", codexHome)
+	}
+	if !pathWithin(codexHome, m.AccountsDir) {
+		return fmt.Errorf("refusing to delete unmanaged CodexHome %s", codexHome)
+	}
+	return nil
+}
+
+func samePath(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	aAbs, errA := filepath.Abs(a)
+	bAbs, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return filepath.Clean(a) == filepath.Clean(b)
+	}
+	aReal, errA := filepath.EvalSymlinks(aAbs)
+	bReal, errB := filepath.EvalSymlinks(bAbs)
+	if errA == nil {
+		aAbs = aReal
+	}
+	if errB == nil {
+		bAbs = bReal
+	}
+	return filepath.Clean(aAbs) == filepath.Clean(bAbs)
+}
+
+func pathWithin(child, parent string) bool {
+	childAbs, err := filepath.Abs(child)
+	if err != nil {
+		return false
+	}
+	parentAbs, err := filepath.Abs(parent)
+	if err != nil {
+		return false
+	}
+	childReal, err := filepath.EvalSymlinks(childAbs)
+	if err == nil {
+		childAbs = childReal
+	}
+	parentReal, err := filepath.EvalSymlinks(parentAbs)
+	if err == nil {
+		parentAbs = parentReal
+	}
+	rel, err := filepath.Rel(filepath.Clean(parentAbs), filepath.Clean(childAbs))
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return false
+	}
+	return true
+}
+
 func (m *Manager) LoginCommand(id string) (*exec.Cmd, error) {
 	account, err := m.GetAccount(id)
 	if err != nil {
@@ -731,6 +902,148 @@ func (m *Manager) CodexCommand(id string, args []string) (*exec.Cmd, error) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd, nil
+}
+
+func (m *Manager) SelectAccountForRun() (AccountView, error) {
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return AccountView{}, err
+	}
+	defer unlock()
+
+	accounts, err := m.ListAccounts()
+	if err != nil {
+		return AccountView{}, err
+	}
+
+	available := make([]AccountView, 0, len(accounts))
+	for _, account := range accounts {
+		if account.Status == StatusReady && account.AuthPresent {
+			available = append(available, account)
+		}
+	}
+	if len(available) == 0 {
+		return AccountView{}, errors.New("no ready account with auth.json is available")
+	}
+	if len(available) == 1 {
+		if err := m.saveRoundRobinState(roundRobinState{LastAccountID: available[0].ID}); err != nil {
+			return AccountView{}, err
+		}
+		return available[0], nil
+	}
+
+	roundRobin, err := m.loadRoundRobinState()
+	if err != nil {
+		return AccountView{}, err
+	}
+	selected := available[0]
+	if roundRobin.LastAccountID != "" {
+		for i, account := range available {
+			if account.ID == roundRobin.LastAccountID {
+				selected = available[(i+1)%len(available)]
+				break
+			}
+		}
+	}
+
+	if err := m.saveRoundRobinState(roundRobinState{LastAccountID: selected.ID}); err != nil {
+		return AccountView{}, err
+	}
+	return selected, nil
+}
+
+func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
+	roundRobin, err := m.loadRoundRobinState()
+	if err != nil {
+		return LoadBalanceStatus{}, err
+	}
+	accounts, err := m.ListAccounts()
+	if err != nil {
+		return LoadBalanceStatus{}, err
+	}
+
+	status := LoadBalanceStatus{
+		Policy:        "round-robin",
+		StatePath:     filepath.Join(m.StateDir, roundRobinFileName),
+		LastAccountID: roundRobin.LastAccountID,
+		Eligible:      []LoadBalanceAccount{},
+		Excluded:      []LoadBalanceAccount{},
+	}
+	for _, account := range accounts {
+		entry := LoadBalanceAccount{
+			ID:            account.ID,
+			Label:         account.Label,
+			Status:        account.Status,
+			AuthPresent:   account.AuthPresent,
+			ConfigPresent: account.ConfigPresent,
+			Active:        account.Active,
+			CodexHome:     account.CodexHome,
+		}
+		entry.Eligible, entry.Reason = loadBalanceEligibility(account)
+		if entry.Eligible {
+			status.Eligible = append(status.Eligible, entry)
+		} else {
+			status.Excluded = append(status.Excluded, entry)
+		}
+	}
+	return status, nil
+}
+
+func loadBalanceEligibility(account AccountView) (bool, string) {
+	if account.Status != StatusReady {
+		return false, fmt.Sprintf("status is %s", account.Status)
+	}
+	if !account.AuthPresent {
+		return false, "auth.json missing"
+	}
+	return true, ""
+}
+
+func (m *Manager) ResetRoundRobin() error {
+	if err := m.Ensure(); err != nil {
+		return err
+	}
+	err := os.Remove(filepath.Join(m.StateDir, roundRobinFileName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (m *Manager) loadRoundRobinState() (roundRobinState, error) {
+	if err := m.Ensure(); err != nil {
+		return roundRobinState{}, err
+	}
+	data, err := os.ReadFile(filepath.Join(m.StateDir, roundRobinFileName))
+	if errors.Is(err, os.ErrNotExist) {
+		return roundRobinState{}, nil
+	}
+	if err != nil {
+		return roundRobinState{}, err
+	}
+	var state roundRobinState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return roundRobinState{}, err
+	}
+	return state, nil
+}
+
+func (m *Manager) saveRoundRobinState(state roundRobinState) error {
+	if err := m.Ensure(); err != nil {
+		return err
+	}
+	path := filepath.Join(m.StateDir, roundRobinFileName)
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, error) {
@@ -829,7 +1142,24 @@ func (m *Manager) accountView(account Account) AccountView {
 		view.ConfigPresent = true
 		view.ConfigUpdated = info.ModTime()
 	}
+	view.Active = m.isAccountActive(account)
 	return view
+}
+
+func (m *Manager) isAccountActive(account Account) bool {
+	liveAuth := filepath.Join(m.LiveCodexHome, authFileName)
+	accAuth := filepath.Join(account.CodexHome, authFileName)
+	liveData, err1 := os.ReadFile(liveAuth)
+	accData, err2 := os.ReadFile(accAuth)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	var liveMap, accMap map[string]any
+	_ = json.Unmarshal(liveData, &liveMap)
+	_ = json.Unmarshal(accData, &accMap)
+	id1 := authIdentity(liveMap)
+	id2 := authIdentity(accMap)
+	return id1 != "" && id1 == id2
 }
 
 func defaultCodexHome() (string, error) {
@@ -867,83 +1197,44 @@ func loadSettings(path string, defaults Settings, home string) (Settings, error)
 	}
 
 	settings := defaults
-	for lineNo, line := range strings.Split(string(data), "\n") {
-		line = stripTomlComment(line)
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		value, err := parseTomlString(parts[1])
-		if err != nil {
-			return Settings{}, fmt.Errorf("%s:%d: %w", path, lineNo+1, err)
-		}
-		switch key {
-		case "live_codex_home":
-			if strings.TrimSpace(value) != "" {
-				settings.LiveCodexHome = expandPath(value, home)
-			}
-		case "accounts_dir":
-			if strings.TrimSpace(value) != "" {
-				settings.AccountsDir = expandPath(value, home)
-			}
-		}
+	if err := toml.Unmarshal(data, &settings); err != nil {
+		return Settings{}, err
 	}
+	settings.LiveCodexHome = expandPath(settings.LiveCodexHome, home)
+	settings.AccountsDir = expandPath(settings.AccountsDir, home)
 	return settings, nil
 }
 
 func writeSettings(path string, settings Settings) error {
-	data := fmt.Sprintf(`# cube20 local settings
-# Codex itself uses CODEX_HOME, auth.json, config.toml, and sessions/.
-live_codex_home = %s
-accounts_dir = %s
-`, strconv.Quote(settings.LiveCodexHome), strconv.Quote(settings.AccountsDir))
+	data, err := toml.Marshal(settings)
+	if err != nil {
+		return err
+	}
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(data), 0o600); err != nil {
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmpPath, path)
 }
 
-func parseTomlString(value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", nil
+func (m *Manager) acquireLock(lockPath string) (func(), error) {
+	start := time.Now()
+	for {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			f.Close()
+			return func() {
+				_ = os.Remove(lockPath)
+			}, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		if time.Since(start) > 2*time.Second {
+			return nil, errors.New("timeout acquiring lock for round-robin selector")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if strings.HasPrefix(value, `"`) {
-		out, err := strconv.Unquote(value)
-		if err != nil {
-			return "", fmt.Errorf("invalid TOML string: %w", err)
-		}
-		return strings.TrimSpace(out), nil
-	}
-	return strings.Trim(strings.TrimSpace(value), `"`), nil
-}
-
-func stripTomlComment(line string) string {
-	inString := false
-	escaped := false
-	for i, ch := range line {
-		if escaped {
-			escaped = false
-			continue
-		}
-		if ch == '\\' && inString {
-			escaped = true
-			continue
-		}
-		if ch == '"' {
-			inString = !inString
-			continue
-		}
-		if ch == '#' && !inString {
-			return strings.TrimSpace(line[:i])
-		}
-	}
-	return strings.TrimSpace(line)
 }
 
 func expandPath(value, home string) string {
