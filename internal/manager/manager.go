@@ -97,6 +97,8 @@ type Settings struct {
 	LiveCodexHome    string `json:"liveCodexHome" toml:"live_codex_home"`
 	AccountsDir      string `json:"accountsDir" toml:"accounts_dir"`
 	SharedConfigPath string `json:"sharedConfigPath" toml:"shared_settings_path"`
+	CloudURL         string `json:"cloudUrl" toml:"cloud_url"`
+	CloudToken       string `json:"cloudToken" toml:"cloud_token"`
 }
 
 type JSONProfile struct {
@@ -106,6 +108,17 @@ type JSONProfile struct {
 	Config string          `json:"config"`
 }
 
+type ProfileSnapshot struct {
+	ID           string          `json:"id"`
+	Label        string          `json:"label"`
+	Plan         string          `json:"plan,omitempty"`
+	Status       AccountStatus   `json:"status,omitempty"`
+	Auth         json.RawMessage `json:"auth"`
+	Config       string          `json:"config,omitempty"`
+	SourceClient string          `json:"sourceClient,omitempty"`
+	UpdatedAt    time.Time       `json:"updatedAt,omitempty"`
+}
+
 type Manager struct {
 	StateDir         string
 	StatePath        string
@@ -113,6 +126,8 @@ type Manager struct {
 	AccountsDir      string
 	LiveCodexHome    string
 	SharedConfigPath string
+	CloudURL         string
+	CloudToken       string
 }
 
 func New() (*Manager, error) {
@@ -138,6 +153,8 @@ func New() (*Manager, error) {
 		AccountsDir:      settings.AccountsDir,
 		LiveCodexHome:    settings.LiveCodexHome,
 		SharedConfigPath: settings.SharedConfigPath,
+		CloudURL:         settings.CloudURL,
+		CloudToken:       settings.CloudToken,
 	}, nil
 }
 
@@ -206,6 +223,8 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir, sharedConfigPath st
 		LiveCodexHome:    m.LiveCodexHome,
 		AccountsDir:      m.AccountsDir,
 		SharedConfigPath: m.SharedConfigPath,
+		CloudURL:         m.CloudURL,
+		CloudToken:       m.CloudToken,
 	}
 	if strings.TrimSpace(liveCodexHome) != "" {
 		settings.LiveCodexHome = expandPath(liveCodexHome, home)
@@ -226,9 +245,36 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir, sharedConfigPath st
 	m.LiveCodexHome = settings.LiveCodexHome
 	m.AccountsDir = settings.AccountsDir
 	m.SharedConfigPath = settings.SharedConfigPath
+	m.CloudURL = settings.CloudURL
+	m.CloudToken = settings.CloudToken
 	if err := m.Ensure(); err != nil {
 		return Settings{}, err
 	}
+	return settings, nil
+}
+
+func (m *Manager) UpdateCloudSettings(cloudURL, cloudToken string) (Settings, error) {
+	settings := Settings{
+		LiveCodexHome:    m.LiveCodexHome,
+		AccountsDir:      m.AccountsDir,
+		SharedConfigPath: m.SharedConfigPath,
+		CloudURL:         m.CloudURL,
+		CloudToken:       m.CloudToken,
+	}
+	if strings.TrimSpace(cloudURL) != "" {
+		settings.CloudURL = strings.TrimSpace(cloudURL)
+	}
+	if strings.TrimSpace(cloudToken) != "" {
+		settings.CloudToken = strings.TrimSpace(cloudToken)
+	}
+	if settings.LiveCodexHome == "" || settings.AccountsDir == "" || settings.SharedConfigPath == "" {
+		return Settings{}, errors.New("settings paths cannot be empty")
+	}
+	if err := writeSettings(m.SettingsPath, settings); err != nil {
+		return Settings{}, err
+	}
+	m.CloudURL = settings.CloudURL
+	m.CloudToken = settings.CloudToken
 	return settings, nil
 }
 
@@ -238,7 +284,13 @@ func (m *Manager) ReadSettingsText() (string, error) {
 	}
 	data, err := os.ReadFile(m.SettingsPath)
 	if errors.Is(err, os.ErrNotExist) {
-		settings := Settings{LiveCodexHome: m.LiveCodexHome, AccountsDir: m.AccountsDir, SharedConfigPath: m.SharedConfigPath}
+		settings := Settings{
+			LiveCodexHome:    m.LiveCodexHome,
+			AccountsDir:      m.AccountsDir,
+			SharedConfigPath: m.SharedConfigPath,
+			CloudURL:         m.CloudURL,
+			CloudToken:       m.CloudToken,
+		}
 		if err := writeSettings(m.SettingsPath, settings); err != nil {
 			return "", err
 		}
@@ -260,6 +312,8 @@ func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
 		LiveCodexHome:    m.LiveCodexHome,
 		AccountsDir:      m.AccountsDir,
 		SharedConfigPath: m.SharedConfigPath,
+		CloudURL:         m.CloudURL,
+		CloudToken:       m.CloudToken,
 	}, home)
 	if err != nil {
 		return Settings{}, err
@@ -274,6 +328,8 @@ func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
 	m.LiveCodexHome = settings.LiveCodexHome
 	m.AccountsDir = settings.AccountsDir
 	m.SharedConfigPath = settings.SharedConfigPath
+	m.CloudURL = settings.CloudURL
+	m.CloudToken = settings.CloudToken
 	if err := m.Ensure(); err != nil {
 		return Settings{}, err
 	}
@@ -420,6 +476,176 @@ func (m *Manager) ImportJSONProfile(profile JSONProfile) (Account, error) {
 	}
 
 	return account, nil
+}
+
+func (m *Manager) ExportProfileSnapshot(id string) (ProfileSnapshot, error) {
+	account, err := m.GetAccount(id)
+	if err != nil {
+		return ProfileSnapshot{}, err
+	}
+
+	authPath := filepath.Join(account.CodexHome, authFileName)
+	authRaw, err := os.ReadFile(authPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return ProfileSnapshot{}, fmt.Errorf("account %q has no auth.json", id)
+	}
+	if err != nil {
+		return ProfileSnapshot{}, err
+	}
+
+	configText, err := m.ReadSharedConfigText()
+	if err != nil {
+		return ProfileSnapshot{}, err
+	}
+	updatedAt := account.UpdatedAt
+	if info, err := os.Stat(authPath); err == nil && info.ModTime().After(updatedAt) {
+		updatedAt = info.ModTime()
+	}
+
+	return ProfileSnapshot{
+		ID:        account.ID,
+		Label:     account.Label,
+		Plan:      account.Plan,
+		Status:    account.Status,
+		Auth:      prettyJSON(authRaw),
+		Config:    configText,
+		UpdatedAt: updatedAt,
+	}, nil
+}
+
+func (m *Manager) UpsertProfileSnapshot(snapshot ProfileSnapshot) (Account, error) {
+	account, err := m.UpsertJSONProfile(JSONProfile{
+		ID:     snapshot.ID,
+		Label:  snapshot.Label,
+		Auth:   snapshot.Auth,
+		Config: snapshot.Config,
+	})
+	if err != nil {
+		return Account{}, err
+	}
+
+	if snapshot.Status != "" {
+		switch snapshot.Status {
+		case StatusReady, StatusDrain, StatusDisabled:
+		default:
+			return Account{}, fmt.Errorf("unknown status %q", snapshot.Status)
+		}
+	}
+
+	state, err := m.Load()
+	if err != nil {
+		return Account{}, err
+	}
+	for i := range state.Accounts {
+		if state.Accounts[i].ID != account.ID {
+			continue
+		}
+		if strings.TrimSpace(snapshot.Label) != "" {
+			state.Accounts[i].Label = strings.TrimSpace(snapshot.Label)
+		}
+		if strings.TrimSpace(snapshot.Plan) != "" {
+			state.Accounts[i].Plan = strings.TrimSpace(snapshot.Plan)
+		}
+		if snapshot.Status != "" {
+			state.Accounts[i].Status = snapshot.Status
+		}
+		state.Accounts[i].UpdatedAt = time.Now()
+		account = state.Accounts[i]
+		break
+	}
+	if err := m.Save(state); err != nil {
+		return Account{}, err
+	}
+	return account, nil
+}
+
+func (m *Manager) UpsertJSONProfile(profile JSONProfile) (Account, error) {
+	authRaw := profile.Auth
+	if len(authRaw) == 0 || string(authRaw) == "null" {
+		return Account{}, errors.New("profile json must include auth, or upload a raw auth.json")
+	}
+
+	var auth map[string]any
+	if err := json.Unmarshal(authRaw, &auth); err != nil {
+		return Account{}, fmt.Errorf("auth is not valid JSON: %w", err)
+	}
+
+	state, err := m.Load()
+	if err != nil {
+		return Account{}, err
+	}
+
+	identity := authIdentity(auth)
+	id := strings.TrimSpace(profile.ID)
+	if id == "" {
+		id = sanitizeAccountID(deriveIDFromAuth(auth, profile.Label))
+		if id == "" {
+			id = uniqueFromUsed("profile-"+time.Now().Format("20060102-150405"), accountIDs(state))
+		}
+	}
+
+	existingIndex := -1
+	for i, account := range state.Accounts {
+		if account.ID == id {
+			existingIndex = i
+			break
+		}
+	}
+	if existingIndex < 0 && identity != "" {
+		for i, account := range state.Accounts {
+			existing := readAuthMetadata(filepath.Join(account.CodexHome, authFileName))
+			if authIdentity(existing) == identity {
+				existingIndex = i
+				break
+			}
+		}
+	}
+
+	label := strings.TrimSpace(profile.Label)
+	if label == "" {
+		label = deriveLabelFromAuth(auth)
+	}
+
+	if existingIndex >= 0 {
+		account := state.Accounts[existingIndex]
+		if err := m.writeProfileFiles(account, authRaw, profile.Config); err != nil {
+			return Account{}, err
+		}
+		if label != "" {
+			account.Label = label
+		}
+		account.UpdatedAt = time.Now()
+		state.Accounts[existingIndex] = account
+		if err := m.Save(state); err != nil {
+			return Account{}, err
+		}
+		return account, nil
+	}
+
+	account, err := m.AddAccount(id, label)
+	if err != nil {
+		return Account{}, err
+	}
+	if err := m.writeProfileFiles(account, authRaw, profile.Config); err != nil {
+		return Account{}, err
+	}
+	return account, nil
+}
+
+func (m *Manager) writeProfileFiles(account Account, authRaw json.RawMessage, config string) error {
+	if err := os.MkdirAll(account.CodexHome, 0o700); err != nil {
+		return err
+	}
+	authPath := filepath.Join(account.CodexHome, authFileName)
+	if err := os.WriteFile(authPath, prettyJSON(authRaw), fileModeFor(authFileName)); err != nil {
+		return err
+	}
+	if strings.TrimSpace(config) != "" {
+		if err := m.WriteSharedConfigText(config); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *Manager) ListAccounts() ([]AccountView, error) {
@@ -1297,6 +1523,8 @@ func defaultSettings(home string) Settings {
 		LiveCodexHome:    liveCodexHome,
 		AccountsDir:      filepath.Join(home, defaultAccountsDirName),
 		SharedConfigPath: filepath.Join(home, defaultStateDirName, sharedSettingsFileName),
+		CloudURL:         strings.TrimSpace(os.Getenv("CUBE_CLOUD_URL")),
+		CloudToken:       strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")),
 	}
 }
 
@@ -1344,6 +1572,8 @@ func parseSettingsData(data []byte, defaults Settings, home string) (Settings, b
 
 	settings.LiveCodexHome = expandPath(settings.LiveCodexHome, home)
 	settings.AccountsDir = expandPath(settings.AccountsDir, home)
+	settings.CloudURL = strings.TrimSpace(settings.CloudURL)
+	settings.CloudToken = strings.TrimSpace(settings.CloudToken)
 	if strings.TrimSpace(settings.SharedConfigPath) == "" {
 		settings.SharedConfigPath = defaults.SharedConfigPath
 		changed = true

@@ -1,6 +1,8 @@
 package web
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,9 +15,10 @@ import (
 )
 
 type Server struct {
-	Manager *manager.Manager
-	Host    string
-	Port    int
+	Manager    *manager.Manager
+	Host       string
+	Port       int
+	CloudToken string
 }
 
 func (s *Server) ListenAndServe() error {
@@ -27,17 +30,23 @@ func (s *Server) ListenAndServe() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/accounts/import-json", s.handleImportJSON)
-	mux.HandleFunc("/api/accounts/import-live", s.handleImportLive)
-	mux.HandleFunc("/api/accounts/pick", s.handleLBPick)
-	mux.HandleFunc("/api/lb/pick", s.handleLBPick)
-	mux.HandleFunc("/api/lb/reset", s.handleLBReset)
-	mux.HandleFunc("/api/lb/status", s.handleLBStatus)
-	mux.HandleFunc("/api/accounts", s.handleAccounts)
-	mux.HandleFunc("/api/accounts/", s.handleAccountAction)
-	mux.HandleFunc("/api/meta", s.handleMeta)
-	mux.HandleFunc("/api/settings", s.handleSettings)
-	mux.HandleFunc("/api/codex-config", s.handleCodexConfig)
+	api := func(handler http.HandlerFunc) http.HandlerFunc {
+		return s.withAPIAuth(handler)
+	}
+	mux.HandleFunc("/api/sync/push", api(s.handleSyncPush))
+	mux.HandleFunc("/api/sync/pull/", api(s.handleSyncPull))
+	mux.HandleFunc("/api/sync/claim", api(s.handleSyncClaim))
+	mux.HandleFunc("/api/accounts/import-json", api(s.handleImportJSON))
+	mux.HandleFunc("/api/accounts/import-live", api(s.handleImportLive))
+	mux.HandleFunc("/api/accounts/pick", api(s.handleLBPick))
+	mux.HandleFunc("/api/lb/pick", api(s.handleLBPick))
+	mux.HandleFunc("/api/lb/reset", api(s.handleLBReset))
+	mux.HandleFunc("/api/lb/status", api(s.handleLBStatus))
+	mux.HandleFunc("/api/accounts", api(s.handleAccounts))
+	mux.HandleFunc("/api/accounts/", api(s.handleAccountAction))
+	mux.HandleFunc("/api/meta", api(s.handleMeta))
+	mux.HandleFunc("/api/settings", api(s.handleSettings))
+	mux.HandleFunc("/api/codex-config", api(s.handleCodexConfig))
 
 	distSub, err := fs.Sub(webdist.DistFS, "dist")
 	if err != nil {
@@ -47,7 +56,41 @@ func (s *Server) ListenAndServe() error {
 
 	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
 	fmt.Printf("cube dashboard: http://%s\n", addr)
+	if strings.TrimSpace(s.CloudToken) != "" {
+		fmt.Println("cube dashboard: API bearer token is required")
+	}
 	return http.ListenAndServe(addr, mux)
+}
+
+func (s *Server) withAPIAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.apiAuthorized(r) {
+			next(w, r)
+			return
+		}
+		writeError(w, http.StatusUnauthorized, "missing or invalid cloud token")
+	}
+}
+
+func (s *Server) apiAuthorized(r *http.Request) bool {
+	expected := strings.TrimSpace(s.CloudToken)
+	if expected == "" {
+		return true
+	}
+	candidate := strings.TrimSpace(r.Header.Get("X-Cube-Token"))
+	if candidate == "" {
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+			candidate = strings.TrimSpace(auth[len("bearer "):])
+		}
+	}
+	if candidate == "" {
+		candidate = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	if len(candidate) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(candidate), []byte(expected)) == 1
 }
 
 func staticHandler(dist fs.FS) http.Handler {
@@ -135,6 +178,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			"accountsDir":        s.Manager.AccountsDir,
 			"sharedConfigPath":   s.Manager.SharedConfigPath,
 			"sharedSettingsPath": s.Manager.SharedConfigPath,
+			"cloudUrl":           s.Manager.CloudURL,
+			"cloudTokenPresent":  strings.TrimSpace(s.Manager.CloudToken) != "",
 		})
 	case http.MethodPatch:
 		var body struct {
@@ -177,6 +222,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			"accountsDir":        settings.AccountsDir,
 			"sharedConfigPath":   settings.SharedConfigPath,
 			"sharedSettingsPath": settings.SharedConfigPath,
+			"cloudUrl":           settings.CloudURL,
+			"cloudTokenPresent":  strings.TrimSpace(settings.CloudToken) != "",
 		})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -238,6 +285,75 @@ func (s *Server) handleCodexConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var snapshot manager.ProfileSnapshot
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&snapshot); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	account, err := s.Manager.UpsertJSONProfile(manager.JSONProfile{
+		ID:     snapshot.ID,
+		Label:  snapshot.Label,
+		Auth:   snapshot.Auth,
+		Config: snapshot.Config,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.ManagerAccountView(account))
+}
+
+func (s *Server) handleSyncPull(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/sync/pull/"), "/")
+	if id == "" {
+		id = strings.TrimSpace(r.URL.Query().Get("id"))
+	}
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing account id")
+		return
+	}
+	s.refreshBeforeExport(id)
+	snapshot, err := s.Manager.ExportProfileSnapshot(id)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (s *Server) handleSyncClaim(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	account, err := s.Manager.SelectAccountForRun()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.refreshBeforeExport(account.ID)
+	snapshot, err := s.Manager.ExportProfileSnapshot(account.ID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (s *Server) refreshBeforeExport(id string) {
+	_, _ = s.Manager.FetchQuota(context.Background(), id)
 }
 
 func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
