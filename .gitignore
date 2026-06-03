@@ -1,6 +1,7 @@
 bin/
-dist/
+/dist/
 .DS_Store
 *.log
 tmp/
-
+cache/
+web/node_modules/

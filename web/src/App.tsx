@@ -1,5 +1,5 @@
-import type { FormEvent, ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import type { FormEvent, ReactNode, RefObject } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Avatar,
   Button,
@@ -20,6 +20,7 @@ import {
   FolderCog,
   Gauge,
   Info,
+  PanelRightClose,
   PanelRightOpen,
   Play,
   RefreshCw,
@@ -181,6 +182,10 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const accountsSectionRef = useRef<HTMLElement | null>(null);
+  const lbSectionRef = useRef<HTMLElement | null>(null);
+  const importSectionRef = useRef<HTMLElement | null>(null);
+  const quotaAutoKeyRef = useRef("");
 
   const selected = useMemo(() => accounts.find((account) => account.id === selectedId), [accounts, selectedId]);
   const selectedKeys = useMemo<DataGridSelection>(() => (selectedId ? new Set<string>([selectedId]) : new Set<string>()), [selectedId]);
@@ -238,6 +243,26 @@ export default function App() {
     setLabel(selected.label || "");
     setStatus(selected.status);
   }, [selected]);
+
+  useEffect(() => {
+    if (loading || !accounts.length) return;
+    const key = accounts.map((account) => `${account.id}:${account.authPresent ? "1" : "0"}`).join("|");
+    if (quotaAutoKeyRef.current === key) return;
+    quotaAutoKeyRef.current = key;
+    for (const account of accounts) {
+      if (account.authPresent) void fetchQuota(account.id, true);
+    }
+  }, [accounts, loading]);
+
+  function scrollToSection(ref: RefObject<HTMLElement | null>) {
+    ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (compactShell) setSidebarOpen(false);
+  }
+
+  function openSettingsPanel() {
+    setAsideOpen(true);
+    if (compactShell) setSidebarOpen(false);
+  }
 
   async function withBusy(action: () => Promise<void>) {
     setBusy(true);
@@ -388,8 +413,8 @@ export default function App() {
         header: "Account",
         isRowHeader: true,
         allowsSorting: true,
-        width: 260,
-        minWidth: 220,
+        width: 240,
+        minWidth: 200,
         pinned: "start",
         sortFn: (a, b) => accountName(a).localeCompare(accountName(b)),
         cell: (account) => (
@@ -419,8 +444,8 @@ export default function App() {
       {
         id: "status",
         header: "Status",
-        width: 110,
-        minWidth: 96,
+        width: 96,
+        minWidth: 88,
         allowsSorting: true,
         accessorKey: "status",
         cell: (account) => (
@@ -436,15 +461,15 @@ export default function App() {
       {
         id: "files",
         header: "Files",
-        width: 150,
-        minWidth: 140,
+        width: 132,
+        minWidth: 124,
         cell: (account) => (
           <div className="flex flex-wrap gap-1.5">
             <Chip color={account.authPresent ? "success" : "danger"} size="sm" variant="soft">
-              auth.json
+              auth
             </Chip>
             <Chip color={account.configPresent ? "accent" : "warning"} size="sm" variant="soft">
-              settings
+              config
             </Chip>
           </div>
         ),
@@ -452,17 +477,22 @@ export default function App() {
       {
         id: "quota",
         header: "Quota",
-        width: 220,
-        minWidth: 200,
+        width: 190,
+        minWidth: 180,
         cell: (account) => {
           const summary = quotaSummary(quotas[account.id]);
           return (
             <div className="flex min-w-0 flex-col gap-1.5">
               <div className="flex items-center justify-between gap-2">
                 <span className="truncate text-xs font-medium text-slate-700">{summary.label}</span>
-                <Button size="sm" variant="ghost" onPress={() => fetchQuota(account.id)}>
-                  Check
-                </Button>
+                <Tooltip>
+                  <Tooltip.Trigger>
+                    <Button aria-label={`Check quota for ${accountName(account)}`} size="sm" variant="ghost" onPress={() => fetchQuota(account.id)}>
+                      <Gauge size={14} />
+                    </Button>
+                  </Tooltip.Trigger>
+                  <Tooltip.Content>Check quota</Tooltip.Content>
+                </Tooltip>
               </div>
               <ProgressBar aria-label="Quota remaining" color={summary.color} size="sm" value={summary.value} />
             </div>
@@ -472,15 +502,20 @@ export default function App() {
       {
         id: "usage",
         header: "Local Usage",
-        width: 160,
-        minWidth: 150,
+        width: 140,
+        minWidth: 132,
         cell: (account) => {
           const usage = usages[account.id];
           if (!usage) {
             return (
-              <Button size="sm" variant="ghost" onPress={() => fetchUsage(account.id)}>
-                Load usage
-              </Button>
+              <Tooltip>
+                <Tooltip.Trigger>
+                  <Button aria-label={`Load local usage for ${accountName(account)}`} size="sm" variant="ghost" onPress={() => fetchUsage(account.id)}>
+                    <RefreshCw size={14} />
+                  </Button>
+                </Tooltip.Trigger>
+                <Tooltip.Content>Load usage</Tooltip.Content>
+              </Tooltip>
             );
           }
           return (
@@ -494,8 +529,8 @@ export default function App() {
       {
         id: "home",
         header: "CODEX_HOME",
-        width: 320,
-        minWidth: 260,
+        width: 272,
+        minWidth: 240,
         cell: (account) => (
           <Tooltip>
             <Tooltip.Trigger className="block max-w-full text-left">
@@ -521,9 +556,10 @@ export default function App() {
         </div>
       </div>
       <div className="flex flex-1 flex-col gap-1 px-3 py-4 text-sm">
-        <NavItem icon={<Database size={17} />} label="Accounts" active badge={accounts.length.toString()} />
-        <NavItem icon={<Route size={17} />} label="Load Balancer" badge={eligibleCount.toString()} />
-        <NavItem icon={<FolderCog size={17} />} label="Settings" />
+        <NavItem icon={<Database size={17} />} label="Accounts" active badge={accounts.length.toString()} onPress={() => scrollToSection(accountsSectionRef)} />
+        <NavItem icon={<Route size={17} />} label="Load Balancer" badge={eligibleCount.toString()} onPress={() => scrollToSection(lbSectionRef)} />
+        <NavItem icon={<FileJson size={17} />} label="Import auth" onPress={() => scrollToSection(importSectionRef)} />
+        <NavItem icon={<FolderCog size={17} />} label="Settings" onPress={openSettingsPanel} />
       </div>
       <div className="border-t border-slate-200 p-3">
         <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
@@ -545,11 +581,13 @@ export default function App() {
         )}
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold text-slate-950">{compactShell ? "cube20 accounts" : "Account inventory"}</div>
-          <div className="path-text hidden text-xs text-slate-500 min-[560px]:block">{meta?.accountsDir || "Loading accounts directory"}</div>
+          <div className="hidden max-w-[min(44vw,34rem)] truncate text-xs text-slate-500 min-[760px]:block">
+            {meta?.accountsDir || "Loading accounts directory"}
+          </div>
         </div>
       </div>
       <div className="cube-navbar-actions flex shrink-0 items-center gap-1.5 sm:gap-2">
-        <Chip className="hidden min-[760px]:inline-flex" color={meta?.liveAuthPresent ? "success" : "warning"} size="sm" variant="soft">
+        <Chip className="hidden min-[900px]:inline-flex" color={meta?.liveAuthPresent ? "success" : "warning"} size="sm" variant="soft">
           live auth {meta?.liveAuthPresent ? "ready" : "missing"}
         </Chip>
         <button
@@ -558,16 +596,16 @@ export default function App() {
           type="button"
           onClick={() => setAsideOpen((open) => !open)}
         >
-          <PanelRightOpen size={15} />
-          <span className="hidden min-[560px]:inline">Details</span>
+          {asideOpen ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
+          <span className="hidden min-[700px]:inline">Details</span>
         </button>
         <Button aria-label="Refresh" className="gap-2" size="sm" variant="secondary" onPress={() => loadAll()}>
           <RefreshCw size={15} />
-          <span className="hidden min-[560px]:inline">Refresh</span>
+          <span className="hidden min-[700px]:inline">Refresh</span>
         </Button>
         <Button aria-label="Quotas" className="gap-2" size="sm" variant="primary" onPress={refreshAllQuotas}>
           <Gauge size={15} />
-          <span className="hidden min-[560px]:inline">Quotas</span>
+          <span className="hidden min-[700px]:inline">Quotas</span>
         </Button>
       </div>
     </div>
@@ -580,7 +618,7 @@ export default function App() {
       asideMaxSize={38}
       asideMinSize={24}
       asideMobile="sheet"
-      asideResizable
+      asideResizable={!compactShell}
       className="h-screen bg-slate-50"
       asideOpen={asideOpen}
       onAsideOpenChange={setAsideOpen}
@@ -597,31 +635,76 @@ export default function App() {
       sidebarVariant="sidebar"
     >
       <div className="cube-content mx-auto flex w-full max-w-[1500px] flex-col gap-4 p-3 sm:p-4 lg:gap-5 lg:p-6">
-        <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <div className="hidden grid-cols-2 gap-2 min-[640px]:gap-3 lg:grid xl:grid-cols-4">
           <MetricCard icon={<Database size={18} />} label="Accounts" value={accounts.length.toString()} status="success" />
           <MetricCard icon={<CheckCircle2 size={18} />} label="Ready Pool" value={readyCount.toString()} status="success" />
           <MetricCard icon={<Route size={18} />} label="LB Eligible" value={eligibleCount.toString()} status="warning" />
           <MetricCard icon={<CircleSlash size={18} />} label="Missing Settings" value={missingConfigCount.toString()} status="danger" />
         </div>
 
-        <Card className="overflow-hidden border border-slate-200 bg-white shadow-sm">
-          <Card.Header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 sm:px-5 sm:py-4">
-            <div className="min-w-0">
-              <h1 className="text-lg font-semibold leading-6 text-slate-950">Accounts</h1>
-              <p className="path-text text-xs text-slate-500">Active: {accountName(activeAccount)}</p>
+        <section ref={accountsSectionRef} className="scroll-mt-20">
+          <Card className="overflow-hidden border border-slate-200 bg-white shadow-sm">
+          <Card.Header className="cube-accounts-header border-b border-slate-200 px-4 py-3 sm:px-5 sm:py-4">
+            <div className="cube-accounts-title min-w-0">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-slate-100 text-slate-700">
+                  <Database size={16} />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-base font-semibold leading-5 text-slate-950">Accounts</h2>
+                  <p className="path-text text-xs text-slate-500">
+                    {accounts.length} profiles · Active: {accountName(activeAccount)}
+                  </p>
+                </div>
+              </div>
+              <div className="cube-accounts-chips">
+                <Chip color="success" size="sm" variant="soft">
+                  {readyCount} ready
+                </Chip>
+                <Chip color="accent" size="sm" variant="soft">
+                  {eligibleCount} lb
+                </Chip>
+                <Chip color={missingConfigCount ? "warning" : "success"} size="sm" variant="soft">
+                  {missingConfigCount} missing settings
+                </Chip>
+              </div>
             </div>
-            <div className="flex shrink-0 gap-2">
-              <Button className="gap-2" isDisabled={!selected || busy} variant="primary" onPress={activateAccount}>
+            <div className="cube-account-toolbar">
+              <Button
+                aria-label="Switch selected account"
+                className="cube-action-button gap-2"
+                isDisabled={!selected || busy}
+                size="sm"
+                variant="primary"
+                onPress={activateAccount}
+              >
                 <Play size={15} />
-                <span className="hidden min-[420px]:inline">Switch</span>
+                <span className="cube-action-label">Switch</span>
               </Button>
-              <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={importLive}>
+              <Button
+                aria-label="Import current live auth"
+                className="cube-action-button gap-2"
+                isDisabled={busy}
+                size="sm"
+                variant="secondary"
+                onPress={importLive}
+              >
                 <UploadCloud size={15} />
-                <span className="hidden min-[420px]:inline">Import live</span>
+                <span className="cube-action-label">Import live</span>
               </Button>
             </div>
           </Card.Header>
           <Card.Content className="p-0">
+            {!loading && accounts.length > 0 && (
+              <QuotaOverview
+                accounts={accounts}
+                busy={busy}
+                quotas={quotas}
+                selectedId={selectedId}
+                onRefreshAll={refreshAllQuotas}
+                onSelect={(id) => setSelectedId(id)}
+              />
+            )}
             {loading ? (
               <div className="space-y-3 p-5">
                 <Skeleton className="h-16 rounded-xl" />
@@ -630,7 +713,7 @@ export default function App() {
               </div>
             ) : (
               <>
-                <div className="grid gap-3 p-3 md:hidden">
+                <div className="grid gap-3 p-3 sm:grid-cols-2 lg:hidden">
                   {accounts.length ? (
                     accounts.map((account) => (
                       <MobileAccountCard
@@ -654,13 +737,13 @@ export default function App() {
                     </EmptyState>
                   )}
                 </div>
-                <div className="hidden md:block">
+                <div className="hidden lg:block">
                   <DataGrid
                     aria-label="Codex accounts"
                     allowsColumnResize
                     className="account-grid"
                     columns={columns}
-                    contentClassName="min-w-[1100px]"
+                    contentClassName="min-w-[1080px]"
                     data={accounts}
                     getRowId={(account) => account.id}
                     onRowAction={(key) => setSelectedId(String(key))}
@@ -689,8 +772,10 @@ export default function App() {
             )}
           </Card.Content>
         </Card>
+        </section>
 
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+          <section ref={lbSectionRef} className="scroll-mt-20">
           <Card className="border border-slate-200 bg-white shadow-sm">
             <Card.Header className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
               <div>
@@ -718,7 +803,9 @@ export default function App() {
               </div>
             </Card.Content>
           </Card>
+          </section>
 
+          <section ref={importSectionRef} className="scroll-mt-20">
           <Card className="border border-slate-200 bg-white shadow-sm">
             <Card.Header className="border-b border-slate-200 px-5 py-4">
               <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
@@ -739,6 +826,7 @@ export default function App() {
               </DropZone>
             </Card.Content>
           </Card>
+          </section>
         </div>
 
         {message && (
@@ -871,12 +959,181 @@ export default function App() {
   }
 }
 
-function NavItem({ active, badge, icon, label }: { active?: boolean; badge?: string; icon: ReactNode; label: string }) {
+function quotaSeverity(usedPercent: number) {
+  if (usedPercent >= 90) return "danger";
+  if (usedPercent >= 70) return "warning";
+  return "healthy";
+}
+
+function shortQuotaLabel(value: string) {
+  return value
+    .replace(" window", "")
+    .replace("Weekly", "7d")
+    .replace("All-Model", "all")
+    .replace("Code review", "Review");
+}
+
+function QuotaOverview({
+  accounts,
+  busy,
+  onRefreshAll,
+  onSelect,
+  quotas,
+  selectedId,
+}: {
+  accounts: Account[];
+  busy: boolean;
+  onRefreshAll: () => void;
+  onSelect: (id: string) => void;
+  quotas: Record<string, QuotaResult>;
+  selectedId: string;
+}) {
+  const quotaWindows = accounts.flatMap((account) =>
+    (quotas[account.id]?.quotas || []).map((quota) => ({
+      account,
+      quota,
+      remainingPercent: Math.max(0, Math.min(100, 100 - quota.usedPercent)),
+    })),
+  );
+  const tightest = quotaWindows.sort((a, b) => a.remainingPercent - b.remainingPercent)[0];
+  const checkedCount = accounts.filter((account) => quotas[account.id]).length;
+
   return (
-    <div
-      className={`flex h-10 items-center gap-3 rounded-xl px-3 text-sm ${
+    <div className="quota-menubar border-b border-slate-200 bg-slate-50/70 px-3 py-3">
+      <div className="quota-menubar-head">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white text-slate-700 shadow-sm ring-1 ring-slate-200">
+            <Gauge size={15} />
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold leading-5 text-slate-950">Subscription balance</div>
+            <div className="truncate text-xs text-slate-500">
+              {tightest
+                ? `${accountName(tightest.account)} · ${tightest.quota.remainingDisplay} left`
+                : checkedCount
+                  ? "Quota checked, no subscription window returned yet"
+                  : "Checking quota for every auth.json account"}
+            </div>
+          </div>
+        </div>
+        <div className="quota-menubar-actions">
+          <div className="quota-headline-stat">
+            <span>Lowest balance</span>
+            <strong>{tightest ? `${tightest.quota.remainingDisplay} left` : "Pending"}</strong>
+          </div>
+          <Button className="gap-2" isDisabled={busy || !accounts.length} size="sm" variant="secondary" onPress={onRefreshAll}>
+            <RefreshCw size={14} />
+            Refresh
+          </Button>
+        </div>
+      </div>
+
+      <div className="quota-provider-row" aria-label="Account quota balance">
+        {accounts.map((account) => (
+          <QuotaProviderCard
+            key={account.id}
+            account={account}
+            isSelected={account.id === selectedId}
+            quota={quotas[account.id]}
+            onSelect={() => onSelect(account.id)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function QuotaProviderCard({
+  account,
+  isSelected,
+  onSelect,
+  quota,
+}: {
+  account: Account;
+  isSelected: boolean;
+  onSelect: () => void;
+  quota?: QuotaResult;
+}) {
+  const windows = quota?.quotas || [];
+  const tightestWindow = [...windows].sort((a, b) => b.usedPercent - a.usedPercent)[0];
+  const headline =
+    quota?.status === "supported" && windows.length
+      ? `${tightestWindow.remainingDisplay} left`
+      : quota?.status === "loading"
+        ? "Checking..."
+        : quota?.status
+          ? quotaSummary(quota).label
+          : "Queued";
+  const severity =
+    quota?.status === "supported" && windows.length
+      ? quotaSeverity(Math.max(...windows.map((item) => item.usedPercent)))
+      : quota?.status === "error" || quota?.status === "refresh_token_invalidated"
+        ? "danger"
+        : quota?.status === "unsupported_api_key"
+          ? "warning"
+          : "muted";
+
+  return (
+    <button
+      aria-label={`Select ${accountName(account)} quota card`}
+      className={`quota-provider-card status-${severity}${isSelected ? " is-selected" : ""}`}
+      title={quota?.detail || account.codexHome}
+      type="button"
+      onClick={onSelect}
+    >
+      <div className="quota-provider-header">
+        <span className="quota-provider-dot" />
+        <span className="quota-provider-name">{accountName(account)}</span>
+        {account.active && <span className="quota-provider-pill">active</span>}
+      </div>
+      <div className="quota-provider-meta">
+        <span>{quota?.plan || account.plan || account.status}</span>
+        <strong>{headline}</strong>
+      </div>
+      {windows.length ? (
+        <div className="quota-meter-list">
+          {windows.slice(0, 3).map((item) => {
+            const remaining = Math.max(0, Math.min(100, 100 - item.usedPercent));
+            return (
+              <div key={item.label} className={`quota-inline-meter status-${quotaSeverity(item.usedPercent)}`}>
+                <div className="quota-inline-top">
+                  <span>{shortQuotaLabel(item.label)}</span>
+                  <strong>{item.remainingDisplay}</strong>
+                </div>
+                <div className="quota-inline-track">
+                  <span style={{ width: `${remaining}%` }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="quota-provider-empty">{quota?.detail || (account.authPresent ? "Waiting for quota data" : "auth.json missing")}</div>
+      )}
+    </button>
+  );
+}
+
+function NavItem({
+  active,
+  badge,
+  icon,
+  label,
+  onPress,
+}: {
+  active?: boolean;
+  badge?: string;
+  icon: ReactNode;
+  label: string;
+  onPress: () => void;
+}) {
+  return (
+    <button
+      className={`cube-nav-button flex h-10 w-full items-center gap-3 rounded-xl px-3 text-left text-sm ${
         active ? "bg-slate-950 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"
       }`}
+      type="button"
+      onClick={onPress}
     >
       <span className="grid h-6 w-6 place-items-center">{icon}</span>
       <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
@@ -885,7 +1142,7 @@ function NavItem({ active, badge, icon, label }: { active?: boolean; badge?: str
           {badge}
         </span>
       )}
-    </div>
+    </button>
   );
 }
 
@@ -913,15 +1170,6 @@ function MobileAccountCard({
       className={`cube-mobile-account rounded-lg border bg-white p-3 shadow-sm ${
         isSelected ? "border-slate-900 ring-1 ring-slate-900" : "border-slate-200"
       }`}
-      role="button"
-      tabIndex={0}
-      onClick={onSelect}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onSelect();
-        }
-      }}
     >
       <div className="flex min-w-0 items-start gap-3">
         <Avatar className="shrink-0" color="accent" size="md" variant="soft">
@@ -941,56 +1189,85 @@ function MobileAccountCard({
           </div>
           <div className="mt-1 font-mono text-xs text-slate-500">{shortID(account.id)}</div>
         </div>
+        <Button
+          className="shrink-0 gap-1.5"
+          size="sm"
+          variant={isSelected ? "primary" : "secondary"}
+          onPress={onSelect}
+        >
+          {isSelected ? <CheckCircle2 size={14} /> : <PanelRightOpen size={14} />}
+          <span>{isSelected ? "Selected" : "Select"}</span>
+        </Button>
       </div>
 
       <div className="mt-3 flex flex-wrap gap-1.5">
         <Chip color={account.authPresent ? "success" : "danger"} size="sm" variant="soft">
-          auth.json
+          auth
         </Chip>
         <Chip color={account.configPresent ? "accent" : "warning"} size="sm" variant="soft">
-          settings
+          config
         </Chip>
       </div>
 
-      <div className="mt-3 rounded-md bg-slate-50 p-3">
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <span className="truncate text-xs font-medium text-slate-700">{summary.label}</span>
-          <Button
-            size="sm"
-            variant="ghost"
-            onPress={() => {
-              onFetchQuota();
-            }}
-          >
-            Check
-          </Button>
-        </div>
-        <ProgressBar aria-label="Quota remaining" color={summary.color} size="sm" value={summary.value} />
-      </div>
-
-      <div className="mt-3 flex items-center justify-between gap-2 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
-        {usage ? (
-          <div className="min-w-0">
-            <div className="font-semibold text-slate-900">{tokens(usage.today?.total)} today</div>
-            <div>{tokens(usage.sevenDays?.total)} over 7d</div>
+      {isSelected ? (
+        <>
+          <div className="mt-3 rounded-md bg-slate-50 p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <span className="truncate text-xs font-medium text-slate-700">{summary.label}</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={(event) => event.stopPropagation()}
+                onPress={() => {
+                  onFetchQuota();
+                }}
+              >
+                Check
+              </Button>
+            </div>
+            <ProgressBar aria-label="Quota remaining" color={summary.color} size="sm" value={summary.value} />
           </div>
-        ) : (
-          <span className="font-medium text-slate-700">Local usage</span>
-        )}
-        {!usage && (
-          <Button
-            size="sm"
-            variant="ghost"
-            onPress={() => {
-              onFetchUsage();
-            }}
-          >
-            Load
-          </Button>
-        )}
-      </div>
 
-      <code className="path-text mt-3 block rounded-md bg-slate-50 p-2 text-xs leading-5 text-slate-500">{account.codexHome}</code>
+          <div className="mt-3 flex items-center justify-between gap-2 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
+            {usage ? (
+              <div className="min-w-0">
+                <div className="font-semibold text-slate-900">{tokens(usage.today?.total)} today</div>
+                <div>{tokens(usage.sevenDays?.total)} over 7d</div>
+              </div>
+            ) : (
+              <span className="font-medium text-slate-700">Local usage</span>
+            )}
+            {!usage && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={(event) => event.stopPropagation()}
+                onPress={() => {
+                  onFetchUsage();
+                }}
+              >
+                Load
+              </Button>
+            )}
+          </div>
+
+          <div className="mt-3 rounded-md bg-slate-50 p-2">
+            <div className="mb-1 text-[11px] font-semibold uppercase leading-4 text-slate-400">CODEX_HOME</div>
+            <code className="cube-mobile-path path-text block text-xs leading-5 text-slate-500">{account.codexHome}</code>
+          </div>
+        </>
+      ) : (
+        <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+          <div className="min-w-0 rounded-md bg-slate-50 p-2">
+            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">Quota</div>
+            <div className="truncate font-medium text-slate-700">{summary.label}</div>
+          </div>
+          <div className="min-w-0 rounded-md bg-slate-50 p-2">
+            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">Usage</div>
+            <div className="truncate font-medium text-slate-700">{usage ? `${tokens(usage.today?.total)} today` : "Not loaded"}</div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
