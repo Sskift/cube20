@@ -205,6 +205,7 @@ func New() (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	settings = applyEnvironmentOverrides(settings)
 
 	return &Manager{
 		StateDir:         stateDir,
@@ -217,6 +218,19 @@ func New() (*Manager, error) {
 		CloudToken:       settings.CloudToken,
 		DatabaseURL:      settings.DatabaseURL,
 	}, nil
+}
+
+func applyEnvironmentOverrides(settings Settings) Settings {
+	if value := strings.TrimSpace(os.Getenv("CUBE_CLOUD_URL")); value != "" {
+		settings.CloudURL = value
+	}
+	if value := strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")); value != "" {
+		settings.CloudToken = value
+	}
+	if value := firstNonEmpty(os.Getenv("CUBE_DATABASE_URL"), os.Getenv("DATABASE_URL")); value != "" {
+		settings.DatabaseURL = value
+	}
+	return settings
 }
 
 func (m *Manager) Ensure() error {
