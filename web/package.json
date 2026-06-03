@@ -10,7 +10,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@heroui-pro/react": "^1.0.0-beta.5",
     "@heroui/react": "^3.1.0",
     "@heroui/styles": "^3.1.0",
     "@number-flow/react": "^0.5.14",
@@ -18,7 +17,6 @@
     "embla-carousel": "^8.6.0",
     "embla-carousel-react": "^8.6.0",
     "framer-motion": "^12.40.0",
-    "heroui-native-pro": "^1.0.0-beta.3",
     "lucide-react": "^1.17.0",
     "marked": "^18.0.4",
     "motion": "^12.40.0",

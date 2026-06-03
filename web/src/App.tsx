@@ -1,4 +1,4 @@
-import type { FormEvent, ReactNode } from "react";
+import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Avatar,
@@ -30,13 +30,6 @@ import {
   Trash2,
   UploadCloud,
 } from "lucide-react";
-import {
-  AppLayout,
-  DropZone,
-  EmptyState,
-  KPI,
-  NativeSelect,
-} from "@heroui-pro/react";
 
 type AccountStatus = "ready" | "drain" | "disabled";
 
@@ -253,6 +246,144 @@ function quotaHint(quota?: QuotaResult) {
   if (quota.status === "error") return quota.detail || "Quota check failed.";
   return "";
 }
+
+function AppLayout({
+  aside,
+  asideOpen,
+  children,
+  className = "",
+  navbar,
+  sidebar,
+  sidebarOpen,
+}: {
+  aside?: ReactNode;
+  asideDefaultSize?: number;
+  asideMaxSize?: number;
+  asideMinSize?: number;
+  asideMobile?: string;
+  asideOpen?: boolean;
+  asideResizable?: boolean;
+  children: ReactNode;
+  className?: string;
+  navbar?: ReactNode;
+  onAsideOpenChange?: (open: boolean) => void;
+  onSidebarOpenChange?: (open: boolean) => void;
+  scrollMode?: string;
+  sidebar?: ReactNode;
+  sidebarCollapsible?: string;
+  sidebarDefaultSize?: number;
+  sidebarMaxSize?: number;
+  sidebarMinSize?: number;
+  sidebarOpen?: boolean;
+  sidebarResizable?: boolean;
+  sidebarVariant?: string;
+}) {
+  return (
+    <div className={`flex min-h-0 overflow-hidden ${className}`}>
+      {sidebar && sidebarOpen !== false && <aside className="hidden w-[17rem] shrink-0 lg:block">{sidebar}</aside>}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {navbar}
+        <main className="min-h-0 flex-1 overflow-auto">{children}</main>
+      </div>
+      {aside && asideOpen && <aside className="hidden w-[24rem] shrink-0 border-l border-slate-200 xl:block">{aside}</aside>}
+    </div>
+  );
+}
+
+const DropZone = Object.assign(
+  function DropZoneRoot({ children }: { children: ReactNode }) {
+    return <div>{children}</div>;
+  },
+  {
+    Area({ children, className = "" }: { children: ReactNode; className?: string }) {
+      return <div className={className}>{children}</div>;
+    },
+    Icon({ children }: { children: ReactNode }) {
+      return <div className="mb-2 flex justify-center text-slate-500">{children}</div>;
+    },
+    Label({ children }: { children: ReactNode }) {
+      return <div className="text-sm font-semibold text-slate-900">{children}</div>;
+    },
+    Description({ children }: { children: ReactNode }) {
+      return <div className="mt-1 text-xs text-slate-500">{children}</div>;
+    },
+    Input({ accept, onSelect }: { accept?: string; onSelect: (files: FileList) => void }) {
+      return (
+        <input
+          accept={accept}
+          className="mt-3 text-sm text-slate-600"
+          type="file"
+          onChange={(event: ChangeEvent<HTMLInputElement>) => {
+            if (event.currentTarget.files) onSelect(event.currentTarget.files);
+          }}
+        />
+      );
+    },
+  },
+);
+
+const EmptyState = Object.assign(
+  function EmptyStateRoot({ children, className = "" }: { children: ReactNode; className?: string; size?: string }) {
+    return <div className={`flex flex-col items-center justify-center text-center ${className}`}>{children}</div>;
+  },
+  {
+    Media({ children }: { children: ReactNode; variant?: string }) {
+      return <div className="mb-3 grid h-12 w-12 place-items-center rounded-lg bg-slate-100 text-slate-500">{children}</div>;
+    },
+    Title({ children }: { children: ReactNode }) {
+      return <div className="text-sm font-semibold text-slate-950">{children}</div>;
+    },
+    Description({ children }: { children: ReactNode }) {
+      return <div className="mt-1 max-w-sm text-xs text-slate-500">{children}</div>;
+    },
+  },
+);
+
+const KPI = Object.assign(
+  function KPIRoot({ children, className = "" }: { children: ReactNode; className?: string }) {
+    return <div className={`rounded-lg p-4 ${className}`}>{children}</div>;
+  },
+  {
+    Header({ children }: { children: ReactNode }) {
+      return <div className="mb-3 flex items-center gap-2">{children}</div>;
+    },
+    Icon({ children, status }: { children: ReactNode; status: "success" | "warning" | "danger" }) {
+      const color = status === "success" ? "text-emerald-600 bg-emerald-50" : status === "warning" ? "text-amber-600 bg-amber-50" : "text-rose-600 bg-rose-50";
+      return <div className={`grid h-8 w-8 place-items-center rounded-md ${color}`}>{children}</div>;
+    },
+    Title({ children }: { children: ReactNode }) {
+      return <div className="text-xs font-medium uppercase text-slate-500">{children}</div>;
+    },
+    Content({ children }: { children: ReactNode }) {
+      return <div>{children}</div>;
+    },
+    Value({ children }: { children: ReactNode; value: number }) {
+      return <div className="text-2xl font-semibold text-slate-950">{children}</div>;
+    },
+  },
+);
+
+const NativeSelect = Object.assign(
+  function NativeSelectRoot({ children }: { children: ReactNode; fullWidth?: boolean; variant?: string }) {
+    return <div>{children}</div>;
+  },
+  {
+    Trigger({ children, onChange, value }: { children: ReactNode; onChange: (event: ChangeEvent<HTMLSelectElement>) => void; value: string }) {
+      return (
+        <select
+          className="h-10 w-full rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900 shadow-sm outline-none focus:border-slate-400"
+          value={value}
+          onChange={onChange}
+        >
+          {children}
+        </select>
+      );
+    },
+    Option({ children, value }: { children: ReactNode; value: string }) {
+      return <option value={value}>{children}</option>;
+    },
+  },
+);
 
 export default function App() {
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -585,7 +716,16 @@ export default function App() {
   const navbar = (
     <div className="cube-navbar flex min-h-14 w-full items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 py-2 sm:gap-3 md:flex-nowrap md:px-4">
       <div className="flex min-w-0 items-center gap-3">
-        {!compactShell && <AppLayout.MenuToggle className="lg:hidden" tooltip="Menu" />}
+        {!compactShell && (
+          <button
+            aria-label="Menu"
+            className="grid h-9 w-9 place-items-center rounded-lg border border-slate-200 bg-white text-slate-700 shadow-sm lg:hidden"
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+          >
+            <PanelRightOpen size={15} />
+          </button>
+        )}
         {compactShell && (
           <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-slate-950 text-white">
             <ShieldCheck size={18} />
