@@ -88,7 +88,7 @@ type usageResponse struct {
 var httpClient = &http.Client{
 	Timeout: 8 * time.Second,
 	Transport: &http.Transport{
-		Proxy:                 nil,
+		Proxy:                 http.ProxyFromEnvironment,
 		ResponseHeaderTimeout: 6 * time.Second,
 		TLSHandshakeTimeout:   4 * time.Second,
 		IdleConnTimeout:       30 * time.Second,
