@@ -41,20 +41,28 @@ var accountIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 type AccountStatus string
 
 const (
-	StatusReady    AccountStatus = "ready"
-	StatusDrain    AccountStatus = "drain"
-	StatusDisabled AccountStatus = "disabled"
+	StatusReady      AccountStatus = "ready"
+	StatusRecovering AccountStatus = "recovering"
+	StatusDrain      AccountStatus = "drain"
+	StatusDisabled   AccountStatus = "disabled"
 )
 
 type Account struct {
-	ID        string        `json:"id"`
-	Label     string        `json:"label"`
-	Plan      string        `json:"plan"`
-	Status    AccountStatus `json:"status"`
-	CodexHome string        `json:"codexHome"`
-	CreatedAt time.Time     `json:"createdAt"`
-	UpdatedAt time.Time     `json:"updatedAt"`
-	LastError string        `json:"lastError,omitempty"`
+	ID               string        `json:"id"`
+	Label            string        `json:"label"`
+	Plan             string        `json:"plan"`
+	Status           AccountStatus `json:"status"`
+	CodexHome        string        `json:"codexHome"`
+	Generation       int64         `json:"generation"`
+	LeaseID          string        `json:"leaseId,omitempty"`
+	LeaseClientID    string        `json:"leaseClientId,omitempty"`
+	LeaseHolder      string        `json:"leaseHolder,omitempty"`
+	LeaseStartedAt   time.Time     `json:"leaseStartedAt,omitempty"`
+	LeaseHeartbeatAt time.Time     `json:"leaseHeartbeatAt,omitempty"`
+	LeaseExpiresAt   time.Time     `json:"leaseExpiresAt,omitempty"`
+	CreatedAt        time.Time     `json:"createdAt"`
+	UpdatedAt        time.Time     `json:"updatedAt"`
+	LastError        string        `json:"lastError,omitempty"`
 }
 
 type AccountView struct {
@@ -66,6 +74,23 @@ type AccountView struct {
 	ConfigPath    string    `json:"configPath"`
 	ConfigUpdated time.Time `json:"configUpdated,omitempty"`
 	Active        bool      `json:"active"`
+	LeaseActive   bool      `json:"leaseActive"`
+}
+
+type Lease struct {
+	ID          string    `json:"id"`
+	AccountID   string    `json:"accountId"`
+	ClientID    string    `json:"clientId,omitempty"`
+	Holder      string    `json:"holder,omitempty"`
+	Generation  int64     `json:"generation"`
+	StartedAt   time.Time `json:"startedAt"`
+	HeartbeatAt time.Time `json:"heartbeatAt"`
+	ExpiresAt   time.Time `json:"expiresAt"`
+}
+
+type LeaseSnapshot struct {
+	Lease    Lease           `json:"lease"`
+	Snapshot ProfileSnapshot `json:"snapshot"`
 }
 
 type State struct {
@@ -125,6 +150,9 @@ type RefreshQueueItem struct {
 	UsedPercent        float64       `json:"usedPercent,omitempty"`
 	QuotaStatus        quota.Status  `json:"quotaStatus,omitempty"`
 	RefreshOrderReason string        `json:"refreshOrderReason,omitempty"`
+	LeaseActive        bool          `json:"leaseActive,omitempty"`
+	LeaseClientID      string        `json:"leaseClientId,omitempty"`
+	LeaseExpiresAt     time.Time     `json:"leaseExpiresAt,omitempty"`
 }
 
 type roundRobinState struct {
@@ -132,15 +160,19 @@ type roundRobinState struct {
 }
 
 type LoadBalanceAccount struct {
-	ID            string        `json:"id"`
-	Label         string        `json:"label"`
-	Status        AccountStatus `json:"status"`
-	AuthPresent   bool          `json:"authPresent"`
-	ConfigPresent bool          `json:"configPresent"`
-	Active        bool          `json:"active"`
-	CodexHome     string        `json:"codexHome"`
-	Eligible      bool          `json:"eligible"`
-	Reason        string        `json:"reason,omitempty"`
+	ID             string        `json:"id"`
+	Label          string        `json:"label"`
+	Status         AccountStatus `json:"status"`
+	AuthPresent    bool          `json:"authPresent"`
+	ConfigPresent  bool          `json:"configPresent"`
+	Active         bool          `json:"active"`
+	CodexHome      string        `json:"codexHome"`
+	Generation     int64         `json:"generation"`
+	LeaseActive    bool          `json:"leaseActive"`
+	LeaseClientID  string        `json:"leaseClientId,omitempty"`
+	LeaseExpiresAt time.Time     `json:"leaseExpiresAt,omitempty"`
+	Eligible       bool          `json:"eligible"`
+	Reason         string        `json:"reason,omitempty"`
 }
 
 type LoadBalanceStatus struct {
@@ -175,6 +207,8 @@ type ProfileSnapshot struct {
 	Auth         json.RawMessage `json:"auth"`
 	Config       string          `json:"config,omitempty"`
 	SourceClient string          `json:"sourceClient,omitempty"`
+	LeaseID      string          `json:"leaseId,omitempty"`
+	Generation   int64           `json:"generation,omitempty"`
 	UpdatedAt    time.Time       `json:"updatedAt,omitempty"`
 }
 
@@ -282,6 +316,14 @@ func normalizeState(state State) State {
 	if state.Accounts == nil {
 		state.Accounts = []Account{}
 	}
+	for i := range state.Accounts {
+		if !validAccountStatus(state.Accounts[i].Status) {
+			state.Accounts[i].Status = StatusReady
+		}
+		if state.Accounts[i].Generation < 0 {
+			state.Accounts[i].Generation = 0
+		}
+	}
 	if state.Clients == nil {
 		state.Clients = []Client{}
 	}
@@ -292,6 +334,15 @@ func normalizeState(state State) State {
 		state.QuotaCache = map[string]QuotaCache{}
 	}
 	return state
+}
+
+func validAccountStatus(status AccountStatus) bool {
+	switch status {
+	case StatusReady, StatusRecovering, StatusDrain, StatusDisabled:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) Save(state State) error {
@@ -345,11 +396,25 @@ func (m *Manager) ensurePostgres() error {
 			plan text NOT NULL DEFAULT '',
 			status text NOT NULL DEFAULT 'ready',
 			codex_home text NOT NULL DEFAULT '',
+			generation bigint NOT NULL DEFAULT 0,
+			lease_id text NOT NULL DEFAULT '',
+			lease_client_id text NOT NULL DEFAULT '',
+			lease_holder text NOT NULL DEFAULT '',
+			lease_started_at timestamptz,
+			lease_heartbeat_at timestamptz,
+			lease_expires_at timestamptz,
 			auth_json jsonb,
 			created_at timestamptz NOT NULL DEFAULT now(),
 			updated_at timestamptz NOT NULL DEFAULT now(),
 			last_error text NOT NULL DEFAULT ''
 		)`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS generation bigint NOT NULL DEFAULT 0`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS lease_id text NOT NULL DEFAULT ''`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS lease_client_id text NOT NULL DEFAULT ''`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS lease_holder text NOT NULL DEFAULT ''`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS lease_started_at timestamptz`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS lease_heartbeat_at timestamptz`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz`,
 		`CREATE TABLE IF NOT EXISTS cube_clients (
 			id text PRIMARY KEY,
 			label text NOT NULL DEFAULT '',
@@ -399,7 +464,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 	defer db.Close()
 
 	state := normalizeState(State{Version: 1})
-	accountRows, err := db.QueryContext(ctx, `SELECT id, label, plan, status, codex_home, created_at, updated_at, last_error, auth_json::text FROM cube_accounts ORDER BY id`)
+	accountRows, err := db.QueryContext(ctx, `SELECT id, label, plan, status, codex_home, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, created_at, updated_at, last_error, auth_json::text FROM cube_accounts ORDER BY id`)
 	if err != nil {
 		return State{}, err
 	}
@@ -408,12 +473,22 @@ func (m *Manager) loadPostgresState() (State, error) {
 		var account Account
 		var statusText string
 		var authText sql.NullString
+		var leaseStarted sql.NullTime
+		var leaseHeartbeat sql.NullTime
+		var leaseExpires sql.NullTime
 		if err := accountRows.Scan(
 			&account.ID,
 			&account.Label,
 			&account.Plan,
 			&statusText,
 			&account.CodexHome,
+			&account.Generation,
+			&account.LeaseID,
+			&account.LeaseClientID,
+			&account.LeaseHolder,
+			&leaseStarted,
+			&leaseHeartbeat,
+			&leaseExpires,
 			&account.CreatedAt,
 			&account.UpdatedAt,
 			&account.LastError,
@@ -427,6 +502,15 @@ func (m *Manager) loadPostgresState() (State, error) {
 		}
 		if strings.TrimSpace(account.CodexHome) == "" {
 			account.CodexHome = filepath.Join(m.AccountsDir, account.ID)
+		}
+		if leaseStarted.Valid {
+			account.LeaseStartedAt = leaseStarted.Time
+		}
+		if leaseHeartbeat.Valid {
+			account.LeaseHeartbeatAt = leaseHeartbeat.Time
+		}
+		if leaseExpires.Valid {
+			account.LeaseExpiresAt = leaseExpires.Time
 		}
 		if authText.Valid && strings.TrimSpace(authText.String) != "" {
 			if err := m.materializeAuth(account, []byte(authText.String)); err != nil {
@@ -547,18 +631,37 @@ func (m *Manager) savePostgresState(state State) error {
 		if strings.TrimSpace(account.CodexHome) == "" {
 			account.CodexHome = filepath.Join(m.AccountsDir, account.ID)
 		}
+		var leaseStarted any
+		if !account.LeaseStartedAt.IsZero() {
+			leaseStarted = account.LeaseStartedAt
+		}
+		var leaseHeartbeat any
+		if !account.LeaseHeartbeatAt.IsZero() {
+			leaseHeartbeat = account.LeaseHeartbeatAt
+		}
+		var leaseExpires any
+		if !account.LeaseExpiresAt.IsZero() {
+			leaseExpires = account.LeaseExpiresAt
+		}
 		authJSON, err := m.readAccountAuthJSON(account)
 		if err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_accounts
-			(id, label, plan, status, codex_home, auth_json, created_at, updated_at, last_error)
-			VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)`,
+			(id, label, plan, status, codex_home, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, auth_json, created_at, updated_at, last_error)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16)`,
 			account.ID,
 			account.Label,
 			account.Plan,
 			string(account.Status),
 			account.CodexHome,
+			account.Generation,
+			account.LeaseID,
+			account.LeaseClientID,
+			account.LeaseHolder,
+			leaseStarted,
+			leaseHeartbeat,
+			leaseExpires,
 			authJSON,
 			account.CreatedAt,
 			account.UpdatedAt,
@@ -859,12 +962,15 @@ func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
 	for _, account := range accounts {
 		cache := state.QuotaCache[account.ID]
 		item := RefreshQueueItem{
-			AccountID:   account.ID,
-			Label:       account.Label,
-			Status:      account.Status,
-			AuthPresent: account.AuthPresent,
-			UpdatedAt:   cache.UpdatedAt,
-			QuotaStatus: cache.Result.Status,
+			AccountID:      account.ID,
+			Label:          account.Label,
+			Status:         account.Status,
+			AuthPresent:    account.AuthPresent,
+			UpdatedAt:      cache.UpdatedAt,
+			QuotaStatus:    cache.Result.Status,
+			LeaseActive:    account.LeaseActive,
+			LeaseClientID:  account.LeaseClientID,
+			LeaseExpiresAt: account.LeaseExpiresAt,
 		}
 		if cache.FiveHour != nil {
 			item.ResetsAt = cache.FiveHour.ResetsAt
@@ -875,6 +981,8 @@ func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
 		switch {
 		case !account.AuthPresent:
 			item.RefreshOrderReason = "auth missing"
+		case account.LeaseActive:
+			item.RefreshOrderReason = "leased"
 		case cache.FiveHour == nil:
 			item.RefreshOrderReason = "quota not checked"
 		case cache.FiveHour.ResetsAt == "":
@@ -1118,6 +1226,21 @@ func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account,
 	if err := copyFile(sourceAuth, targetAuth, fileModeFor(authFileName)); err != nil {
 		return Account{}, err
 	}
+	state, err = m.Load()
+	if err != nil {
+		return Account{}, err
+	}
+	for i := range state.Accounts {
+		if state.Accounts[i].ID == account.ID {
+			state.Accounts[i].Generation = 1
+			state.Accounts[i].UpdatedAt = time.Now()
+			account = state.Accounts[i]
+			break
+		}
+	}
+	if err := m.Save(state); err != nil {
+		return Account{}, err
+	}
 	_ = m.syncSharedConfigFromCodexHome(sourceCodexHome, false)
 	return account, nil
 }
@@ -1147,12 +1270,13 @@ func (m *Manager) ExportProfileSnapshot(id string) (ProfileSnapshot, error) {
 	}
 
 	return ProfileSnapshot{
-		ID:        account.ID,
-		Label:     account.Label,
-		Plan:      account.Plan,
-		Status:    account.Status,
-		Auth:      prettyJSON(authRaw),
-		UpdatedAt: updatedAt,
+		ID:         account.ID,
+		Label:      account.Label,
+		Plan:       account.Plan,
+		Status:     account.Status,
+		Auth:       prettyJSON(authRaw),
+		Generation: account.Generation,
+		UpdatedAt:  updatedAt,
 	}, nil
 }
 
@@ -1167,9 +1291,7 @@ func (m *Manager) UpsertProfileSnapshot(snapshot ProfileSnapshot) (Account, erro
 	}
 
 	if snapshot.Status != "" {
-		switch snapshot.Status {
-		case StatusReady, StatusDrain, StatusDisabled:
-		default:
+		if !validAccountStatus(snapshot.Status) {
 			return Account{}, fmt.Errorf("unknown status %q", snapshot.Status)
 		}
 	}
@@ -1250,12 +1372,16 @@ func (m *Manager) UpsertJSONProfile(profile JSONProfile) (Account, error) {
 
 	if existingIndex >= 0 {
 		account := state.Accounts[existingIndex]
+		if accountLeaseActive(account, time.Now()) {
+			return Account{}, fmt.Errorf("account %q is currently leased; wait for release or use the lease auth endpoint", account.ID)
+		}
 		if err := m.writeProfileFiles(account, authRaw); err != nil {
 			return Account{}, err
 		}
 		if label != "" {
 			account.Label = label
 		}
+		account.Generation++
 		account.UpdatedAt = time.Now()
 		state.Accounts[existingIndex] = account
 		if err := m.Save(state); err != nil {
@@ -1269,6 +1395,21 @@ func (m *Manager) UpsertJSONProfile(profile JSONProfile) (Account, error) {
 		return Account{}, err
 	}
 	if err := m.writeProfileFiles(account, authRaw); err != nil {
+		return Account{}, err
+	}
+	state, err = m.Load()
+	if err != nil {
+		return Account{}, err
+	}
+	for i := range state.Accounts {
+		if state.Accounts[i].ID == account.ID {
+			state.Accounts[i].Generation = 1
+			state.Accounts[i].UpdatedAt = time.Now()
+			account = state.Accounts[i]
+			break
+		}
+	}
+	if err := m.Save(state); err != nil {
 		return Account{}, err
 	}
 	return account, nil
@@ -1466,6 +1607,14 @@ func generatePAT() (string, error) {
 	return "cube_pat_" + base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
+func generateLeaseID() (string, error) {
+	raw := make([]byte, 18)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return "lease_" + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
 	return fmt.Sprintf("%x", sum)
@@ -1619,6 +1768,15 @@ func readAuthMetadata(path string) map[string]any {
 	return auth
 }
 
+func fileDigest(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
+}
+
 func prettyJSON(raw json.RawMessage) []byte {
 	var value any
 	if err := json.Unmarshal(raw, &value); err != nil {
@@ -1645,9 +1803,7 @@ func (m *Manager) GetAccount(id string) (Account, error) {
 }
 
 func (m *Manager) SetStatus(id string, status AccountStatus) error {
-	switch status {
-	case StatusReady, StatusDrain, StatusDisabled:
-	default:
+	if !validAccountStatus(status) {
 		return fmt.Errorf("unknown status %q", status)
 	}
 
@@ -1837,8 +1993,9 @@ func (m *Manager) SelectAccountForRun() (AccountView, error) {
 	}
 
 	available := make([]AccountView, 0, len(accounts))
+	now := time.Now()
 	for _, account := range accounts {
-		if account.Status == StatusReady && account.AuthPresent {
+		if account.Status == StatusReady && account.AuthPresent && !accountLeaseActive(account.Account, now) {
 			available = append(available, account)
 		}
 	}
@@ -1872,6 +2029,256 @@ func (m *Manager) SelectAccountForRun() (AccountView, error) {
 	return selected, nil
 }
 
+func (m *Manager) ClaimLease(ctx context.Context, clientID, holder string, ttl time.Duration) (LeaseSnapshot, error) {
+	if err := m.RecoverExpiredLeases(ctx); err != nil {
+		return LeaseSnapshot{}, err
+	}
+
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return LeaseSnapshot{}, err
+	}
+	defer unlock()
+
+	state, err := m.Load()
+	if err != nil {
+		return LeaseSnapshot{}, err
+	}
+	now := time.Now()
+	state, _, _ = expireAccountLeases(state, now)
+
+	type candidate struct {
+		index   int
+		account Account
+	}
+	available := []candidate{}
+	for i, account := range state.Accounts {
+		if account.Status != StatusReady || !m.accountAuthPresent(account) || accountLeaseActive(account, now) {
+			continue
+		}
+		available = append(available, candidate{index: i, account: account})
+	}
+	sort.Slice(available, func(i, j int) bool {
+		return available[i].account.ID < available[j].account.ID
+	})
+	if len(available) == 0 {
+		if err := m.Save(state); err != nil {
+			return LeaseSnapshot{}, err
+		}
+		return LeaseSnapshot{}, errors.New("no ready, unleased account with auth.json is available")
+	}
+
+	roundRobin, err := m.loadRoundRobinState()
+	if err != nil {
+		return LeaseSnapshot{}, err
+	}
+	selected := available[0]
+	if roundRobin.LastAccountID != "" {
+		for i, item := range available {
+			if item.account.ID == roundRobin.LastAccountID {
+				selected = available[(i+1)%len(available)]
+				break
+			}
+		}
+	}
+
+	leaseID, err := generateLeaseID()
+	if err != nil {
+		return LeaseSnapshot{}, err
+	}
+	ttl = normalizeLeaseTTL(ttl)
+	account := state.Accounts[selected.index]
+	account.LeaseID = leaseID
+	account.LeaseClientID = strings.TrimSpace(clientID)
+	account.LeaseHolder = strings.TrimSpace(holder)
+	account.LeaseStartedAt = now
+	account.LeaseHeartbeatAt = now
+	account.LeaseExpiresAt = now.Add(ttl)
+	account.UpdatedAt = now
+	state.Accounts[selected.index] = account
+
+	if err := m.Save(state); err != nil {
+		return LeaseSnapshot{}, err
+	}
+	_ = m.saveRoundRobinState(roundRobinState{LastAccountID: account.ID})
+
+	snapshot, err := m.ExportProfileSnapshot(account.ID)
+	if err != nil {
+		return LeaseSnapshot{}, err
+	}
+	snapshot.LeaseID = leaseID
+	snapshot.Generation = account.Generation
+	snapshot.SourceClient = account.LeaseHolder
+
+	lease := leaseFromAccount(account)
+	return LeaseSnapshot{Lease: lease, Snapshot: snapshot}, nil
+}
+
+func (m *Manager) TouchLease(leaseID, accountID, clientID, holder string, ttl time.Duration) (Lease, error) {
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return Lease{}, err
+	}
+	defer unlock()
+
+	state, err := m.Load()
+	if err != nil {
+		return Lease{}, err
+	}
+	now := time.Now()
+	state, _, _ = expireAccountLeases(state, now)
+	index, account, err := findLeaseAccount(state, accountID, leaseID)
+	if err != nil {
+		_ = m.Save(state)
+		return Lease{}, err
+	}
+	if err := validateLease(account, leaseID, clientID, now); err != nil {
+		_ = m.Save(state)
+		return Lease{}, err
+	}
+	ttl = normalizeLeaseTTL(ttl)
+	account.LeaseHolder = firstNonEmpty(strings.TrimSpace(holder), account.LeaseHolder)
+	account.LeaseHeartbeatAt = now
+	account.LeaseExpiresAt = now.Add(ttl)
+	account.UpdatedAt = now
+	state.Accounts[index] = account
+	if err := m.Save(state); err != nil {
+		return Lease{}, err
+	}
+	return leaseFromAccount(account), nil
+}
+
+func (m *Manager) UpdateLeasedProfileSnapshot(snapshot ProfileSnapshot, clientID string, ttl time.Duration) (Account, error) {
+	if strings.TrimSpace(snapshot.ID) == "" {
+		return Account{}, errors.New("lease auth update needs account id")
+	}
+	if strings.TrimSpace(snapshot.LeaseID) == "" {
+		return Account{}, errors.New("lease auth update needs lease id")
+	}
+	if len(snapshot.Auth) == 0 || string(snapshot.Auth) == "null" {
+		return Account{}, errors.New("lease auth update needs auth")
+	}
+	if !json.Valid(snapshot.Auth) {
+		return Account{}, errors.New("auth is not valid JSON")
+	}
+	if snapshot.Status != "" && !validAccountStatus(snapshot.Status) {
+		return Account{}, fmt.Errorf("unknown status %q", snapshot.Status)
+	}
+
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return Account{}, err
+	}
+	defer unlock()
+
+	state, err := m.Load()
+	if err != nil {
+		return Account{}, err
+	}
+	now := time.Now()
+	state, _, _ = expireAccountLeases(state, now)
+	index, account, err := findLeaseAccount(state, snapshot.ID, snapshot.LeaseID)
+	if err != nil {
+		_ = m.Save(state)
+		return Account{}, err
+	}
+	if err := validateLease(account, snapshot.LeaseID, clientID, now); err != nil {
+		_ = m.Save(state)
+		return Account{}, err
+	}
+	if snapshot.Generation != account.Generation {
+		return Account{}, fmt.Errorf("auth generation conflict for %s: client has %d, server has %d", account.ID, snapshot.Generation, account.Generation)
+	}
+	if err := m.writeProfileFiles(account, snapshot.Auth); err != nil {
+		return Account{}, err
+	}
+	if strings.TrimSpace(snapshot.Label) != "" {
+		account.Label = strings.TrimSpace(snapshot.Label)
+	}
+	if strings.TrimSpace(snapshot.Plan) != "" {
+		account.Plan = strings.TrimSpace(snapshot.Plan)
+	}
+	if snapshot.Status != "" {
+		account.Status = snapshot.Status
+	}
+	account.Generation++
+	account.LeaseHolder = firstNonEmpty(strings.TrimSpace(snapshot.SourceClient), account.LeaseHolder)
+	account.LeaseHeartbeatAt = now
+	account.LeaseExpiresAt = now.Add(normalizeLeaseTTL(ttl))
+	account.UpdatedAt = now
+	state.Accounts[index] = account
+	if err := m.Save(state); err != nil {
+		return Account{}, err
+	}
+	return account, nil
+}
+
+func (m *Manager) ReleaseLease(accountID, leaseID, clientID string) error {
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	state, _, _ = expireAccountLeases(state, now)
+	index, account, err := findLeaseAccount(state, accountID, leaseID)
+	if err != nil {
+		return m.Save(state)
+	}
+	if err := validateLease(account, leaseID, clientID, now); err != nil {
+		return err
+	}
+	clearAccountLease(&account)
+	account.UpdatedAt = now
+	state.Accounts[index] = account
+	return m.Save(state)
+}
+
+func (m *Manager) AccountHasActiveLease(id string) (bool, error) {
+	account, err := m.GetAccount(id)
+	if err != nil {
+		return false, err
+	}
+	return accountLeaseActive(account, time.Now()), nil
+}
+
+func (m *Manager) RecoverExpiredLeases(ctx context.Context) error {
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return err
+	}
+	state, err := m.Load()
+	if err != nil {
+		unlock()
+		return err
+	}
+	state, expired, changed := expireAccountLeases(state, time.Now())
+	if changed {
+		err = m.Save(state)
+	}
+	unlock()
+	if err != nil {
+		return err
+	}
+	for _, id := range expired {
+		result, err := m.FetchQuota(ctx, id)
+		if err != nil && result.Status == "" {
+			continue
+		}
+	}
+	return nil
+}
+
 func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 	roundRobin, err := m.loadRoundRobinState()
 	if err != nil {
@@ -1891,13 +2298,17 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 	}
 	for _, account := range accounts {
 		entry := LoadBalanceAccount{
-			ID:            account.ID,
-			Label:         account.Label,
-			Status:        account.Status,
-			AuthPresent:   account.AuthPresent,
-			ConfigPresent: account.ConfigPresent,
-			Active:        account.Active,
-			CodexHome:     account.CodexHome,
+			ID:             account.ID,
+			Label:          account.Label,
+			Status:         account.Status,
+			AuthPresent:    account.AuthPresent,
+			ConfigPresent:  account.ConfigPresent,
+			Active:         account.Active,
+			CodexHome:      account.CodexHome,
+			Generation:     account.Generation,
+			LeaseActive:    account.LeaseActive,
+			LeaseClientID:  account.LeaseClientID,
+			LeaseExpiresAt: account.LeaseExpiresAt,
 		}
 		entry.Eligible, entry.Reason = loadBalanceEligibility(account)
 		if entry.Eligible {
@@ -1916,7 +2327,109 @@ func loadBalanceEligibility(account AccountView) (bool, string) {
 	if !account.AuthPresent {
 		return false, "auth.json missing"
 	}
+	if account.LeaseActive {
+		return false, fmt.Sprintf("leased until %s", account.LeaseExpiresAt.Format(time.RFC3339))
+	}
 	return true, ""
+}
+
+func (m *Manager) accountAuthPresent(account Account) bool {
+	_, err := os.Stat(filepath.Join(account.CodexHome, authFileName))
+	return err == nil
+}
+
+func accountLeaseActive(account Account, now time.Time) bool {
+	return strings.TrimSpace(account.LeaseID) != "" && !account.LeaseExpiresAt.IsZero() && account.LeaseExpiresAt.After(now)
+}
+
+func leaseFromAccount(account Account) Lease {
+	return Lease{
+		ID:          account.LeaseID,
+		AccountID:   account.ID,
+		ClientID:    account.LeaseClientID,
+		Holder:      account.LeaseHolder,
+		Generation:  account.Generation,
+		StartedAt:   account.LeaseStartedAt,
+		HeartbeatAt: account.LeaseHeartbeatAt,
+		ExpiresAt:   account.LeaseExpiresAt,
+	}
+}
+
+func clearAccountLease(account *Account) {
+	account.LeaseID = ""
+	account.LeaseClientID = ""
+	account.LeaseHolder = ""
+	account.LeaseStartedAt = time.Time{}
+	account.LeaseHeartbeatAt = time.Time{}
+	account.LeaseExpiresAt = time.Time{}
+}
+
+func normalizeLeaseTTL(ttl time.Duration) time.Duration {
+	if ttl < 30*time.Second {
+		return 90 * time.Second
+	}
+	if ttl > 30*time.Minute {
+		return 30 * time.Minute
+	}
+	return ttl
+}
+
+func expireAccountLeases(state State, now time.Time) (State, []string, bool) {
+	expired := []string{}
+	changed := false
+	for i := range state.Accounts {
+		account := state.Accounts[i]
+		if strings.TrimSpace(account.LeaseID) == "" {
+			continue
+		}
+		if account.LeaseExpiresAt.IsZero() || account.LeaseExpiresAt.After(now) {
+			continue
+		}
+		leaseID := account.LeaseID
+		clearAccountLease(&account)
+		if account.Status == StatusReady {
+			account.Status = StatusRecovering
+		}
+		account.LastError = fmt.Sprintf("lease %s expired at %s; recovery check pending", leaseID, now.Format(time.RFC3339))
+		account.UpdatedAt = now
+		state.Accounts[i] = account
+		expired = append(expired, account.ID)
+		changed = true
+	}
+	return state, expired, changed
+}
+
+func findLeaseAccount(state State, accountID, leaseID string) (int, Account, error) {
+	accountID = strings.TrimSpace(accountID)
+	leaseID = strings.TrimSpace(leaseID)
+	for i, account := range state.Accounts {
+		if accountID != "" && account.ID != accountID {
+			continue
+		}
+		if leaseID != "" && account.LeaseID != leaseID {
+			continue
+		}
+		return i, account, nil
+	}
+	if accountID != "" {
+		return -1, Account{}, fmt.Errorf("lease %q for account %q not found", leaseID, accountID)
+	}
+	return -1, Account{}, fmt.Errorf("lease %q not found", leaseID)
+}
+
+func validateLease(account Account, leaseID, clientID string, now time.Time) error {
+	leaseID = strings.TrimSpace(leaseID)
+	clientID = strings.TrimSpace(clientID)
+	if leaseID == "" || account.LeaseID != leaseID {
+		return fmt.Errorf("account %s is not held by lease %q", account.ID, leaseID)
+	}
+	if !accountLeaseActive(account, now) {
+		return fmt.Errorf("lease %s for account %s has expired", leaseID, account.ID)
+	}
+	if clientID != "" && account.LeaseClientID != "" && account.LeaseClientID != clientID {
+		return fmt.Errorf("lease %s belongs to client %s", leaseID, account.LeaseClientID)
+	}
+	return nil
 }
 
 func (m *Manager) ResetRoundRobin() error {
@@ -2012,13 +2525,32 @@ func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, erro
 	if err != nil {
 		return quota.Result{}, err
 	}
+	now := time.Now()
+	if accountLeaseActive(account, now) {
+		state, loadErr := m.Load()
+		if loadErr == nil {
+			if cache, ok := state.QuotaCache[id]; ok && cache.Result.Status != "" {
+				cache.Result.Detail = firstNonEmpty(cache.Result.Detail, fmt.Sprintf("account is leased by %s until %s; returning cached quota", account.LeaseClientID, account.LeaseExpiresAt.Format(time.RFC3339)))
+				return cache.Result, nil
+			}
+		}
+		return quota.Result{
+			Status: quota.StatusError,
+			Source: "cube lease",
+			Detail: fmt.Sprintf("account is leased by %s until %s; quota refresh is paused", account.LeaseClientID, account.LeaseExpiresAt.Format(time.RFC3339)),
+		}, nil
+	}
 	_ = m.syncLiveAuthToManaged(account)
-	result, err := quota.FetchForCodexHome(ctx, account.CodexHome, time.Now())
-	_ = m.recordQuotaResult(id, result)
+	authPath := filepath.Join(account.CodexHome, authFileName)
+	beforeDigest := fileDigest(authPath)
+	result, err := quota.FetchForCodexHome(ctx, account.CodexHome, now)
+	afterDigest := fileDigest(authPath)
+	authChanged := beforeDigest != "" && afterDigest != "" && beforeDigest != afterDigest
+	_ = m.recordQuotaResult(id, result, authChanged)
 	return result, err
 }
 
-func (m *Manager) recordQuotaResult(id string, result quota.Result) error {
+func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged bool) error {
 	if strings.TrimSpace(id) == "" {
 		return nil
 	}
@@ -2048,10 +2580,37 @@ func (m *Manager) recordQuotaResult(id string, result quota.Result) error {
 			if state.Accounts[i].ID != id {
 				continue
 			}
-			if state.Accounts[i].Status == StatusReady {
+			if state.Accounts[i].Status == StatusReady || state.Accounts[i].Status == StatusRecovering {
 				state.Accounts[i].Status = StatusDrain
 			}
 			state.Accounts[i].LastError = result.Detail
+			state.Accounts[i].UpdatedAt = time.Now()
+			break
+		}
+	} else if result.Status == quota.StatusSupported {
+		for i := range state.Accounts {
+			if state.Accounts[i].ID != id {
+				continue
+			}
+			if strings.TrimSpace(result.Plan) != "" {
+				state.Accounts[i].Plan = result.Plan
+			}
+			if state.Accounts[i].Status == StatusRecovering {
+				state.Accounts[i].Status = StatusReady
+			}
+			state.Accounts[i].LastError = ""
+			if authChanged {
+				state.Accounts[i].Generation++
+			}
+			state.Accounts[i].UpdatedAt = time.Now()
+			break
+		}
+	} else if authChanged {
+		for i := range state.Accounts {
+			if state.Accounts[i].ID != id {
+				continue
+			}
+			state.Accounts[i].Generation++
 			state.Accounts[i].UpdatedAt = time.Now()
 			break
 		}
@@ -2306,6 +2865,7 @@ func (m *Manager) accountView(account Account) AccountView {
 	view.ConfigPresent = configPresent
 	view.ConfigUpdated = configUpdated
 	view.Active = m.isAccountActive(account)
+	view.LeaseActive = accountLeaseActive(account, time.Now())
 	return view
 }
 

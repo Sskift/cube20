@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -121,7 +122,7 @@ func runAccounts(m *manager.Manager, args []string) error {
 		return cmd.Run()
 	case "status":
 		if len(args) != 3 {
-			return fmt.Errorf("usage: cube accounts status <id> <ready|drain|disabled>")
+			return fmt.Errorf("usage: cube accounts status <id> <ready|recovering|drain|disabled>")
 		}
 		return m.SetStatus(args[1], manager.AccountStatus(args[2]))
 	case "quota":
@@ -599,36 +600,44 @@ func runCloudRun(m *manager.Manager, args []string) error {
 	if err != nil {
 		return err
 	}
-	snapshot, err := claimProfileSnapshot(context.Background(), opts)
+	leaseSnapshot, err := claimLeaseSnapshot(context.Background(), opts)
 	if err != nil {
 		return err
 	}
+	snapshot := leaseSnapshot.Snapshot
 	codexHome, err := writeSnapshotToTempHome(m, snapshot)
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(codexHome)
 
-	fmt.Fprintf(os.Stderr, "cube: cloud selected %s; using temporary CODEX_HOME\n", snapshot.ID)
+	fmt.Fprintf(os.Stderr, "cube: cloud leased %s (%s); using temporary CODEX_HOME\n", snapshot.ID, leaseSnapshot.Lease.ID)
 	cmd := codexCommandForHome(codexHome, codexArgs)
-	runErr := cmd.Run()
-	authErr := pushAuthFromHome(context.Background(), opts, snapshot, codexHome)
+	runErr, authErr := runCommandWithLease(context.Background(), opts, leaseSnapshot, codexHome, cmd)
 	usageErr := pushUsageFromHome(context.Background(), opts, snapshot.ID, codexHome)
+	var releaseErr error
+	if authErr == nil {
+		releaseErr = releaseLease(context.Background(), opts, leaseSnapshot.Lease.ID, snapshot.ID)
+	}
 
 	if runErr != nil {
-		if authErr != nil || usageErr != nil {
-			return fmt.Errorf("codex failed: %w; auth upload: %v; usage upload: %v", runErr, authErr, usageErr)
+		if authErr != nil || usageErr != nil || releaseErr != nil {
+			return fmt.Errorf("codex failed: %w; auth upload: %v; usage upload: %v; lease release: %v", runErr, authErr, usageErr, releaseErr)
 		}
 		return runErr
 	}
 	if authErr != nil {
 		return authErr
 	}
-	return usageErr
+	if usageErr != nil {
+		return usageErr
+	}
+	return releaseErr
 }
 
 func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, []string, error) {
 	opts := defaultCloudSyncOptions(m)
+	opts.Interval = 20 * time.Second
 	codexArgs := []string{}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -650,6 +659,16 @@ func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, 
 			}
 			opts.Client = strings.TrimSpace(args[i+1])
 			i++
+		case "--heartbeat", "--interval":
+			if i+1 >= len(args) {
+				return opts, nil, fmt.Errorf("missing value for %s", args[i])
+			}
+			interval, err := time.ParseDuration(args[i+1])
+			if err != nil {
+				return opts, nil, fmt.Errorf("invalid %s %q", args[i], args[i+1])
+			}
+			opts.Interval = interval
+			i++
 		case "--":
 			codexArgs = append(codexArgs, args[i+1:]...)
 			i = len(args)
@@ -660,6 +679,9 @@ func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, 
 	}
 	if opts.Server == "" {
 		return opts, nil, fmt.Errorf("missing cloud server; run cube cloud config --server <url> --token <token>, pass --server, or set CUBE_CLOUD_URL")
+	}
+	if opts.Interval < 5*time.Second {
+		return opts, nil, fmt.Errorf("--heartbeat must be at least 5s")
 	}
 	return opts, codexArgs, nil
 }
@@ -676,6 +698,146 @@ func claimProfileSnapshot(ctx context.Context, opts cloudSyncOptions) (manager.P
 		return manager.ProfileSnapshot{}, fmt.Errorf("cloud claim for %s returned no auth", snapshot.ID)
 	}
 	return snapshot, nil
+}
+
+func claimLeaseSnapshot(ctx context.Context, opts cloudSyncOptions) (manager.LeaseSnapshot, error) {
+	body := struct {
+		Client     string `json:"client"`
+		TTLSeconds int    `json:"ttlSeconds"`
+	}{
+		Client:     opts.Client,
+		TTLSeconds: leaseTTLSeconds(opts),
+	}
+	var leaseSnapshot manager.LeaseSnapshot
+	if err := cloudJSON(ctx, http.MethodPost, opts, "/api/sync/leases", body, &leaseSnapshot); err != nil {
+		return manager.LeaseSnapshot{}, err
+	}
+	if strings.TrimSpace(leaseSnapshot.Lease.ID) == "" {
+		return manager.LeaseSnapshot{}, errors.New("cloud lease returned an empty lease id")
+	}
+	if strings.TrimSpace(leaseSnapshot.Snapshot.ID) == "" {
+		return manager.LeaseSnapshot{}, errors.New("cloud lease returned an empty account id")
+	}
+	if len(leaseSnapshot.Snapshot.Auth) == 0 || string(leaseSnapshot.Snapshot.Auth) == "null" {
+		return manager.LeaseSnapshot{}, fmt.Errorf("cloud lease for %s returned no auth", leaseSnapshot.Snapshot.ID)
+	}
+	leaseSnapshot.Snapshot.LeaseID = leaseSnapshot.Lease.ID
+	leaseSnapshot.Snapshot.Generation = leaseSnapshot.Lease.Generation
+	return leaseSnapshot, nil
+}
+
+func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapshot manager.LeaseSnapshot, codexHome string, cmd *exec.Cmd) (error, error) {
+	authPath := filepath.Join(codexHome, "auth.json")
+	lastDigest := localFileDigest(authPath)
+	snapshot := leaseSnapshot.Snapshot
+	snapshot.LeaseID = leaseSnapshot.Lease.ID
+	if snapshot.Generation == 0 {
+		snapshot.Generation = leaseSnapshot.Lease.Generation
+	}
+
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(opts.Interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				lease, err := heartbeatLease(ctx, opts, leaseSnapshot.Lease.ID, snapshot.ID)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "cube: lease heartbeat failed: %v\n", err)
+				} else if lease.Generation > 0 {
+					snapshot.Generation = lease.Generation
+				}
+				nextDigest := localFileDigest(authPath)
+				if nextDigest != "" && nextDigest != lastDigest {
+					account, err := pushLeasedAuthFromHome(ctx, opts, snapshot, codexHome)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "cube: lease auth upload failed: %v\n", err)
+						continue
+					}
+					snapshot.Generation = account.Generation
+					lastDigest = nextDigest
+				}
+			}
+		}
+	}()
+
+	runErr := cmd.Run()
+	close(stop)
+	<-stopped
+
+	account, authErr := pushLeasedAuthFromHome(ctx, opts, snapshot, codexHome)
+	if authErr != nil {
+		return runErr, authErr
+	}
+	snapshot.Generation = account.Generation
+	return runErr, nil
+}
+
+func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, accountID string) (manager.Lease, error) {
+	body := struct {
+		AccountID  string `json:"accountId"`
+		Client     string `json:"client"`
+		TTLSeconds int    `json:"ttlSeconds"`
+	}{
+		AccountID:  accountID,
+		Client:     opts.Client,
+		TTLSeconds: leaseTTLSeconds(opts),
+	}
+	var lease manager.Lease
+	err := cloudJSON(ctx, http.MethodPatch, opts, "/api/sync/leases/"+url.PathEscape(leaseID), body, &lease)
+	return lease, err
+}
+
+func pushLeasedAuthFromHome(ctx context.Context, opts cloudSyncOptions, snapshot manager.ProfileSnapshot, codexHome string) (manager.AccountView, error) {
+	authRaw, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		return manager.AccountView{}, err
+	}
+	snapshot.Auth = authRaw
+	snapshot.Config = ""
+	snapshot.SourceClient = opts.Client
+	snapshot.UpdatedAt = time.Now()
+
+	var account manager.AccountView
+	path := "/api/sync/leases/" + url.PathEscape(snapshot.LeaseID) + "/auth"
+	if err := cloudJSON(ctx, http.MethodPut, opts, path, snapshot, &account); err != nil {
+		return manager.AccountView{}, err
+	}
+	return account, nil
+}
+
+func releaseLease(ctx context.Context, opts cloudSyncOptions, leaseID, accountID string) error {
+	body := struct {
+		AccountID string `json:"accountId"`
+	}{
+		AccountID: accountID,
+	}
+	return cloudJSON(ctx, http.MethodDelete, opts, "/api/sync/leases/"+url.PathEscape(leaseID), body, nil)
+}
+
+func leaseTTLSeconds(opts cloudSyncOptions) int {
+	ttl := opts.Interval * 4
+	if ttl < 90*time.Second {
+		ttl = 90 * time.Second
+	}
+	if ttl > 30*time.Minute {
+		ttl = 30 * time.Minute
+	}
+	return int(ttl.Seconds())
+}
+
+func localFileDigest(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum)
 }
 
 func writeSnapshotToTempHome(m *manager.Manager, snapshot manager.ProfileSnapshot) (string, error) {
@@ -787,6 +949,13 @@ func claimProfile(ctx context.Context, m *manager.Manager, opts cloudSyncOptions
 	snapshot, err := claimProfileSnapshot(ctx, opts)
 	if err != nil {
 		return manager.Account{}, err
+	}
+	if strings.TrimSpace(snapshot.LeaseID) != "" {
+		defer func() {
+			if err := releaseLease(context.Background(), opts, snapshot.LeaseID, snapshot.ID); err != nil {
+				fmt.Fprintf(os.Stderr, "cube sync: release lease %s failed: %v\n", snapshot.LeaseID, err)
+			}
+		}()
 	}
 	account, err := m.UpsertProfileSnapshot(snapshot)
 	if err != nil {
@@ -1012,7 +1181,7 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  cube")
-	fmt.Println("  cube run [--server <url>] [--token <token>] [-- codex args...]")
+	fmt.Println("  cube run [--server <url>] [--token <token>] [--heartbeat 20s] [-- codex args...]")
 	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...>")
 	fmt.Println("  cube cloud quota <account-id>")
 	fmt.Println("  cube config edit")
@@ -1029,7 +1198,7 @@ func printHelp() {
 	fmt.Println("  cube accounts login <id>")
 	fmt.Println("  cube accounts quota <id>")
 	fmt.Println("  cube accounts usage <id>")
-	fmt.Println("  cube accounts status <id> <ready|drain|disabled>")
+	fmt.Println("  cube accounts status <id> <ready|recovering|drain|disabled>")
 	fmt.Println("  cube accounts delete <id>")
 	fmt.Println("  cube profile deploy <id>")
 	fmt.Println("  cube auth deploy <id>")

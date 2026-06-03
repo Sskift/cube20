@@ -8,9 +8,9 @@ The cloud deployment model is:
   quota refreshes, usage stats, and the hosted dashboard.
 - Local machines store only the cloud URL/PAT and their own Codex
   `config.toml`.
-- `cube run` asks the cloud server which credential to use, runs Codex with a
-  temporary `CODEX_HOME`, uploads refreshed auth and usage, then deletes the
-  temporary local auth copy.
+- `cube run` asks the cloud server for an exclusive account lease, runs Codex
+  with a temporary `CODEX_HOME`, heartbeats the lease, uploads refreshed auth
+  and usage, releases the lease, then deletes the temporary local auth copy.
 
 ## Storage
 
@@ -21,8 +21,9 @@ Local `cube` keeps only client/runtime metadata outside the repository:
 - Optional legacy account homes: `~/.codex-accounts/<account-id>`
 
 Cloud servers should set `CUBE_DATABASE_URL` or `database_url` in
-`settings.toml`. When configured, account auth, client PATs, usage stats, quota
-cache, and load-balancer cursor are persisted in Postgres.
+`settings.toml`. When configured, account auth, lease state/generation, client
+PATs, usage stats, quota cache, and load-balancer cursor are persisted in
+Postgres.
 
 The managed Postgres tables are created automatically:
 
@@ -53,6 +54,7 @@ cube clients revoke client-macbook-a
 cube cloud config --server https://cube.example.com --token <cube_pat_...>
 cube cloud quota work-plus
 cube run
+cube run --heartbeat 20s -- --model gpt-5
 cube config edit
 cube sync push work-plus
 cube sync daemon --all --pull --interval 60s
@@ -105,8 +107,9 @@ cloud server:
 ```
 
 Give each local operator only their generated `cube_pat_...` token. The PAT can
-claim credentials, upload refreshed auth, upload usage, and request remote
-quota refreshes. It is not the dashboard admin token.
+claim an exclusive account lease, heartbeat that lease, upload refreshed auth,
+upload usage, and request remote quota refreshes. It is not the dashboard admin
+token.
 
 ## Cloud Run
 
@@ -114,13 +117,18 @@ quota refreshes. It is not the dashboard admin token.
 # Save this once on each local machine.
 ./bin/cube cloud config --server https://cube.example.com --token <cube_pat_...>
 
-# Ask the cloud load balancer for the next ready account, run Codex with a
-# temporary auth snapshot, then upload refreshed auth and token usage.
+# Ask the cloud load balancer for the next ready, unleased account. cube keeps
+# the lease alive while Codex runs, uploads auth.json changes, uploads token
+# usage, then releases the lease.
 cd ~/work/a
 ./bin/cube run
 
 cd ~/work/b
 ./bin/cube run -- --model gpt-5
+
+# Optional: tune the heartbeat interval. The server grants a longer TTL than the
+# heartbeat interval, so normal long-running sessions stay leased.
+./bin/cube run --heartbeat 20s
 
 # Ask the server to refresh and return quota. This does not read local auth.
 ./bin/cube cloud quota work-plus
@@ -136,6 +144,18 @@ Environment variables still work and override the saved settings:
 export CUBE_CLOUD_URL=https://cube.example.com
 export CUBE_CLOUD_TOKEN=<cube_pat_...>
 ```
+
+Cloud run uses exclusive leases. A single cloud-owned account is never handed to
+two active `cube run` sessions at the same time. Each lease records the client,
+heartbeat time, expiry time, and auth generation. If Codex rotates auth while
+running, cube uploads the new `auth.json` with the current generation. Stale or
+late uploads are rejected instead of overwriting a newer server copy.
+
+If the local process or network is interrupted long enough for the heartbeat to
+expire, the server clears the lease and moves that account to `recovering`.
+During recovery it verifies the last uploaded auth with a quota refresh; success
+returns the account to `ready`, while invalidated refresh tokens stay out of the
+pool until a fresh login/auth upload.
 
 ## Cloud Sync Admin Tools
 
@@ -158,7 +178,11 @@ The cloud endpoints are:
 
 - `POST /api/sync/push`
 - `GET /api/sync/pull/<id>`
-- `POST /api/sync/claim`
+- `POST /api/sync/claim` (legacy lease claim response)
+- `POST /api/sync/leases`
+- `PATCH /api/sync/leases/<lease-id>`
+- `PUT /api/sync/leases/<lease-id>/auth`
+- `DELETE /api/sync/leases/<lease-id>`
 - `POST /api/sync/usage`
 - `GET /api/sync/quota/<id>`
 - `GET /api/stats`

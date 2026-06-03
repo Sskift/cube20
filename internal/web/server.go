@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"strings"
+	"time"
 
 	"cube20/internal/manager"
 	"cube20/internal/usage"
@@ -47,6 +48,8 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/sync/push", sync(s.handleSyncPush))
 	mux.HandleFunc("/api/sync/pull/", sync(s.handleSyncPull))
 	mux.HandleFunc("/api/sync/claim", sync(s.handleSyncClaim))
+	mux.HandleFunc("/api/sync/leases", sync(s.handleSyncLeases))
+	mux.HandleFunc("/api/sync/leases/", sync(s.handleSyncLeaseAction))
 	mux.HandleFunc("/api/sync/usage", sync(s.handleSyncUsage))
 	mux.HandleFunc("/api/sync/quota/", sync(s.handleSyncQuota))
 	mux.HandleFunc("/api/me", sync(s.handleMe))
@@ -343,7 +346,25 @@ func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	account, err := s.Manager.UpsertProfileSnapshot(snapshot)
+	auth := authFromRequest(r)
+	var account manager.Account
+	var err error
+	if strings.TrimSpace(snapshot.LeaseID) != "" {
+		account, err = s.Manager.UpdateLeasedProfileSnapshot(snapshot, auth.ClientID, 90*time.Second)
+	} else {
+		if strings.TrimSpace(snapshot.ID) != "" {
+			leased, leaseErr := s.Manager.AccountHasActiveLease(snapshot.ID)
+			if leaseErr != nil {
+				writeError(w, http.StatusBadRequest, leaseErr.Error())
+				return
+			}
+			if leased {
+				writeError(w, http.StatusConflict, "account is currently leased; use the lease auth endpoint or wait for release")
+				return
+			}
+		}
+		account, err = s.Manager.UpsertProfileSnapshot(snapshot)
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -378,18 +399,136 @@ func (s *Server) handleSyncClaim(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	account, err := s.Manager.SelectAccountForRun()
+	auth := authFromRequest(r)
+	leaseSnapshot, err := s.Manager.ClaimLease(r.Context(), auth.ClientID, firstText(auth.ClientID, r.RemoteAddr), 90*time.Second)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.refreshBeforeExport(account.ID)
-	snapshot, err := s.Manager.ExportProfileSnapshot(account.ID)
+	writeJSON(w, http.StatusOK, leaseSnapshot.Snapshot)
+}
+
+func (s *Server) handleSyncLeases(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		ClientID   string `json:"clientId"`
+		Client     string `json:"client"`
+		Holder     string `json:"holder"`
+		TTLSeconds int    `json:"ttlSeconds"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	}
+	auth := authFromRequest(r)
+	clientID := strings.TrimSpace(auth.ClientID)
+	if clientID == "" {
+		clientID = strings.TrimSpace(body.ClientID)
+	}
+	holder := firstText(body.Holder, body.Client, clientID, r.RemoteAddr)
+	ttl := time.Duration(body.TTLSeconds) * time.Second
+	leaseSnapshot, err := s.Manager.ClaimLease(r.Context(), clientID, holder, ttl)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, snapshot)
+	writeJSON(w, http.StatusCreated, leaseSnapshot)
+}
+
+func (s *Server) handleSyncLeaseAction(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/sync/leases/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	leaseID := parts[0]
+	auth := authFromRequest(r)
+
+	if len(parts) == 1 {
+		switch r.Method {
+		case http.MethodPatch, http.MethodPost:
+			var body struct {
+				AccountID  string `json:"accountId"`
+				Client     string `json:"client"`
+				Holder     string `json:"holder"`
+				TTLSeconds int    `json:"ttlSeconds"`
+			}
+			if r.Body != nil {
+				_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+			}
+			lease, err := s.Manager.TouchLease(leaseID, body.AccountID, auth.ClientID, firstText(body.Holder, body.Client), time.Duration(body.TTLSeconds)*time.Second)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, lease)
+		case http.MethodDelete:
+			var body struct {
+				AccountID string `json:"accountId"`
+			}
+			if r.Body != nil {
+				_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+			}
+			if err := s.Manager.ReleaseLease(body.AccountID, leaseID, auth.ClientID); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"released": true, "leaseId": leaseID})
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "heartbeat" {
+		if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var body struct {
+			AccountID  string `json:"accountId"`
+			Client     string `json:"client"`
+			Holder     string `json:"holder"`
+			TTLSeconds int    `json:"ttlSeconds"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+		}
+		lease, err := s.Manager.TouchLease(leaseID, body.AccountID, auth.ClientID, firstText(body.Holder, body.Client), time.Duration(body.TTLSeconds)*time.Second)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, lease)
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "auth" {
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var snapshot manager.ProfileSnapshot
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&snapshot); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		if strings.TrimSpace(snapshot.LeaseID) == "" {
+			snapshot.LeaseID = leaseID
+		}
+		account, err := s.Manager.UpdateLeasedProfileSnapshot(snapshot, auth.ClientID, 90*time.Second)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, s.ManagerAccountView(account))
+		return
+	}
+
+	http.NotFound(w, r)
 }
 
 func (s *Server) handleSyncUsage(w http.ResponseWriter, r *http.Request) {
@@ -839,6 +978,15 @@ func rawString(raw json.RawMessage) string {
 		return ""
 	}
 	return strings.TrimSpace(text)
+}
+
+func firstText(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

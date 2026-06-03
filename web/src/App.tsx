@@ -35,7 +35,7 @@ import {
   Users,
 } from "lucide-react";
 
-type AccountStatus = "ready" | "drain" | "disabled";
+type AccountStatus = "ready" | "recovering" | "drain" | "disabled";
 
 interface Account {
   id: string;
@@ -43,11 +43,17 @@ interface Account {
   plan: string;
   status: AccountStatus;
   codexHome: string;
+  generation?: number;
+  leaseId?: string;
+  leaseClientId?: string;
+  leaseHolder?: string;
+  leaseExpiresAt?: string;
   authPresent: boolean;
   authPath: string;
   configPresent: boolean;
   configPath: string;
   active: boolean;
+  leaseActive?: boolean;
 }
 
 interface Meta {
@@ -134,6 +140,9 @@ interface RefreshQueueItem {
   usedPercent?: number;
   quotaStatus?: string;
   refreshOrderReason?: string;
+  leaseActive?: boolean;
+  leaseClientId?: string;
+  leaseExpiresAt?: string;
 }
 
 interface LoadBalanceAccount {
@@ -144,6 +153,10 @@ interface LoadBalanceAccount {
   configPresent: boolean;
   active: boolean;
   codexHome: string;
+  generation?: number;
+  leaseActive?: boolean;
+  leaseClientId?: string;
+  leaseExpiresAt?: string;
   eligible: boolean;
   reason?: string;
 }
@@ -1016,7 +1029,7 @@ export default function App() {
               <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
                 <div className="min-w-0">
                   <h2 className="text-base font-semibold text-slate-950">Load balancer</h2>
-                  <p className="text-xs text-slate-500">Round-robin account assignment for `cube run`.</p>
+                  <p className="text-xs text-slate-500">Lease-aware account assignment for cube run.</p>
                 </div>
                 <Chip color="success" variant="soft">
                   {eligibleCount} eligible
@@ -1051,11 +1064,13 @@ export default function App() {
                             <div className="truncate font-medium text-slate-800">
                               {account ? accountName(account) : item.label || shortID(item.accountId)}
                             </div>
-                            <div className="truncate text-slate-500">{item.refreshOrderReason || item.quotaStatus || item.status}</div>
+                            <div className="truncate text-slate-500">
+                              {item.leaseActive ? `leased by ${item.leaseClientId || "client"}` : item.refreshOrderReason || item.quotaStatus || item.status}
+                            </div>
                           </div>
                           <div className="text-right text-slate-600">
                             <div className="font-medium">{item.remainingDisplay || "-"}</div>
-                            <div>{shortTime(item.resetsAt)}</div>
+                            <div>{shortTime(item.leaseActive ? item.leaseExpiresAt : item.resetsAt)}</div>
                           </div>
                         </div>
                       );
@@ -1278,6 +1293,7 @@ export default function App() {
                         onChange={(event) => setStatus(event.currentTarget.value as AccountStatus)}
                       >
                         <NativeSelect.Option value="ready">ready</NativeSelect.Option>
+                        <NativeSelect.Option value="recovering">recovering</NativeSelect.Option>
                         <NativeSelect.Option value="drain">drain</NativeSelect.Option>
                         <NativeSelect.Option value="disabled">disabled</NativeSelect.Option>
                       </NativeSelect.Trigger>
@@ -1307,6 +1323,8 @@ export default function App() {
                   <SignalLine label="latest model" value={selectedStats?.latestModel || selectedStats?.models?.[0]?.model || "-"} />
                   <SignalLine label="last client" value={selectedStats?.clientId || "-"} />
                   <SignalLine label="5h reset" value={selectedRefresh?.resetsAt ? shortTime(selectedRefresh.resetsAt) : selectedRefresh?.refreshOrderReason || "-"} />
+                  <SignalLine label="generation" value={(selected.generation || 0).toString()} />
+                  <SignalLine label="lease" value={selected.leaseActive ? `${selected.leaseClientId || selected.leaseHolder || "client"} until ${shortTime(selected.leaseExpiresAt)}` : "-"} />
                 </Card.Content>
               </Card>
             </>
@@ -1664,6 +1682,7 @@ function QuotaProviderCard({
         <span className="quota-provider-dot" />
         <span className="quota-provider-name">{accountName(account)}</span>
         {account.active && <span className="quota-provider-pill">active</span>}
+        {account.leaseActive && <span className="quota-provider-pill">leased</span>}
       </div>
       <div className="quota-provider-meta">
         <span>{quota?.plan || account.plan || account.status}</span>
@@ -1767,9 +1786,14 @@ function MobileAccountCard({
                 active
               </Chip>
             )}
-            <Chip color={account.status === "ready" ? "success" : account.status === "drain" ? "warning" : "danger"} size="sm" variant="soft">
+            <Chip color={account.status === "ready" ? "success" : account.status === "recovering" || account.status === "drain" ? "warning" : "danger"} size="sm" variant="soft">
               {account.status}
             </Chip>
+            {account.leaseActive && (
+              <Chip color="accent" size="sm" variant="soft">
+                leased
+              </Chip>
+            )}
           </div>
           <div className="mt-1 font-mono text-xs text-slate-500">{shortID(account.id)}</div>
         </div>
@@ -1790,6 +1814,9 @@ function MobileAccountCard({
         </Chip>
         <Chip color={refresh?.quotaStatus === "supported" ? "success" : "warning"} size="sm" variant="soft">
           5h {fiveHour}
+        </Chip>
+        <Chip color={account.leaseActive ? "accent" : "default"} size="sm" variant="soft">
+          gen {account.generation || 0}
         </Chip>
       </div>
 
