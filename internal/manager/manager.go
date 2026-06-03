@@ -1123,47 +1123,7 @@ func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account,
 }
 
 func (m *Manager) ImportJSONProfile(profile JSONProfile) (Account, error) {
-	authRaw := profile.Auth
-	if len(authRaw) == 0 || string(authRaw) == "null" {
-		return Account{}, errors.New("profile json must include auth, or upload a raw auth.json")
-	}
-
-	var auth map[string]any
-	if err := json.Unmarshal(authRaw, &auth); err != nil {
-		return Account{}, fmt.Errorf("auth is not valid JSON: %w", err)
-	}
-
-	state, err := m.Load()
-	if err != nil {
-		return Account{}, err
-	}
-	identity := authIdentity(auth)
-	id := strings.TrimSpace(profile.ID)
-	if id == "" {
-		id = sanitizeAccountID(deriveIDFromAuth(auth, profile.Label))
-		if id == "" {
-			id = uniqueFromUsed("profile-"+time.Now().Format("20060102-150405"), accountIDs(state))
-		}
-	}
-	if duplicate, ok := duplicateAccount(state, id, identity); ok {
-		return Account{}, fmt.Errorf("auth.json already exists as account %q", duplicate.ID)
-	}
-	label := strings.TrimSpace(profile.Label)
-	if label == "" {
-		label = deriveLabelFromAuth(auth)
-	}
-
-	account, err := m.AddAccount(id, label)
-	if err != nil {
-		return Account{}, err
-	}
-
-	authPath := filepath.Join(account.CodexHome, authFileName)
-	if err := os.WriteFile(authPath, prettyJSON(authRaw), fileModeFor(authFileName)); err != nil {
-		return Account{}, err
-	}
-
-	return account, nil
+	return m.UpsertJSONProfile(profile)
 }
 
 func (m *Manager) ExportProfileSnapshot(id string) (ProfileSnapshot, error) {
@@ -2082,6 +2042,19 @@ func (m *Manager) recordQuotaResult(id string, result quota.Result) error {
 		UpdatedAt: time.Now(),
 		Result:    result,
 		FiveHour:  fiveHour,
+	}
+	if result.Status == quota.StatusRefreshInvalid {
+		for i := range state.Accounts {
+			if state.Accounts[i].ID != id {
+				continue
+			}
+			if state.Accounts[i].Status == StatusReady {
+				state.Accounts[i].Status = StatusDrain
+			}
+			state.Accounts[i].LastError = result.Detail
+			state.Accounts[i].UpdatedAt = time.Now()
+			break
+		}
 	}
 	return m.Save(state)
 }

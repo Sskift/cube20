@@ -424,9 +424,11 @@ func isRefreshTokenInvalidated(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	for _, marker := range []string{
+		"app_session_terminated",
 		"refresh_token_reused",
 		"invalid_grant",
 		"invalid refresh",
+		"token_revoked",
 		"refresh token returned http 401",
 		"refresh token returned http 403",
 	} {
