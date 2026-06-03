@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"cube20/internal/manager"
+	"cube20/internal/quota"
 	"cube20/internal/usage"
 	"cube20/web"
 )
@@ -347,6 +348,12 @@ func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	auth := authFromRequest(r)
+	if snapshot.OwnerMode == manager.OwnerClient && strings.TrimSpace(snapshot.OwnerClientID) == "" {
+		snapshot.OwnerClientID = auth.ClientID
+	}
+	if strings.TrimSpace(snapshot.SourceClient) == "" {
+		snapshot.SourceClient = auth.ClientID
+	}
 	var account manager.Account
 	var err error
 	if strings.TrimSpace(snapshot.LeaseID) != "" {
@@ -553,16 +560,48 @@ func (s *Server) handleSyncUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSyncQuota(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
 	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/sync/quota/"), "/")
 	if id == "" {
 		id = strings.TrimSpace(r.URL.Query().Get("id"))
 	}
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "missing account id")
+		return
+	}
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		var body struct {
+			Result quota.Result `json:"result"`
+			Quota  quota.Result `json:"quota"`
+		}
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "could not read quota report")
+			return
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		result := body.Result
+		if result.Status == "" {
+			result = body.Quota
+		}
+		if result.Status == "" {
+			if err := json.Unmarshal(raw, &result); err != nil || result.Status == "" {
+				writeError(w, http.StatusBadRequest, "quota report needs result.status")
+				return
+			}
+		}
+		auth := authFromRequest(r)
+		if err := s.Manager.RecordQuotaReport(id, result, auth.ClientID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id})
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	result, err := s.Manager.FetchQuota(r.Context(), id)
@@ -875,6 +914,24 @@ func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": string(body.Status)})
+	case "owner":
+		if r.Method != http.MethodPatch {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var body struct {
+			OwnerMode     manager.AccountOwnerMode `json:"ownerMode"`
+			OwnerClientID string                   `json:"ownerClientId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		if err := s.Manager.SetOwner(id, body.OwnerMode, body.OwnerClientID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"ownerMode": string(body.OwnerMode), "ownerClientId": body.OwnerClientID})
 	case "deploy", "activate":
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")

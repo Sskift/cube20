@@ -36,6 +36,7 @@ import {
 } from "lucide-react";
 
 type AccountStatus = "ready" | "recovering" | "drain" | "disabled";
+type AccountOwnerMode = "cloud" | "client";
 
 interface Account {
   id: string;
@@ -43,6 +44,8 @@ interface Account {
   plan: string;
   status: AccountStatus;
   codexHome: string;
+  ownerMode?: AccountOwnerMode;
+  ownerClientId?: string;
   generation?: number;
   leaseId?: string;
   leaseClientId?: string;
@@ -89,6 +92,7 @@ interface QuotaItem {
 interface QuotaResult {
   status: string;
   plan?: string;
+  source?: string;
   detail?: string;
   quotas?: QuotaItem[];
 }
@@ -140,6 +144,10 @@ interface RefreshQueueItem {
   usedPercent?: number;
   quotaStatus?: string;
   refreshOrderReason?: string;
+  ownerMode?: AccountOwnerMode;
+  ownerClientId?: string;
+  quotaSource?: string;
+  quotaReporterClientId?: string;
   leaseActive?: boolean;
   leaseClientId?: string;
   leaseExpiresAt?: string;
@@ -153,6 +161,8 @@ interface LoadBalanceAccount {
   configPresent: boolean;
   active: boolean;
   codexHome: string;
+  ownerMode?: AccountOwnerMode;
+  ownerClientId?: string;
   generation?: number;
   leaseActive?: boolean;
   leaseClientId?: string;
@@ -444,6 +454,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState("");
   const [label, setLabel] = useState("");
   const [status, setStatus] = useState<AccountStatus>("ready");
+  const [ownerMode, setOwnerMode] = useState<AccountOwnerMode>("cloud");
   const [liveHome, setLiveHome] = useState("");
   const [accountsDir, setAccountsDir] = useState("");
   const [settingsToml, setSettingsToml] = useState("");
@@ -548,6 +559,7 @@ export default function App() {
     if (!selected) return;
     setLabel(selected.label || "");
     setStatus(selected.status);
+    setOwnerMode(selected.ownerMode || "cloud");
   }, [selected]);
 
   useEffect(() => {
@@ -601,6 +613,10 @@ export default function App() {
       await apiJSON(`/api/accounts/${encodeURIComponent(selected.id)}/status`, {
         method: "PATCH",
         body: JSON.stringify({ status }),
+      });
+      await apiJSON(`/api/accounts/${encodeURIComponent(selected.id)}/owner`, {
+        method: "PATCH",
+        body: JSON.stringify({ ownerMode, ownerClientId: selected.ownerClientId || "" }),
       });
       setMessage("Account saved");
       await loadAll(selected.id);
@@ -1065,7 +1081,11 @@ export default function App() {
                               {account ? accountName(account) : item.label || shortID(item.accountId)}
                             </div>
                             <div className="truncate text-slate-500">
-                              {item.leaseActive ? `leased by ${item.leaseClientId || "client"}` : item.refreshOrderReason || item.quotaStatus || item.status}
+                              {item.ownerMode === "client"
+                                ? `${item.refreshOrderReason || "client reported"}${item.quotaReporterClientId ? ` · ${item.quotaReporterClientId}` : ""}`
+                                : item.leaseActive
+                                  ? `leased by ${item.leaseClientId || "client"}`
+                                  : item.refreshOrderReason || item.quotaStatus || item.status}
                             </div>
                           </div>
                           <div className="text-right text-slate-600">
@@ -1299,6 +1319,17 @@ export default function App() {
                       </NativeSelect.Trigger>
                     </NativeSelect>
                   </FieldLabel>
+                  <FieldLabel text="Owner">
+                    <NativeSelect fullWidth variant="secondary">
+                      <NativeSelect.Trigger
+                        value={ownerMode}
+                        onChange={(event) => setOwnerMode(event.currentTarget.value as AccountOwnerMode)}
+                      >
+                        <NativeSelect.Option value="cloud">cloud</NativeSelect.Option>
+                        <NativeSelect.Option value="client">client</NativeSelect.Option>
+                      </NativeSelect.Trigger>
+                    </NativeSelect>
+                  </FieldLabel>
                   <div className="grid grid-cols-2 gap-2">
                     <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={saveAccount}>
                       <Save size={15} />
@@ -1324,6 +1355,8 @@ export default function App() {
                   <SignalLine label="last client" value={selectedStats?.clientId || "-"} />
                   <SignalLine label="5h reset" value={selectedRefresh?.resetsAt ? shortTime(selectedRefresh.resetsAt) : selectedRefresh?.refreshOrderReason || "-"} />
                   <SignalLine label="generation" value={(selected.generation || 0).toString()} />
+                  <SignalLine label="owner" value={selected.ownerMode === "client" ? `client ${selected.ownerClientId || "-"}` : "cloud"} />
+                  <SignalLine label="quota source" value={selectedRefresh?.quotaSource ? `${selectedRefresh.quotaSource}${selectedRefresh.quotaReporterClientId ? ` · ${selectedRefresh.quotaReporterClientId}` : ""}` : quotas[selected.id]?.source || "-"} />
                   <SignalLine label="lease" value={selected.leaseActive ? `${selected.leaseClientId || selected.leaseHolder || "client"} until ${shortTime(selected.leaseExpiresAt)}` : "-"} />
                 </Card.Content>
               </Card>
@@ -1608,7 +1641,7 @@ function QuotaOverview({
                 ? `${accountName(tightest.account)} · ${tightest.quota.remainingDisplay} left`
                 : checkedCount
                   ? "Quota checked, no subscription window returned yet"
-                  : "Checking quota for every auth.json account"}
+                  : "Checking cloud-owned accounts and client reports"}
             </div>
           </div>
         </div>
@@ -1682,6 +1715,7 @@ function QuotaProviderCard({
         <span className="quota-provider-dot" />
         <span className="quota-provider-name">{accountName(account)}</span>
         {account.active && <span className="quota-provider-pill">active</span>}
+        <span className="quota-provider-pill">{account.ownerMode || "cloud"}</span>
         {account.leaseActive && <span className="quota-provider-pill">leased</span>}
       </div>
       <div className="quota-provider-meta">
@@ -1811,6 +1845,9 @@ function MobileAccountCard({
       <div className="mt-3 flex flex-wrap gap-1.5">
         <Chip color={account.authPresent ? "success" : "danger"} size="sm" variant="soft">
           auth
+        </Chip>
+        <Chip color={account.ownerMode === "client" ? "accent" : "default"} size="sm" variant="soft">
+          {account.ownerMode || "cloud"}
         </Chip>
         <Chip color={refresh?.quotaStatus === "supported" ? "success" : "warning"} size="sm" variant="soft">
           5h {fiveHour}

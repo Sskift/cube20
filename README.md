@@ -8,6 +8,8 @@ The cloud deployment model is:
   quota refreshes, usage stats, and the hosted dashboard.
 - Local machines store only the cloud URL/PAT and their own Codex
   `config.toml`.
+- Cloud-owned accounts are refreshed and leased by the server. Client-owned
+  accounts are refreshed locally and reported back to the server.
 - `cube run` asks the cloud server for an exclusive account lease, runs Codex
   with a temporary `CODEX_HOME`, heartbeats the lease, uploads refreshed auth
   and usage, releases the lease, then deletes the temporary local auth copy.
@@ -21,9 +23,9 @@ Local `cube` keeps only client/runtime metadata outside the repository:
 - Optional legacy account homes: `~/.codex-accounts/<account-id>`
 
 Cloud servers should set `CUBE_DATABASE_URL` or `database_url` in
-`settings.toml`. When configured, account auth, lease state/generation, client
-PATs, usage stats, quota cache, and load-balancer cursor are persisted in
-Postgres.
+`settings.toml`. When configured, account auth, owner mode, lease
+state/generation, client PATs, usage stats, quota cache/source, and
+load-balancer cursor are persisted in Postgres.
 
 The managed Postgres tables are created automatically:
 
@@ -55,6 +57,8 @@ cube cloud config --server https://cube.example.com --token <cube_pat_...>
 cube cloud quota work-plus
 cube run
 cube run --heartbeat 20s -- --model gpt-5
+cube report
+cube report --daemon --interval 5m
 cube config edit
 cube sync push work-plus
 cube sync daemon --all --pull --interval 60s
@@ -157,6 +161,30 @@ During recovery it verifies the last uploaded auth with a quota refresh; success
 returns the account to `ready`, while invalidated refresh tokens stay out of the
 pool until a fresh login/auth upload.
 
+## Local Reports
+
+Use `cube report` for accounts that should stay owned by the local Codex
+profile, such as a personal `~/.codex/auth.json` that must not be refreshed by
+the cloud server:
+
+```shell
+# One-shot report of local auth, usage, and quota.
+./bin/cube report
+
+# Keep local auth/usage/quota flowing to the cloud dashboard.
+./bin/cube report --daemon --interval 5m
+```
+
+`cube report` marks the uploaded account as `client` owned. The local machine
+refreshes quota with its own `auth.json`, uploads the refreshed auth snapshot,
+uploads usage stats, and posts the quota result to the server cache. The cloud
+dashboard shows that quota as `client report`, and the load balancer will not
+lease that account to `cube run`.
+
+For cloud-owned accounts, dashboard refresh and `cube cloud quota <id>` are
+server-side refreshes. For client-owned accounts, those same cloud reads return
+the latest client-reported cache instead of refreshing the server copy.
+
 ## Cloud Sync Admin Tools
 
 These commands are migration/debug tools for moving existing local auth
@@ -185,6 +213,7 @@ The cloud endpoints are:
 - `DELETE /api/sync/leases/<lease-id>`
 - `POST /api/sync/usage`
 - `GET /api/sync/quota/<id>`
+- `POST /api/sync/quota/<id>` (client quota report)
 - `GET /api/stats`
 - `GET /api/refresh-queue`
 - `GET|POST /api/clients`
@@ -195,12 +224,18 @@ the admin token or a client PAT.
 
 ## Quota
 
-On a local client, use `cube cloud quota <id>`. It asks the cloud server to
-refresh quota using the server-owned auth snapshot and returns the result. For
-ChatGPT OAuth logins the server calls the ChatGPT usage endpoint and normalizes
-the 5h, 7d, and code-review windows. API-key-only Codex profiles are reported
-as unsupported because ChatGPT subscription quota is not available from an API
-key.
+For cloud-owned accounts, use `cube cloud quota <id>`. It asks the cloud server
+to refresh quota using the server-owned auth snapshot and returns the result.
+
+For client-owned accounts, use `cube report` or `cube report --daemon`; the
+local machine refreshes quota with its own auth, then posts that result to the
+cloud cache. Cloud reads return the latest client-reported quota and do not
+refresh the server copy.
+
+For ChatGPT OAuth logins the quota fetcher calls the ChatGPT usage endpoint and
+normalizes the 5h, 7d, and code-review windows. API-key-only Codex profiles are
+reported as unsupported because ChatGPT subscription quota is not available
+from an API key.
 
 ## Usage Stats
 

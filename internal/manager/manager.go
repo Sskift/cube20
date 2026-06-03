@@ -47,22 +47,38 @@ const (
 	StatusDisabled   AccountStatus = "disabled"
 )
 
+type AccountOwnerMode string
+
+const (
+	OwnerCloud  AccountOwnerMode = "cloud"
+	OwnerClient AccountOwnerMode = "client"
+)
+
+type QuotaSource string
+
+const (
+	QuotaSourceCloud  QuotaSource = "cloud"
+	QuotaSourceClient QuotaSource = "client"
+)
+
 type Account struct {
-	ID               string        `json:"id"`
-	Label            string        `json:"label"`
-	Plan             string        `json:"plan"`
-	Status           AccountStatus `json:"status"`
-	CodexHome        string        `json:"codexHome"`
-	Generation       int64         `json:"generation"`
-	LeaseID          string        `json:"leaseId,omitempty"`
-	LeaseClientID    string        `json:"leaseClientId,omitempty"`
-	LeaseHolder      string        `json:"leaseHolder,omitempty"`
-	LeaseStartedAt   time.Time     `json:"leaseStartedAt,omitempty"`
-	LeaseHeartbeatAt time.Time     `json:"leaseHeartbeatAt,omitempty"`
-	LeaseExpiresAt   time.Time     `json:"leaseExpiresAt,omitempty"`
-	CreatedAt        time.Time     `json:"createdAt"`
-	UpdatedAt        time.Time     `json:"updatedAt"`
-	LastError        string        `json:"lastError,omitempty"`
+	ID               string           `json:"id"`
+	Label            string           `json:"label"`
+	Plan             string           `json:"plan"`
+	Status           AccountStatus    `json:"status"`
+	CodexHome        string           `json:"codexHome"`
+	OwnerMode        AccountOwnerMode `json:"ownerMode"`
+	OwnerClientID    string           `json:"ownerClientId,omitempty"`
+	Generation       int64            `json:"generation"`
+	LeaseID          string           `json:"leaseId,omitempty"`
+	LeaseClientID    string           `json:"leaseClientId,omitempty"`
+	LeaseHolder      string           `json:"leaseHolder,omitempty"`
+	LeaseStartedAt   time.Time        `json:"leaseStartedAt,omitempty"`
+	LeaseHeartbeatAt time.Time        `json:"leaseHeartbeatAt,omitempty"`
+	LeaseExpiresAt   time.Time        `json:"leaseExpiresAt,omitempty"`
+	CreatedAt        time.Time        `json:"createdAt"`
+	UpdatedAt        time.Time        `json:"updatedAt"`
+	LastError        string           `json:"lastError,omitempty"`
 }
 
 type AccountView struct {
@@ -132,27 +148,33 @@ type AccountUsage struct {
 }
 
 type QuotaCache struct {
-	AccountID string        `json:"accountId"`
-	UpdatedAt time.Time     `json:"updatedAt"`
-	Result    quota.Result  `json:"result"`
-	FiveHour  *quota.Window `json:"fiveHour,omitempty"`
+	AccountID        string        `json:"accountId"`
+	UpdatedAt        time.Time     `json:"updatedAt"`
+	Result           quota.Result  `json:"result"`
+	FiveHour         *quota.Window `json:"fiveHour,omitempty"`
+	Source           QuotaSource   `json:"source,omitempty"`
+	ReporterClientID string        `json:"reporterClientId,omitempty"`
 }
 
 type RefreshQueueItem struct {
-	AccountID          string        `json:"accountId"`
-	Label              string        `json:"label"`
-	Status             AccountStatus `json:"status"`
-	AuthPresent        bool          `json:"authPresent"`
-	UpdatedAt          time.Time     `json:"updatedAt,omitempty"`
-	ResetsAt           string        `json:"resetsAt,omitempty"`
-	RemainingDisplay   string        `json:"remainingDisplay,omitempty"`
-	RemainingPercent   float64       `json:"remainingPercent,omitempty"`
-	UsedPercent        float64       `json:"usedPercent,omitempty"`
-	QuotaStatus        quota.Status  `json:"quotaStatus,omitempty"`
-	RefreshOrderReason string        `json:"refreshOrderReason,omitempty"`
-	LeaseActive        bool          `json:"leaseActive,omitempty"`
-	LeaseClientID      string        `json:"leaseClientId,omitempty"`
-	LeaseExpiresAt     time.Time     `json:"leaseExpiresAt,omitempty"`
+	AccountID             string           `json:"accountId"`
+	Label                 string           `json:"label"`
+	Status                AccountStatus    `json:"status"`
+	AuthPresent           bool             `json:"authPresent"`
+	UpdatedAt             time.Time        `json:"updatedAt,omitempty"`
+	ResetsAt              string           `json:"resetsAt,omitempty"`
+	RemainingDisplay      string           `json:"remainingDisplay,omitempty"`
+	RemainingPercent      float64          `json:"remainingPercent,omitempty"`
+	UsedPercent           float64          `json:"usedPercent,omitempty"`
+	QuotaStatus           quota.Status     `json:"quotaStatus,omitempty"`
+	RefreshOrderReason    string           `json:"refreshOrderReason,omitempty"`
+	OwnerMode             AccountOwnerMode `json:"ownerMode,omitempty"`
+	OwnerClientID         string           `json:"ownerClientId,omitempty"`
+	QuotaSource           QuotaSource      `json:"quotaSource,omitempty"`
+	QuotaReporterClientID string           `json:"quotaReporterClientId,omitempty"`
+	LeaseActive           bool             `json:"leaseActive,omitempty"`
+	LeaseClientID         string           `json:"leaseClientId,omitempty"`
+	LeaseExpiresAt        time.Time        `json:"leaseExpiresAt,omitempty"`
 }
 
 type roundRobinState struct {
@@ -160,19 +182,21 @@ type roundRobinState struct {
 }
 
 type LoadBalanceAccount struct {
-	ID             string        `json:"id"`
-	Label          string        `json:"label"`
-	Status         AccountStatus `json:"status"`
-	AuthPresent    bool          `json:"authPresent"`
-	ConfigPresent  bool          `json:"configPresent"`
-	Active         bool          `json:"active"`
-	CodexHome      string        `json:"codexHome"`
-	Generation     int64         `json:"generation"`
-	LeaseActive    bool          `json:"leaseActive"`
-	LeaseClientID  string        `json:"leaseClientId,omitempty"`
-	LeaseExpiresAt time.Time     `json:"leaseExpiresAt,omitempty"`
-	Eligible       bool          `json:"eligible"`
-	Reason         string        `json:"reason,omitempty"`
+	ID             string           `json:"id"`
+	Label          string           `json:"label"`
+	Status         AccountStatus    `json:"status"`
+	AuthPresent    bool             `json:"authPresent"`
+	ConfigPresent  bool             `json:"configPresent"`
+	Active         bool             `json:"active"`
+	CodexHome      string           `json:"codexHome"`
+	OwnerMode      AccountOwnerMode `json:"ownerMode"`
+	OwnerClientID  string           `json:"ownerClientId,omitempty"`
+	Generation     int64            `json:"generation"`
+	LeaseActive    bool             `json:"leaseActive"`
+	LeaseClientID  string           `json:"leaseClientId,omitempty"`
+	LeaseExpiresAt time.Time        `json:"leaseExpiresAt,omitempty"`
+	Eligible       bool             `json:"eligible"`
+	Reason         string           `json:"reason,omitempty"`
 }
 
 type LoadBalanceStatus struct {
@@ -200,16 +224,18 @@ type JSONProfile struct {
 }
 
 type ProfileSnapshot struct {
-	ID           string          `json:"id"`
-	Label        string          `json:"label"`
-	Plan         string          `json:"plan,omitempty"`
-	Status       AccountStatus   `json:"status,omitempty"`
-	Auth         json.RawMessage `json:"auth"`
-	Config       string          `json:"config,omitempty"`
-	SourceClient string          `json:"sourceClient,omitempty"`
-	LeaseID      string          `json:"leaseId,omitempty"`
-	Generation   int64           `json:"generation,omitempty"`
-	UpdatedAt    time.Time       `json:"updatedAt,omitempty"`
+	ID            string           `json:"id"`
+	Label         string           `json:"label"`
+	Plan          string           `json:"plan,omitempty"`
+	Status        AccountStatus    `json:"status,omitempty"`
+	Auth          json.RawMessage  `json:"auth"`
+	Config        string           `json:"config,omitempty"`
+	SourceClient  string           `json:"sourceClient,omitempty"`
+	OwnerMode     AccountOwnerMode `json:"ownerMode,omitempty"`
+	OwnerClientID string           `json:"ownerClientId,omitempty"`
+	LeaseID       string           `json:"leaseId,omitempty"`
+	Generation    int64            `json:"generation,omitempty"`
+	UpdatedAt     time.Time        `json:"updatedAt,omitempty"`
 }
 
 type Manager struct {
@@ -320,6 +346,9 @@ func normalizeState(state State) State {
 		if !validAccountStatus(state.Accounts[i].Status) {
 			state.Accounts[i].Status = StatusReady
 		}
+		if !validOwnerMode(state.Accounts[i].OwnerMode) {
+			state.Accounts[i].OwnerMode = OwnerCloud
+		}
 		if state.Accounts[i].Generation < 0 {
 			state.Accounts[i].Generation = 0
 		}
@@ -334,6 +363,15 @@ func normalizeState(state State) State {
 		state.QuotaCache = map[string]QuotaCache{}
 	}
 	return state
+}
+
+func validOwnerMode(ownerMode AccountOwnerMode) bool {
+	switch ownerMode {
+	case OwnerCloud, OwnerClient:
+		return true
+	default:
+		return false
+	}
 }
 
 func validAccountStatus(status AccountStatus) bool {
@@ -396,6 +434,8 @@ func (m *Manager) ensurePostgres() error {
 			plan text NOT NULL DEFAULT '',
 			status text NOT NULL DEFAULT 'ready',
 			codex_home text NOT NULL DEFAULT '',
+			owner_mode text NOT NULL DEFAULT 'cloud',
+			owner_client_id text NOT NULL DEFAULT '',
 			generation bigint NOT NULL DEFAULT 0,
 			lease_id text NOT NULL DEFAULT '',
 			lease_client_id text NOT NULL DEFAULT '',
@@ -408,6 +448,8 @@ func (m *Manager) ensurePostgres() error {
 			updated_at timestamptz NOT NULL DEFAULT now(),
 			last_error text NOT NULL DEFAULT ''
 		)`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS owner_mode text NOT NULL DEFAULT 'cloud'`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS owner_client_id text NOT NULL DEFAULT ''`,
 		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS generation bigint NOT NULL DEFAULT 0`,
 		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS lease_id text NOT NULL DEFAULT ''`,
 		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS lease_client_id text NOT NULL DEFAULT ''`,
@@ -438,8 +480,12 @@ func (m *Manager) ensurePostgres() error {
 			account_id text PRIMARY KEY,
 			updated_at timestamptz NOT NULL DEFAULT now(),
 			result jsonb NOT NULL DEFAULT '{}'::jsonb,
-			five_hour jsonb
+			five_hour jsonb,
+			quota_source text NOT NULL DEFAULT 'cloud',
+			reporter_client_id text NOT NULL DEFAULT ''
 		)`,
+		`ALTER TABLE cube_quota_cache ADD COLUMN IF NOT EXISTS quota_source text NOT NULL DEFAULT 'cloud'`,
+		`ALTER TABLE cube_quota_cache ADD COLUMN IF NOT EXISTS reporter_client_id text NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS cube_meta (
 			key text PRIMARY KEY,
 			value text NOT NULL DEFAULT '',
@@ -464,7 +510,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 	defer db.Close()
 
 	state := normalizeState(State{Version: 1})
-	accountRows, err := db.QueryContext(ctx, `SELECT id, label, plan, status, codex_home, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, created_at, updated_at, last_error, auth_json::text FROM cube_accounts ORDER BY id`)
+	accountRows, err := db.QueryContext(ctx, `SELECT id, label, plan, status, codex_home, owner_mode, owner_client_id, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, created_at, updated_at, last_error, auth_json::text FROM cube_accounts ORDER BY id`)
 	if err != nil {
 		return State{}, err
 	}
@@ -472,6 +518,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 	for accountRows.Next() {
 		var account Account
 		var statusText string
+		var ownerModeText string
 		var authText sql.NullString
 		var leaseStarted sql.NullTime
 		var leaseHeartbeat sql.NullTime
@@ -482,6 +529,8 @@ func (m *Manager) loadPostgresState() (State, error) {
 			&account.Plan,
 			&statusText,
 			&account.CodexHome,
+			&ownerModeText,
+			&account.OwnerClientID,
 			&account.Generation,
 			&account.LeaseID,
 			&account.LeaseClientID,
@@ -499,6 +548,10 @@ func (m *Manager) loadPostgresState() (State, error) {
 		account.Status = AccountStatus(statusText)
 		if account.Status == "" {
 			account.Status = StatusReady
+		}
+		account.OwnerMode = AccountOwnerMode(ownerModeText)
+		if !validOwnerMode(account.OwnerMode) {
+			account.OwnerMode = OwnerCloud
 		}
 		if strings.TrimSpace(account.CodexHome) == "" {
 			account.CodexHome = filepath.Join(m.AccountsDir, account.ID)
@@ -568,7 +621,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 		return State{}, err
 	}
 
-	quotaRows, err := db.QueryContext(ctx, `SELECT account_id, updated_at, result::text, five_hour::text FROM cube_quota_cache`)
+	quotaRows, err := db.QueryContext(ctx, `SELECT account_id, updated_at, result::text, five_hour::text, quota_source, reporter_client_id FROM cube_quota_cache`)
 	if err != nil {
 		return State{}, err
 	}
@@ -577,8 +630,13 @@ func (m *Manager) loadPostgresState() (State, error) {
 		var cache QuotaCache
 		var resultText string
 		var fiveText sql.NullString
-		if err := quotaRows.Scan(&cache.AccountID, &cache.UpdatedAt, &resultText, &fiveText); err != nil {
+		var sourceText string
+		if err := quotaRows.Scan(&cache.AccountID, &cache.UpdatedAt, &resultText, &fiveText, &sourceText, &cache.ReporterClientID); err != nil {
 			return State{}, err
+		}
+		cache.Source = QuotaSource(sourceText)
+		if cache.Source == "" {
+			cache.Source = QuotaSourceCloud
 		}
 		_ = json.Unmarshal([]byte(resultText), &cache.Result)
 		if fiveText.Valid && strings.TrimSpace(fiveText.String) != "" {
@@ -628,6 +686,9 @@ func (m *Manager) savePostgresState(state State) error {
 		if account.Status == "" {
 			account.Status = StatusReady
 		}
+		if !validOwnerMode(account.OwnerMode) {
+			account.OwnerMode = OwnerCloud
+		}
 		if strings.TrimSpace(account.CodexHome) == "" {
 			account.CodexHome = filepath.Join(m.AccountsDir, account.ID)
 		}
@@ -648,13 +709,15 @@ func (m *Manager) savePostgresState(state State) error {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_accounts
-			(id, label, plan, status, codex_home, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, auth_json, created_at, updated_at, last_error)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16)`,
+			(id, label, plan, status, codex_home, owner_mode, owner_client_id, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, auth_json, created_at, updated_at, last_error)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18)`,
 			account.ID,
 			account.Label,
 			account.Plan,
 			string(account.Status),
 			account.CodexHome,
+			string(account.OwnerMode),
+			account.OwnerClientID,
 			account.Generation,
 			account.LeaseID,
 			account.LeaseClientID,
@@ -744,6 +807,9 @@ func (m *Manager) savePostgresState(state State) error {
 		if cache.UpdatedAt.IsZero() {
 			cache.UpdatedAt = now
 		}
+		if cache.Source == "" {
+			cache.Source = QuotaSourceCloud
+		}
 		result, err := jsonText(cache.Result)
 		if err != nil {
 			return err
@@ -756,12 +822,14 @@ func (m *Manager) savePostgresState(state State) error {
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_quota_cache
-			(account_id, updated_at, result, five_hour)
-			VALUES ($1, $2, $3::jsonb, $4::jsonb)`,
+			(account_id, updated_at, result, five_hour, quota_source, reporter_client_id)
+			VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6)`,
 			cache.AccountID,
 			cache.UpdatedAt,
 			result,
 			fiveHour,
+			string(cache.Source),
+			cache.ReporterClientID,
 		); err != nil {
 			return err
 		}
@@ -962,15 +1030,19 @@ func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
 	for _, account := range accounts {
 		cache := state.QuotaCache[account.ID]
 		item := RefreshQueueItem{
-			AccountID:      account.ID,
-			Label:          account.Label,
-			Status:         account.Status,
-			AuthPresent:    account.AuthPresent,
-			UpdatedAt:      cache.UpdatedAt,
-			QuotaStatus:    cache.Result.Status,
-			LeaseActive:    account.LeaseActive,
-			LeaseClientID:  account.LeaseClientID,
-			LeaseExpiresAt: account.LeaseExpiresAt,
+			AccountID:             account.ID,
+			Label:                 account.Label,
+			Status:                account.Status,
+			AuthPresent:           account.AuthPresent,
+			UpdatedAt:             cache.UpdatedAt,
+			QuotaStatus:           cache.Result.Status,
+			OwnerMode:             account.OwnerMode,
+			OwnerClientID:         account.OwnerClientID,
+			QuotaSource:           cache.Source,
+			QuotaReporterClientID: cache.ReporterClientID,
+			LeaseActive:           account.LeaseActive,
+			LeaseClientID:         account.LeaseClientID,
+			LeaseExpiresAt:        account.LeaseExpiresAt,
 		}
 		if cache.FiveHour != nil {
 			item.ResetsAt = cache.FiveHour.ResetsAt
@@ -981,6 +1053,12 @@ func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
 		switch {
 		case !account.AuthPresent:
 			item.RefreshOrderReason = "auth missing"
+		case account.OwnerMode == OwnerClient:
+			if cache.Result.Status == "" {
+				item.RefreshOrderReason = "waiting for client report"
+			} else {
+				item.RefreshOrderReason = "client reported"
+			}
 		case account.LeaseActive:
 			item.RefreshOrderReason = "leased"
 		case cache.FiveHour == nil:
@@ -1162,6 +1240,7 @@ func (m *Manager) AddAccount(id, label string) (Account, error) {
 		Label:     label,
 		Status:    StatusReady,
 		CodexHome: filepath.Join(m.AccountsDir, id),
+		OwnerMode: OwnerCloud,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -1270,13 +1349,56 @@ func (m *Manager) ExportProfileSnapshot(id string) (ProfileSnapshot, error) {
 	}
 
 	return ProfileSnapshot{
-		ID:         account.ID,
-		Label:      account.Label,
-		Plan:       account.Plan,
-		Status:     account.Status,
-		Auth:       prettyJSON(authRaw),
-		Generation: account.Generation,
-		UpdatedAt:  updatedAt,
+		ID:            account.ID,
+		Label:         account.Label,
+		Plan:          account.Plan,
+		Status:        account.Status,
+		Auth:          prettyJSON(authRaw),
+		OwnerMode:     account.OwnerMode,
+		OwnerClientID: account.OwnerClientID,
+		Generation:    account.Generation,
+		UpdatedAt:     updatedAt,
+	}, nil
+}
+
+func (m *Manager) ExportLiveProfileSnapshot(ownerClientID string) (ProfileSnapshot, error) {
+	codexHome := strings.TrimSpace(m.LiveCodexHome)
+	if codexHome == "" {
+		defaultHome, err := defaultCodexHome()
+		if err != nil {
+			return ProfileSnapshot{}, err
+		}
+		codexHome = defaultHome
+	}
+	authPath := filepath.Join(codexHome, authFileName)
+	authRaw, err := os.ReadFile(authPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return ProfileSnapshot{}, fmt.Errorf("no auth.json found in %s", codexHome)
+	}
+	if err != nil {
+		return ProfileSnapshot{}, err
+	}
+	if !json.Valid(authRaw) {
+		return ProfileSnapshot{}, fmt.Errorf("%s is not valid JSON", authPath)
+	}
+	auth := readAuthMetadata(authPath)
+	label := deriveLabelFromAuth(auth)
+	id := sanitizeAccountID(deriveIDFromAuth(auth, label))
+	if id == "" {
+		id = "current-codex"
+	}
+	updatedAt := time.Now()
+	if info, err := os.Stat(authPath); err == nil {
+		updatedAt = info.ModTime()
+	}
+	return ProfileSnapshot{
+		ID:            id,
+		Label:         label,
+		Status:        StatusReady,
+		Auth:          prettyJSON(authRaw),
+		OwnerMode:     OwnerClient,
+		OwnerClientID: strings.TrimSpace(ownerClientID),
+		UpdatedAt:     updatedAt,
 	}, nil
 }
 
@@ -1295,6 +1417,9 @@ func (m *Manager) UpsertProfileSnapshot(snapshot ProfileSnapshot) (Account, erro
 			return Account{}, fmt.Errorf("unknown status %q", snapshot.Status)
 		}
 	}
+	if snapshot.OwnerMode != "" && !validOwnerMode(snapshot.OwnerMode) {
+		return Account{}, fmt.Errorf("unknown owner mode %q", snapshot.OwnerMode)
+	}
 
 	state, err := m.Load()
 	if err != nil {
@@ -1312,6 +1437,14 @@ func (m *Manager) UpsertProfileSnapshot(snapshot ProfileSnapshot) (Account, erro
 		}
 		if snapshot.Status != "" {
 			state.Accounts[i].Status = snapshot.Status
+		}
+		if snapshot.OwnerMode != "" {
+			state.Accounts[i].OwnerMode = snapshot.OwnerMode
+		}
+		if strings.TrimSpace(snapshot.OwnerClientID) != "" {
+			state.Accounts[i].OwnerClientID = strings.TrimSpace(snapshot.OwnerClientID)
+		} else if snapshot.OwnerMode == OwnerClient && strings.TrimSpace(snapshot.SourceClient) != "" {
+			state.Accounts[i].OwnerClientID = strings.TrimSpace(snapshot.SourceClient)
 		}
 		state.Accounts[i].UpdatedAt = time.Now()
 		account = state.Accounts[i]
@@ -1456,6 +1589,7 @@ func (m *Manager) LiveProfileView() AccountView {
 		Label:     "Current Codex",
 		Status:    StatusReady,
 		CodexHome: m.LiveCodexHome,
+		OwnerMode: OwnerClient,
 	})
 }
 
@@ -1499,6 +1633,7 @@ func (m *Manager) syncManagedAccounts(state State) (State, bool, error) {
 			Label:     label,
 			Status:    StatusReady,
 			CodexHome: codexHome,
+			OwnerMode: OwnerCloud,
 			CreatedAt: now,
 			UpdatedAt: now,
 		})
@@ -1837,6 +1972,29 @@ func (m *Manager) SetLabel(id, label string) error {
 	return fmt.Errorf("account %q not found", id)
 }
 
+func (m *Manager) SetOwner(id string, ownerMode AccountOwnerMode, ownerClientID string) error {
+	if !validOwnerMode(ownerMode) {
+		return fmt.Errorf("unknown owner mode %q", ownerMode)
+	}
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := range state.Accounts {
+		if state.Accounts[i].ID == id {
+			state.Accounts[i].OwnerMode = ownerMode
+			state.Accounts[i].OwnerClientID = strings.TrimSpace(ownerClientID)
+			if ownerMode == OwnerClient {
+				clearAccountLease(&state.Accounts[i])
+			}
+			state.Accounts[i].UpdatedAt = now
+			return m.Save(state)
+		}
+	}
+	return fmt.Errorf("account %q not found", id)
+}
+
 func (m *Manager) DeleteAccount(id string) (Account, error) {
 	state, err := m.Load()
 	if err != nil {
@@ -1995,7 +2153,7 @@ func (m *Manager) SelectAccountForRun() (AccountView, error) {
 	available := make([]AccountView, 0, len(accounts))
 	now := time.Now()
 	for _, account := range accounts {
-		if account.Status == StatusReady && account.AuthPresent && !accountLeaseActive(account.Account, now) {
+		if account.OwnerMode == OwnerCloud && account.Status == StatusReady && account.AuthPresent && !accountLeaseActive(account.Account, now) {
 			available = append(available, account)
 		}
 	}
@@ -2054,7 +2212,7 @@ func (m *Manager) ClaimLease(ctx context.Context, clientID, holder string, ttl t
 	}
 	available := []candidate{}
 	for i, account := range state.Accounts {
-		if account.Status != StatusReady || !m.accountAuthPresent(account) || accountLeaseActive(account, now) {
+		if account.OwnerMode != OwnerCloud || account.Status != StatusReady || !m.accountAuthPresent(account) || accountLeaseActive(account, now) {
 			continue
 		}
 		available = append(available, candidate{index: i, account: account})
@@ -2246,6 +2404,9 @@ func (m *Manager) ReleaseLease(accountID, leaseID, clientID string) error {
 func (m *Manager) AccountHasActiveLease(id string) (bool, error) {
 	account, err := m.GetAccount(id)
 	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return false, nil
+		}
 		return false, err
 	}
 	return accountLeaseActive(account, time.Now()), nil
@@ -2305,6 +2466,8 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 			ConfigPresent:  account.ConfigPresent,
 			Active:         account.Active,
 			CodexHome:      account.CodexHome,
+			OwnerMode:      account.OwnerMode,
+			OwnerClientID:  account.OwnerClientID,
 			Generation:     account.Generation,
 			LeaseActive:    account.LeaseActive,
 			LeaseClientID:  account.LeaseClientID,
@@ -2321,6 +2484,9 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 }
 
 func loadBalanceEligibility(account AccountView) (bool, string) {
+	if account.OwnerMode != OwnerCloud {
+		return false, fmt.Sprintf("owner is %s", account.OwnerMode)
+	}
 	if account.Status != StatusReady {
 		return false, fmt.Sprintf("status is %s", account.Status)
 	}
@@ -2526,12 +2692,34 @@ func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, erro
 		return quota.Result{}, err
 	}
 	now := time.Now()
+	if account.OwnerMode == OwnerClient {
+		state, loadErr := m.Load()
+		if loadErr == nil {
+			if cache, ok := state.QuotaCache[id]; ok && cache.Result.Status != "" {
+				result := cache.Result
+				result.Source = quotaSourceLabel(cache)
+				if cache.ReporterClientID != "" {
+					result.Detail = firstNonEmpty(result.Detail, fmt.Sprintf("client-owned account; returning quota reported by %s at %s", cache.ReporterClientID, cache.UpdatedAt.Format(time.RFC3339)))
+				} else {
+					result.Detail = firstNonEmpty(result.Detail, fmt.Sprintf("client-owned account; returning client-reported quota from %s", cache.UpdatedAt.Format(time.RFC3339)))
+				}
+				return result, nil
+			}
+		}
+		return quota.Result{
+			Status: quota.StatusNotConfigured,
+			Source: "client report",
+			Detail: "client-owned account; waiting for local cube report",
+		}, nil
+	}
 	if accountLeaseActive(account, now) {
 		state, loadErr := m.Load()
 		if loadErr == nil {
 			if cache, ok := state.QuotaCache[id]; ok && cache.Result.Status != "" {
-				cache.Result.Detail = firstNonEmpty(cache.Result.Detail, fmt.Sprintf("account is leased by %s until %s; returning cached quota", account.LeaseClientID, account.LeaseExpiresAt.Format(time.RFC3339)))
-				return cache.Result, nil
+				result := cache.Result
+				result.Source = quotaSourceLabel(cache)
+				result.Detail = firstNonEmpty(result.Detail, fmt.Sprintf("account is leased by %s until %s; returning cached quota", account.LeaseClientID, account.LeaseExpiresAt.Format(time.RFC3339)))
+				return result, nil
 			}
 		}
 		return quota.Result{
@@ -2546,11 +2734,15 @@ func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, erro
 	result, err := quota.FetchForCodexHome(ctx, account.CodexHome, now)
 	afterDigest := fileDigest(authPath)
 	authChanged := beforeDigest != "" && afterDigest != "" && beforeDigest != afterDigest
-	_ = m.recordQuotaResult(id, result, authChanged)
+	_ = m.recordQuotaResult(id, result, authChanged, QuotaSourceCloud, "")
 	return result, err
 }
 
-func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged bool) error {
+func (m *Manager) RecordQuotaReport(id string, result quota.Result, clientID string) error {
+	return m.recordQuotaResult(id, result, false, QuotaSourceClient, strings.TrimSpace(clientID))
+}
+
+func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged bool, source QuotaSource, reporterClientID string) error {
 	if strings.TrimSpace(id) == "" {
 		return nil
 	}
@@ -2569,11 +2761,29 @@ func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged 
 			break
 		}
 	}
+	if source == "" {
+		source = QuotaSourceCloud
+	}
 	state.QuotaCache[id] = QuotaCache{
-		AccountID: id,
-		UpdatedAt: time.Now(),
-		Result:    result,
-		FiveHour:  fiveHour,
+		AccountID:        id,
+		UpdatedAt:        time.Now(),
+		Result:           result,
+		FiveHour:         fiveHour,
+		Source:           source,
+		ReporterClientID: strings.TrimSpace(reporterClientID),
+	}
+	if source == QuotaSourceClient {
+		for i := range state.Accounts {
+			if state.Accounts[i].ID != id {
+				continue
+			}
+			state.Accounts[i].OwnerMode = OwnerClient
+			if strings.TrimSpace(reporterClientID) != "" {
+				state.Accounts[i].OwnerClientID = strings.TrimSpace(reporterClientID)
+			}
+			state.Accounts[i].UpdatedAt = time.Now()
+			break
+		}
 	}
 	if result.Status == quota.StatusRefreshInvalid {
 		for i := range state.Accounts {
@@ -2616,6 +2826,20 @@ func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged 
 		}
 	}
 	return m.Save(state)
+}
+
+func quotaSourceLabel(cache QuotaCache) string {
+	switch cache.Source {
+	case QuotaSourceClient:
+		if cache.ReporterClientID != "" {
+			return "client report:" + cache.ReporterClientID
+		}
+		return "client report"
+	case QuotaSourceCloud:
+		return "cloud refresh"
+	default:
+		return string(cache.Source)
+	}
 }
 
 func (m *Manager) syncLiveAuthToManaged(account Account) error {

@@ -64,6 +64,8 @@ func run(args []string) error {
 		return runClients(m, args[1:])
 	case "sync":
 		return runSync(m, args[1:])
+	case "report":
+		return runReport(m, args[1:])
 	case "dashboard":
 		return runDashboard(m, args[1:])
 	case "help", "-h", "--help":
@@ -593,6 +595,121 @@ func resolveSyncIDs(m *manager.Manager, ids []string, all bool) ([]string, error
 		return nil, fmt.Errorf("missing account id, or pass --all")
 	}
 	return ids, nil
+}
+
+func runReport(m *manager.Manager, args []string) error {
+	opts := defaultCloudSyncOptions(m)
+	opts.Interval = 5 * time.Minute
+	daemon := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--server":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --server")
+			}
+			opts.Server = strings.TrimSpace(args[i+1])
+			i++
+		case "--token":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --token")
+			}
+			opts.Token = strings.TrimSpace(args[i+1])
+			i++
+		case "--client":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --client")
+			}
+			opts.Client = strings.TrimSpace(args[i+1])
+			i++
+		case "--interval":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --interval")
+			}
+			interval, err := time.ParseDuration(args[i+1])
+			if err != nil {
+				return fmt.Errorf("invalid --interval %q", args[i+1])
+			}
+			opts.Interval = interval
+			i++
+		case "--daemon", "--watch":
+			daemon = true
+		default:
+			return fmt.Errorf("unknown report flag %q", args[i])
+		}
+	}
+	if opts.Server == "" {
+		return fmt.Errorf("missing cloud server; run cube cloud config --server <url> --token <token>, pass --server, or set CUBE_CLOUD_URL")
+	}
+	if opts.Interval < 30*time.Second {
+		return fmt.Errorf("--interval must be at least 30s")
+	}
+	if !daemon {
+		return reportLiveOnce(context.Background(), m, opts)
+	}
+	for {
+		if err := reportLiveOnce(context.Background(), m, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "cube report: %v\n", err)
+		}
+		time.Sleep(opts.Interval)
+	}
+}
+
+func reportLiveOnce(ctx context.Context, m *manager.Manager, opts cloudSyncOptions) error {
+	snapshot, err := m.ExportLiveProfileSnapshot("")
+	if err != nil {
+		return err
+	}
+	snapshot.SourceClient = opts.Client
+	snapshot.OwnerMode = manager.OwnerClient
+	snapshot.OwnerClientID = ""
+
+	account, err := pushReportSnapshot(ctx, opts, snapshot)
+	if err != nil {
+		return err
+	}
+
+	result, quotaErr := quota.FetchForCodexHome(ctx, m.LiveCodexHome, time.Now())
+	if refreshedSnapshot, err := m.ExportLiveProfileSnapshot(""); err == nil {
+		refreshedSnapshot.SourceClient = opts.Client
+		refreshedSnapshot.OwnerMode = manager.OwnerClient
+		refreshedSnapshot.OwnerClientID = ""
+		if refreshedAccount, pushErr := pushReportSnapshot(ctx, opts, refreshedSnapshot); pushErr == nil {
+			account = refreshedAccount
+		} else if quotaErr == nil {
+			return pushErr
+		}
+	}
+
+	if err := pushUsageFromHome(ctx, opts, account.ID, m.LiveCodexHome); err != nil {
+		return err
+	}
+	if result.Status != "" {
+		if err := pushQuotaReport(ctx, opts, account.ID, result); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("reported %s owner=client quota=%s source=%s\n", account.ID, result.Status, result.Source)
+	if quotaErr != nil {
+		return quotaErr
+	}
+	return nil
+}
+
+func pushReportSnapshot(ctx context.Context, opts cloudSyncOptions, snapshot manager.ProfileSnapshot) (manager.AccountView, error) {
+	var account manager.AccountView
+	if err := cloudJSON(ctx, http.MethodPost, opts, "/api/sync/push", snapshot, &account); err != nil {
+		return manager.AccountView{}, err
+	}
+	return account, nil
+}
+
+func pushQuotaReport(ctx context.Context, opts cloudSyncOptions, accountID string, result quota.Result) error {
+	body := struct {
+		Result quota.Result `json:"result"`
+	}{
+		Result: result,
+	}
+	return cloudJSON(ctx, http.MethodPost, opts, "/api/sync/quota/"+url.PathEscape(accountID), body, nil)
 }
 
 func runCloudRun(m *manager.Manager, args []string) error {
@@ -1184,6 +1301,7 @@ func printHelp() {
 	fmt.Println("  cube run [--server <url>] [--token <token>] [--heartbeat 20s] [-- codex args...]")
 	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...>")
 	fmt.Println("  cube cloud quota <account-id>")
+	fmt.Println("  cube report [--daemon] [--interval 5m]")
 	fmt.Println("  cube config edit")
 	fmt.Println("  cube config path")
 	fmt.Println("  cube clients list")
