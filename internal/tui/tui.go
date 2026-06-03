@@ -99,6 +99,12 @@ func (a *App) renderAccounts() error {
 	fmt.Println("===================")
 	fmt.Printf("state: %s\n", a.Manager.StatePath)
 	fmt.Printf("settings: %s\n", a.Manager.SettingsPath)
+	sharedPath, sharedPresent, _ := a.Manager.SharedConfigInfo()
+	sharedStatus := "missing"
+	if sharedPresent {
+		sharedStatus = "ready"
+	}
+	fmt.Printf("shared: %s (%s)\n", sharedPath, sharedStatus)
 	fmt.Printf("live: %s\n", a.Manager.LiveCodexHome)
 	fmt.Printf("homes: %s\n", a.Manager.AccountsDir)
 	fmt.Println()
@@ -108,22 +114,18 @@ func (a *App) renderAccounts() error {
 		return nil
 	}
 
-	fmt.Printf("%-18s %-10s %-8s %-8s %-6s %s\n", "ID", "STATUS", "AUTH", "CONFIG", "PLAN", "CODEX_HOME")
+	fmt.Printf("%-18s %-10s %-8s %-6s %s\n", "ID", "STATUS", "AUTH", "PLAN", "CODEX_HOME")
 	fmt.Println(strings.Repeat("-", 86))
 	for _, account := range accounts {
 		auth := "missing"
 		if account.AuthPresent {
 			auth = "ready"
 		}
-		config := "missing"
-		if account.ConfigPresent {
-			config = "ready"
-		}
 		plan := account.Plan
 		if plan == "" {
 			plan = "-"
 		}
-		fmt.Printf("%-18s %-10s %-8s %-8s %-6s %s\n", account.ID, account.Status, auth, config, plan, account.CodexHome)
+		fmt.Printf("%-18s %-10s %-8s %-6s %s\n", account.ID, account.Status, auth, plan, account.CodexHome)
 	}
 	return nil
 }

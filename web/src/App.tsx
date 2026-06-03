@@ -13,7 +13,6 @@ import {
 } from "@heroui/react";
 import {
   CheckCircle2,
-  CircleSlash,
   Database,
   FileJson,
   FolderCog,
@@ -61,6 +60,10 @@ interface Meta {
   liveCodexHome: string;
   liveAuthPresent: boolean;
   liveConfigPresent: boolean;
+  sharedConfigPath: string;
+  sharedSettingsPath?: string;
+  sharedConfigPresent: boolean;
+  sharedConfigUpdated?: string;
 }
 
 interface SettingsPayload {
@@ -68,6 +71,15 @@ interface SettingsPayload {
   settingsToml: string;
   liveCodexHome: string;
   accountsDir: string;
+  sharedConfigPath: string;
+  sharedSettingsPath?: string;
+}
+
+interface CodexConfigPayload {
+  configPath: string;
+  configToml: string;
+  configPresent: boolean;
+  configUpdated?: string;
 }
 
 interface QuotaItem {
@@ -167,7 +179,7 @@ function quotaSummary(quota?: QuotaResult) {
 
 function quotaHint(quota?: QuotaResult) {
   if (!quota) return "";
-  if (quota.status === "refresh_token_invalidated") return "Stored token expired. Re-login or import a fresh auth.json.";
+  if (quota.status === "refresh_token_invalidated") return "Stored token was rotated or revoked. Re-login this account or upload a fresh auth.json.";
   if (quota.status === "unsupported_api_key") return "API-key auth cannot expose subscription balance.";
   if (quota.status === "not_configured") return "auth.json is missing.";
   if (quota.status === "error") return quota.detail || "Quota check failed.";
@@ -183,7 +195,9 @@ export default function App() {
   const [status, setStatus] = useState<AccountStatus>("ready");
   const [liveHome, setLiveHome] = useState("");
   const [accountsDir, setAccountsDir] = useState("");
+  const [sharedConfigPath, setSharedConfigPath] = useState("");
   const [settingsToml, setSettingsToml] = useState("");
+  const [sharedConfigToml, setSharedConfigToml] = useState("");
   const [quotas, setQuotas] = useState<Record<string, QuotaResult>>({});
   const [usages, setUsages] = useState<Record<string, UsageSummary>>({});
   const [message, setMessage] = useState("");
@@ -194,7 +208,6 @@ export default function App() {
 
   const selected = useMemo(() => accounts.find((account) => account.id === selectedId), [accounts, selectedId]);
   const readyCount = accounts.filter((account) => account.status === "ready").length;
-  const missingConfigCount = accounts.filter((account) => !account.configPresent).length;
   const activeAccount = accounts.find((account) => account.active);
   const eligibleCount = lb?.eligible.length ?? 0;
   const [asideOpen, setAsideOpen] = useState(false);
@@ -204,18 +217,21 @@ export default function App() {
   async function loadAll(preferredId = selectedId) {
     setLoading(true);
     try {
-      const [metaData, accountData, lbData, settingsData] = await Promise.all([
+      const [metaData, accountData, lbData, settingsData, codexConfigData] = await Promise.all([
         apiJSON<Meta>("/api/meta"),
         apiJSON<Account[]>("/api/accounts"),
         apiJSON<LoadBalanceStatus>("/api/lb/status"),
         apiJSON<SettingsPayload>("/api/settings"),
+        apiJSON<CodexConfigPayload>("/api/codex-config"),
       ]);
       setMeta(metaData);
       setAccounts(accountData);
       setLB(lbData);
       setLiveHome(settingsData.liveCodexHome);
       setAccountsDir(settingsData.accountsDir);
+      setSharedConfigPath(settingsData.sharedSettingsPath || settingsData.sharedConfigPath || codexConfigData.configPath);
       setSettingsToml(settingsData.settingsToml);
+      setSharedConfigToml(codexConfigData.configToml);
       if (!accountData.some((account) => account.id === preferredId)) {
         setSelectedId(accountData.find((account) => account.active)?.id || accountData[0]?.id || "");
       }
@@ -371,7 +387,7 @@ export default function App() {
     await withBusy(async () => {
       await apiJSON<Meta>("/api/settings", {
         method: "PATCH",
-        body: JSON.stringify({ liveCodexHome: liveHome, accountsDir }),
+        body: JSON.stringify({ liveCodexHome: liveHome, accountsDir, sharedSettingsPath: sharedConfigPath }),
       });
       setMessage("Settings paths saved");
       await loadAll(selectedId);
@@ -386,8 +402,22 @@ export default function App() {
       });
       setLiveHome(settings.liveCodexHome);
       setAccountsDir(settings.accountsDir);
+      setSharedConfigPath(settings.sharedSettingsPath || settings.sharedConfigPath);
       setSettingsToml(settings.settingsToml);
       setMessage("settings.toml saved");
+      await loadAll(selectedId);
+    });
+  }
+
+  async function saveSharedConfig() {
+    await withBusy(async () => {
+      const config = await apiJSON<CodexConfigPayload>("/api/codex-config", {
+        method: "PUT",
+        body: JSON.stringify({ configToml: sharedConfigToml }),
+      });
+      setSharedConfigPath(config.configPath);
+      setSharedConfigToml(config.configToml);
+      setMessage("Shared settings saved");
       await loadAll(selectedId);
     });
   }
@@ -537,7 +567,12 @@ export default function App() {
               <MetricCard icon={<Database size={18} />} label="Accounts" value={accounts.length.toString()} status="success" />
               <MetricCard icon={<CheckCircle2 size={18} />} label="Ready Pool" value={readyCount.toString()} status="success" />
               <MetricCard icon={<Route size={18} />} label="LB Eligible" value={eligibleCount.toString()} status="warning" />
-              <MetricCard icon={<CircleSlash size={18} />} label="Missing Settings" value={missingConfigCount.toString()} status="danger" />
+              <MetricCard
+                icon={<Settings size={18} />}
+                label="Shared Settings"
+                value={meta?.sharedConfigPresent ? "1" : "0"}
+                status={meta?.sharedConfigPresent ? "success" : "warning"}
+              />
             </div>
 
             <section className="cube-view-panel">
@@ -562,8 +597,8 @@ export default function App() {
                       <Chip color="accent" size="sm" variant="soft">
                         {eligibleCount} lb
                       </Chip>
-                      <Chip color={missingConfigCount ? "warning" : "success"} size="sm" variant="soft">
-                        {missingConfigCount} missing settings
+                      <Chip color={meta?.sharedConfigPresent ? "success" : "warning"} size="sm" variant="soft">
+                        shared settings {meta?.sharedConfigPresent ? "ready" : "missing"}
                       </Chip>
                     </div>
                   </div>
@@ -699,8 +734,9 @@ export default function App() {
         )}
 
         {activeView === "settings" && (
-          <section className="cube-view-panel">
+          <section className="cube-view-panel flex flex-col gap-4">
             <SettingsEditorCard />
+            <SharedSettingsCard />
           </section>
         )}
 
@@ -743,6 +779,14 @@ export default function App() {
                 onChange={(event) => setAccountsDir(event.currentTarget.value)}
               />
             </FieldLabel>
+            <FieldLabel text="shared_settings_path">
+              <Input
+                fullWidth
+                value={sharedConfigPath}
+                variant="secondary"
+                onChange={(event) => setSharedConfigPath(event.currentTarget.value)}
+              />
+            </FieldLabel>
             <Button isDisabled={busy} type="submit" variant="primary">
               Save paths
             </Button>
@@ -761,6 +805,36 @@ export default function App() {
             Save TOML
           </Button>
           <div className="path-text font-mono text-xs text-slate-500">{meta?.settingsPath}</div>
+        </Card.Content>
+      </Card>
+    );
+  }
+
+  function SharedSettingsCard({ subtle = false }: { subtle?: boolean } = {}) {
+    return (
+      <Card className={subtle ? "border border-slate-200 shadow-none" : "border border-slate-200 bg-white shadow-sm"}>
+        <Card.Header className="border-b border-slate-100 px-4 py-3">
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-950">
+            <Settings size={16} />
+            Shared settings.toml
+          </h3>
+        </Card.Header>
+        <Card.Content className="gap-4">
+          <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
+            <div className="path-text font-mono">{sharedConfigPath || meta?.sharedSettingsPath || meta?.sharedConfigPath || "-"}</div>
+          </div>
+          <TextArea
+            className="min-h-64 font-mono text-xs leading-5"
+            fullWidth
+            rows={14}
+            value={sharedConfigToml}
+            variant="secondary"
+            onChange={(event) => setSharedConfigToml(event.currentTarget.value)}
+          />
+          <Button className="gap-2" isDisabled={busy} variant="primary" onPress={saveSharedConfig}>
+            <Save size={15} />
+            Save shared settings
+          </Button>
         </Card.Content>
       </Card>
     );
@@ -819,7 +893,12 @@ export default function App() {
                 <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">Files</Card.Header>
                 <Card.Content className="gap-3 text-xs">
                   <FileLine icon={<ShieldCheck size={15} />} label="auth.json" present={selected.authPresent} path={selected.authPath} />
-                  <FileLine icon={<Settings size={15} />} label="config.toml" present={selected.configPresent} path={selected.configPath} />
+                  <FileLine
+                    icon={<Settings size={15} />}
+                    label="shared settings.toml"
+                    present={Boolean(meta?.sharedConfigPresent)}
+                    path={meta?.sharedSettingsPath || meta?.sharedConfigPath || selected.configPath}
+                  />
                 </Card.Content>
               </Card>
             </>
@@ -834,6 +913,7 @@ export default function App() {
           )}
 
           <SettingsEditorCard subtle />
+          <SharedSettingsCard subtle />
         </div>
       </div>
     );
@@ -1118,7 +1198,7 @@ function MobileAccountCard({
           auth
         </Chip>
         <Chip color={account.configPresent ? "accent" : "warning"} size="sm" variant="soft">
-          config
+          shared settings
         </Chip>
       </div>
 

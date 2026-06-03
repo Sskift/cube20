@@ -262,17 +262,19 @@ func listAccounts(m *manager.Manager) error {
 		return nil
 	}
 
-	fmt.Printf("%-18s %-10s %-8s %-8s %s\n", "ID", "STATUS", "AUTH", "CONFIG", "CODEX_HOME")
+	sharedPath, sharedPresent, _ := m.SharedConfigInfo()
+	sharedStatus := "missing"
+	if sharedPresent {
+		sharedStatus = "ready"
+	}
+	fmt.Printf("shared settings: %s (%s)\n", sharedPath, sharedStatus)
+	fmt.Printf("%-18s %-10s %-8s %s\n", "ID", "STATUS", "AUTH", "CODEX_HOME")
 	for _, account := range accounts {
 		auth := "missing"
 		if account.AuthPresent {
 			auth = "ready"
 		}
-		config := "missing"
-		if account.ConfigPresent {
-			config = "ready"
-		}
-		fmt.Printf("%-18s %-10s %-8s %-8s %s\n", account.ID, account.Status, auth, config, account.CodexHome)
+		fmt.Printf("%-18s %-10s %-8s %s\n", account.ID, account.Status, auth, account.CodexHome)
 	}
 	return nil
 }

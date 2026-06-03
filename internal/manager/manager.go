@@ -26,6 +26,7 @@ const (
 	defaultStateDirName    = ".cube20"
 	defaultAccountsDirName = ".codex-accounts"
 	settingsFileName       = "settings.toml"
+	sharedSettingsFileName = "shared-settings.toml"
 	roundRobinFileName     = "run-round-robin.json"
 	authFileName           = "auth.json"
 	configFileName         = "config.toml"
@@ -93,8 +94,9 @@ type LoadBalanceStatus struct {
 }
 
 type Settings struct {
-	LiveCodexHome string `json:"liveCodexHome" toml:"live_codex_home"`
-	AccountsDir   string `json:"accountsDir" toml:"accounts_dir"`
+	LiveCodexHome    string `json:"liveCodexHome" toml:"live_codex_home"`
+	AccountsDir      string `json:"accountsDir" toml:"accounts_dir"`
+	SharedConfigPath string `json:"sharedConfigPath" toml:"shared_settings_path"`
 }
 
 type JSONProfile struct {
@@ -105,11 +107,12 @@ type JSONProfile struct {
 }
 
 type Manager struct {
-	StateDir      string
-	StatePath     string
-	SettingsPath  string
-	AccountsDir   string
-	LiveCodexHome string
+	StateDir         string
+	StatePath        string
+	SettingsPath     string
+	AccountsDir      string
+	LiveCodexHome    string
+	SharedConfigPath string
 }
 
 func New() (*Manager, error) {
@@ -129,11 +132,12 @@ func New() (*Manager, error) {
 	}
 
 	return &Manager{
-		StateDir:      stateDir,
-		StatePath:     filepath.Join(stateDir, "state.json"),
-		SettingsPath:  settingsPath,
-		AccountsDir:   settings.AccountsDir,
-		LiveCodexHome: settings.LiveCodexHome,
+		StateDir:         stateDir,
+		StatePath:        filepath.Join(stateDir, "state.json"),
+		SettingsPath:     settingsPath,
+		AccountsDir:      settings.AccountsDir,
+		LiveCodexHome:    settings.LiveCodexHome,
+		SharedConfigPath: settings.SharedConfigPath,
 	}, nil
 }
 
@@ -141,7 +145,16 @@ func (m *Manager) Ensure() error {
 	if err := os.MkdirAll(m.StateDir, 0o700); err != nil {
 		return err
 	}
-	return os.MkdirAll(m.AccountsDir, 0o700)
+	if err := os.MkdirAll(m.AccountsDir, 0o700); err != nil {
+		return err
+	}
+	if strings.TrimSpace(m.SharedConfigPath) != "" {
+		if err := os.MkdirAll(filepath.Dir(m.SharedConfigPath), 0o700); err != nil {
+			return err
+		}
+		_ = m.syncSharedConfigFromCodexHome(m.LiveCodexHome, false)
+	}
+	return nil
 }
 
 func (m *Manager) Load() (State, error) {
@@ -183,15 +196,16 @@ func (m *Manager) Save(state State) error {
 	return os.Rename(tmpPath, m.StatePath)
 }
 
-func (m *Manager) UpdateSettings(liveCodexHome, accountsDir string) (Settings, error) {
+func (m *Manager) UpdateSettings(liveCodexHome, accountsDir, sharedConfigPath string) (Settings, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return Settings{}, err
 	}
 
 	settings := Settings{
-		LiveCodexHome: m.LiveCodexHome,
-		AccountsDir:   m.AccountsDir,
+		LiveCodexHome:    m.LiveCodexHome,
+		AccountsDir:      m.AccountsDir,
+		SharedConfigPath: m.SharedConfigPath,
 	}
 	if strings.TrimSpace(liveCodexHome) != "" {
 		settings.LiveCodexHome = expandPath(liveCodexHome, home)
@@ -199,7 +213,10 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir string) (Settings, e
 	if strings.TrimSpace(accountsDir) != "" {
 		settings.AccountsDir = expandPath(accountsDir, home)
 	}
-	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
+	if strings.TrimSpace(sharedConfigPath) != "" {
+		settings.SharedConfigPath = expandPath(sharedConfigPath, home)
+	}
+	if settings.LiveCodexHome == "" || settings.AccountsDir == "" || settings.SharedConfigPath == "" {
 		return Settings{}, errors.New("settings paths cannot be empty")
 	}
 
@@ -208,6 +225,7 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir string) (Settings, e
 	}
 	m.LiveCodexHome = settings.LiveCodexHome
 	m.AccountsDir = settings.AccountsDir
+	m.SharedConfigPath = settings.SharedConfigPath
 	if err := m.Ensure(); err != nil {
 		return Settings{}, err
 	}
@@ -220,7 +238,7 @@ func (m *Manager) ReadSettingsText() (string, error) {
 	}
 	data, err := os.ReadFile(m.SettingsPath)
 	if errors.Is(err, os.ErrNotExist) {
-		settings := Settings{LiveCodexHome: m.LiveCodexHome, AccountsDir: m.AccountsDir}
+		settings := Settings{LiveCodexHome: m.LiveCodexHome, AccountsDir: m.AccountsDir, SharedConfigPath: m.SharedConfigPath}
 		if err := writeSettings(m.SettingsPath, settings); err != nil {
 			return "", err
 		}
@@ -238,14 +256,16 @@ func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
 		return Settings{}, err
 	}
 
-	var settings Settings
-	if err := toml.Unmarshal([]byte(raw), &settings); err != nil {
+	settings, _, err := parseSettingsData([]byte(raw), Settings{
+		LiveCodexHome:    m.LiveCodexHome,
+		AccountsDir:      m.AccountsDir,
+		SharedConfigPath: m.SharedConfigPath,
+	}, home)
+	if err != nil {
 		return Settings{}, err
 	}
-	settings.LiveCodexHome = expandPath(settings.LiveCodexHome, home)
-	settings.AccountsDir = expandPath(settings.AccountsDir, home)
-	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
-		return Settings{}, errors.New("settings.toml must include live_codex_home and accounts_dir")
+	if settings.LiveCodexHome == "" || settings.AccountsDir == "" || settings.SharedConfigPath == "" {
+		return Settings{}, errors.New("settings.toml must include live_codex_home, accounts_dir, and shared_settings_path")
 	}
 
 	if err := writeSettings(m.SettingsPath, settings); err != nil {
@@ -253,6 +273,7 @@ func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
 	}
 	m.LiveCodexHome = settings.LiveCodexHome
 	m.AccountsDir = settings.AccountsDir
+	m.SharedConfigPath = settings.SharedConfigPath
 	if err := m.Ensure(); err != nil {
 		return Settings{}, err
 	}
@@ -309,21 +330,15 @@ func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account,
 		}
 	}
 
-	filesToCopy := []string{}
-	for _, fileName := range []string{authFileName, configFileName} {
-		source := filepath.Join(sourceCodexHome, fileName)
-		if _, err := os.Stat(source); err == nil {
-			filesToCopy = append(filesToCopy, fileName)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return Account{}, err
+	sourceAuth := filepath.Join(sourceCodexHome, authFileName)
+	if _, err := os.Stat(sourceAuth); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Account{}, fmt.Errorf("no auth.json found in %s", sourceCodexHome)
 		}
+		return Account{}, err
 	}
 
-	if len(filesToCopy) == 0 {
-		return Account{}, fmt.Errorf("no auth.json or config.toml found in %s", sourceCodexHome)
-	}
-
-	auth := readAuthMetadata(filepath.Join(sourceCodexHome, authFileName))
+	auth := readAuthMetadata(sourceAuth)
 	state, err := m.Load()
 	if err != nil {
 		return Account{}, err
@@ -349,13 +364,11 @@ func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account,
 	if err != nil {
 		return Account{}, err
 	}
-	for _, fileName := range filesToCopy {
-		source := filepath.Join(sourceCodexHome, fileName)
-		target := filepath.Join(account.CodexHome, fileName)
-		if err := copyFile(source, target, fileModeFor(fileName)); err != nil {
-			return Account{}, err
-		}
+	targetAuth := filepath.Join(account.CodexHome, authFileName)
+	if err := copyFile(sourceAuth, targetAuth, fileModeFor(authFileName)); err != nil {
+		return Account{}, err
 	}
+	_ = m.syncSharedConfigFromCodexHome(sourceCodexHome, false)
 	return account, nil
 }
 
@@ -401,8 +414,7 @@ func (m *Manager) ImportJSONProfile(profile JSONProfile) (Account, error) {
 	}
 
 	if strings.TrimSpace(profile.Config) != "" {
-		configPath := filepath.Join(account.CodexHome, configFileName)
-		if err := os.WriteFile(configPath, []byte(profile.Config), fileModeFor(configFileName)); err != nil {
+		if err := m.WriteSharedConfigText(profile.Config); err != nil {
 			return Account{}, err
 		}
 	}
@@ -494,12 +506,8 @@ func (m *Manager) syncManagedAccounts(state State) (State, bool, error) {
 }
 
 func hasManagedFiles(codexHome string) bool {
-	for _, fileName := range []string{authFileName, configFileName} {
-		if _, err := os.Stat(filepath.Join(codexHome, fileName)); err == nil {
-			return true
-		}
-	}
-	return false
+	_, err := os.Stat(filepath.Join(codexHome, authFileName))
+	return err == nil
 }
 
 func (m *Manager) uniqueAccountID(base string) string {
@@ -875,6 +883,9 @@ func (m *Manager) LoginCommand(id string) (*exec.Cmd, error) {
 	if err := os.MkdirAll(account.CodexHome, 0o700); err != nil {
 		return nil, err
 	}
+	if err := m.syncSharedConfigToCodexHome(account.CodexHome); err != nil {
+		return nil, err
+	}
 
 	cmd := exec.Command("codex", "login", "--device-auth")
 	cmd.Env = withEnv(os.Environ(), "CODEX_HOME", account.CodexHome)
@@ -893,6 +904,9 @@ func (m *Manager) CodexCommand(id string, args []string) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("account %q is disabled", id)
 	}
 	if err := os.MkdirAll(account.CodexHome, 0o700); err != nil {
+		return nil, err
+	}
+	if err := m.syncSharedConfigToCodexHome(account.CodexHome); err != nil {
 		return nil, err
 	}
 
@@ -1051,7 +1065,35 @@ func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, erro
 	if err != nil {
 		return quota.Result{}, err
 	}
+	_ = m.syncLiveAuthToManaged(account)
 	return quota.FetchForCodexHome(ctx, account.CodexHome, time.Now())
+}
+
+func (m *Manager) syncLiveAuthToManaged(account Account) error {
+	liveAuth := filepath.Join(m.LiveCodexHome, authFileName)
+	managedAuth := filepath.Join(account.CodexHome, authFileName)
+	if samePath(liveAuth, managedAuth) {
+		return nil
+	}
+
+	liveInfo, err := os.Stat(liveAuth)
+	if err != nil {
+		return nil
+	}
+	managedInfo, err := os.Stat(managedAuth)
+	if err != nil {
+		return nil
+	}
+	if !liveInfo.ModTime().After(managedInfo.ModTime()) {
+		return nil
+	}
+
+	liveIdentity := authIdentity(readAuthMetadata(liveAuth))
+	managedIdentity := authIdentity(readAuthMetadata(managedAuth))
+	if liveIdentity == "" || liveIdentity != managedIdentity {
+		return nil
+	}
+	return copyFile(liveAuth, managedAuth, fileModeFor(authFileName))
 }
 
 func (m *Manager) FetchUsage(id string) (usage.Summary, error) {
@@ -1060,6 +1102,92 @@ func (m *Manager) FetchUsage(id string) (usage.Summary, error) {
 		return usage.Summary{}, err
 	}
 	return usage.SummarizeCodexHome(account.CodexHome, time.Now()), nil
+}
+
+func (m *Manager) SharedConfigInfo() (string, bool, time.Time) {
+	if strings.TrimSpace(m.SharedConfigPath) == "" {
+		return "", false, time.Time{}
+	}
+	info, err := os.Stat(m.SharedConfigPath)
+	if err != nil {
+		return m.SharedConfigPath, false, time.Time{}
+	}
+	return m.SharedConfigPath, true, info.ModTime()
+}
+
+func (m *Manager) ReadSharedConfigText() (string, error) {
+	if err := m.Ensure(); err != nil {
+		return "", err
+	}
+	if _, present, _ := m.SharedConfigInfo(); !present {
+		return "", nil
+	}
+	data, err := os.ReadFile(m.SharedConfigPath)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (m *Manager) WriteSharedConfigText(raw string) error {
+	if strings.TrimSpace(m.SharedConfigPath) == "" {
+		return errors.New("shared_settings_path is empty")
+	}
+	if err := os.MkdirAll(filepath.Dir(m.SharedConfigPath), 0o700); err != nil {
+		return err
+	}
+	tmpPath := m.SharedConfigPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(raw), fileModeFor(configFileName)); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, m.SharedConfigPath)
+}
+
+func (m *Manager) syncSharedConfigFromCodexHome(codexHome string, overwrite bool) error {
+	if strings.TrimSpace(codexHome) == "" || strings.TrimSpace(m.SharedConfigPath) == "" {
+		return nil
+	}
+	source := filepath.Join(codexHome, configFileName)
+	if samePath(source, m.SharedConfigPath) {
+		return nil
+	}
+	if _, err := os.Stat(source); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !overwrite {
+		if _, err := os.Stat(m.SharedConfigPath); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(m.SharedConfigPath), 0o700); err != nil {
+		return err
+	}
+	return copyFile(source, m.SharedConfigPath, fileModeFor(configFileName))
+}
+
+func (m *Manager) syncSharedConfigToCodexHome(codexHome string) error {
+	if strings.TrimSpace(codexHome) == "" || strings.TrimSpace(m.SharedConfigPath) == "" {
+		return nil
+	}
+	if _, err := os.Stat(m.SharedConfigPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	target := filepath.Join(codexHome, configFileName)
+	if samePath(m.SharedConfigPath, target) {
+		return nil
+	}
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		return err
+	}
+	return copyFile(m.SharedConfigPath, target, fileModeFor(configFileName))
 }
 
 func (m *Manager) DeployProfile(id, targetCodexHome string) ([]string, error) {
@@ -1082,35 +1210,25 @@ func (m *Manager) DeployProfile(id, targetCodexHome string) ([]string, error) {
 	}
 
 	written := []string{}
-	missing := []string{}
-	for _, fileName := range []string{authFileName, configFileName} {
-		source := filepath.Join(account.CodexHome, fileName)
-		if _, err := os.Stat(source); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				missing = append(missing, fileName)
-				continue
-			}
-			return nil, err
+	authSource := filepath.Join(account.CodexHome, authFileName)
+	if _, err := os.Stat(authSource); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("account %q has no auth.json", id)
 		}
-
-		target := filepath.Join(targetCodexHome, fileName)
-		if _, err := os.Stat(target); err == nil {
-			backup := target + ".backup-" + time.Now().Format("20060102-150405")
-			if err := copyFile(target, backup, fileModeFor(fileName)); err != nil {
-				return nil, fmt.Errorf("backup existing %s: %w", fileName, err)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-
-		if err := copyFile(source, target, fileModeFor(fileName)); err != nil {
-			return nil, err
-		}
-		written = append(written, target)
+		return nil, err
 	}
+	authTarget := filepath.Join(targetCodexHome, authFileName)
+	if err := copyFileWithBackup(authSource, authTarget, fileModeFor(authFileName)); err != nil {
+		return nil, err
+	}
+	written = append(written, authTarget)
 
-	if len(written) == 0 {
-		return nil, fmt.Errorf("account %q has no managed files; missing %s", id, strings.Join(missing, ", "))
+	if _, present, _ := m.SharedConfigInfo(); present {
+		configTarget := filepath.Join(targetCodexHome, configFileName)
+		if err := copyFileWithBackup(m.SharedConfigPath, configTarget, fileModeFor(configFileName)); err != nil {
+			return nil, err
+		}
+		written = append(written, configTarget)
 	}
 	return written, nil
 }
@@ -1125,7 +1243,7 @@ func (m *Manager) DeployAuth(id, targetCodexHome string) (string, error) {
 
 func (m *Manager) accountView(account Account) AccountView {
 	authPath := filepath.Join(account.CodexHome, authFileName)
-	configPath := filepath.Join(account.CodexHome, configFileName)
+	configPath, configPresent, configUpdated := m.SharedConfigInfo()
 	view := AccountView{
 		Account:    account,
 		AuthPath:   authPath,
@@ -1137,11 +1255,8 @@ func (m *Manager) accountView(account Account) AccountView {
 		view.AuthPresent = true
 		view.AuthUpdated = info.ModTime()
 	}
-	info, err = os.Stat(configPath)
-	if err == nil {
-		view.ConfigPresent = true
-		view.ConfigUpdated = info.ModTime()
-	}
+	view.ConfigPresent = configPresent
+	view.ConfigUpdated = configUpdated
 	view.Active = m.isAccountActive(account)
 	return view
 }
@@ -1179,8 +1294,9 @@ func defaultSettings(home string) Settings {
 		liveCodexHome = expandPath(value, home)
 	}
 	return Settings{
-		LiveCodexHome: liveCodexHome,
-		AccountsDir:   filepath.Join(home, defaultAccountsDirName),
+		LiveCodexHome:    liveCodexHome,
+		AccountsDir:      filepath.Join(home, defaultAccountsDirName),
+		SharedConfigPath: filepath.Join(home, defaultStateDirName, sharedSettingsFileName),
 	}
 }
 
@@ -1196,13 +1312,63 @@ func loadSettings(path string, defaults Settings, home string) (Settings, error)
 		return Settings{}, err
 	}
 
-	settings := defaults
-	if err := toml.Unmarshal(data, &settings); err != nil {
+	settings, changed, err := parseSettingsData(data, defaults, home)
+	if err != nil {
 		return Settings{}, err
 	}
+	if changed {
+		if err := writeSettings(path, settings); err != nil {
+			return Settings{}, err
+		}
+	}
+	return settings, nil
+}
+
+func parseSettingsData(data []byte, defaults Settings, home string) (Settings, bool, error) {
+	settings := defaults
+	if err := toml.Unmarshal(data, &settings); err != nil {
+		return Settings{}, false, err
+	}
+
+	var legacy struct {
+		SharedConfigPath string `toml:"shared_config_path"`
+	}
+	_ = toml.Unmarshal(data, &legacy)
+
+	rawText := string(data)
+	hasSharedSettingsPath := strings.Contains(rawText, "shared_settings_path")
+	changed := !hasSharedSettingsPath || strings.Contains(rawText, "shared_config_path")
+	if !hasSharedSettingsPath && strings.TrimSpace(legacy.SharedConfigPath) != "" {
+		settings.SharedConfigPath = legacy.SharedConfigPath
+	}
+
 	settings.LiveCodexHome = expandPath(settings.LiveCodexHome, home)
 	settings.AccountsDir = expandPath(settings.AccountsDir, home)
-	return settings, nil
+	if strings.TrimSpace(settings.SharedConfigPath) == "" {
+		settings.SharedConfigPath = defaults.SharedConfigPath
+		changed = true
+	}
+	beforeMigration := settings.SharedConfigPath
+	settings.SharedConfigPath = expandPath(settings.SharedConfigPath, home)
+	settings.SharedConfigPath = migrateDefaultSharedSettingsPath(settings.SharedConfigPath, defaults.SharedConfigPath, home)
+	if settings.SharedConfigPath != beforeMigration {
+		changed = true
+	}
+	return settings, changed, nil
+}
+
+func migrateDefaultSharedSettingsPath(path, defaultPath, home string) string {
+	oldDefault := filepath.Join(home, defaultStateDirName, configFileName)
+	if !samePath(path, oldDefault) {
+		return path
+	}
+	if _, err := os.Stat(defaultPath); errors.Is(err, os.ErrNotExist) {
+		if _, oldErr := os.Stat(oldDefault); oldErr == nil {
+			_ = os.MkdirAll(filepath.Dir(defaultPath), 0o700)
+			_ = copyFile(oldDefault, defaultPath, fileModeFor(configFileName))
+		}
+	}
+	return defaultPath
 }
 
 func writeSettings(path string, settings Settings) error {
@@ -1272,6 +1438,21 @@ func copyFile(source, target string, mode os.FileMode) error {
 		return err
 	}
 	return out.Sync()
+}
+
+func copyFileWithBackup(source, target string, mode os.FileMode) error {
+	if samePath(source, target) {
+		return nil
+	}
+	if _, err := os.Stat(target); err == nil {
+		backup := target + ".backup-" + time.Now().Format("20060102-150405")
+		if err := copyFile(target, backup, mode); err != nil {
+			return fmt.Errorf("backup existing %s: %w", filepath.Base(target), err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return copyFile(source, target, mode)
 }
 
 func withEnv(env []string, key, value string) []string {

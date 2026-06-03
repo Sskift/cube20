@@ -37,6 +37,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/accounts/", s.handleAccountAction)
 	mux.HandleFunc("/api/meta", s.handleMeta)
 	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/api/codex-config", s.handleCodexConfig)
 
 	distSub, err := fs.Sub(webdist.DistFS, "dist")
 	if err != nil {
@@ -128,21 +129,29 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"settingsPath":  s.Manager.SettingsPath,
-			"settingsToml":  text,
-			"liveCodexHome": s.Manager.LiveCodexHome,
-			"accountsDir":   s.Manager.AccountsDir,
+			"settingsPath":       s.Manager.SettingsPath,
+			"settingsToml":       text,
+			"liveCodexHome":      s.Manager.LiveCodexHome,
+			"accountsDir":        s.Manager.AccountsDir,
+			"sharedConfigPath":   s.Manager.SharedConfigPath,
+			"sharedSettingsPath": s.Manager.SharedConfigPath,
 		})
 	case http.MethodPatch:
 		var body struct {
-			LiveCodexHome string `json:"liveCodexHome"`
-			AccountsDir   string `json:"accountsDir"`
+			LiveCodexHome      string `json:"liveCodexHome"`
+			AccountsDir        string `json:"accountsDir"`
+			SharedConfigPath   string `json:"sharedConfigPath"`
+			SharedSettingsPath string `json:"sharedSettingsPath"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-		if _, err := s.Manager.UpdateSettings(body.LiveCodexHome, body.AccountsDir); err != nil {
+		sharedPath := body.SharedSettingsPath
+		if strings.TrimSpace(sharedPath) == "" {
+			sharedPath = body.SharedConfigPath
+		}
+		if _, err := s.Manager.UpdateSettings(body.LiveCodexHome, body.AccountsDir, sharedPath); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -162,10 +171,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		text, _ := s.Manager.ReadSettingsText()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"settingsPath":  s.Manager.SettingsPath,
-			"settingsToml":  text,
-			"liveCodexHome": settings.LiveCodexHome,
-			"accountsDir":   settings.AccountsDir,
+			"settingsPath":       s.Manager.SettingsPath,
+			"settingsToml":       text,
+			"liveCodexHome":      settings.LiveCodexHome,
+			"accountsDir":        settings.AccountsDir,
+			"sharedConfigPath":   settings.SharedConfigPath,
+			"sharedSettingsPath": settings.SharedConfigPath,
 		})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -174,14 +185,59 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) writeMeta(w http.ResponseWriter) {
 	live := s.Manager.LiveProfileView()
+	sharedConfigPath, sharedConfigPresent, sharedConfigUpdated := s.Manager.SharedConfigInfo()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"statePath":         s.Manager.StatePath,
-		"settingsPath":      s.Manager.SettingsPath,
-		"accountsDir":       s.Manager.AccountsDir,
-		"liveCodexHome":     s.Manager.LiveCodexHome,
-		"liveAuthPresent":   live.AuthPresent,
-		"liveConfigPresent": live.ConfigPresent,
+		"statePath":           s.Manager.StatePath,
+		"settingsPath":        s.Manager.SettingsPath,
+		"accountsDir":         s.Manager.AccountsDir,
+		"liveCodexHome":       s.Manager.LiveCodexHome,
+		"liveAuthPresent":     live.AuthPresent,
+		"liveConfigPresent":   live.ConfigPresent,
+		"sharedConfigPath":    sharedConfigPath,
+		"sharedSettingsPath":  sharedConfigPath,
+		"sharedConfigPresent": sharedConfigPresent,
+		"sharedConfigUpdated": sharedConfigUpdated,
 	})
+}
+
+func (s *Server) handleCodexConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		text, err := s.Manager.ReadSharedConfigText()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		path, present, updated := s.Manager.SharedConfigInfo()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"configPath":    path,
+			"configToml":    text,
+			"configPresent": present,
+			"configUpdated": updated,
+		})
+	case http.MethodPut:
+		var body struct {
+			ConfigToml string `json:"configToml"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		if err := s.Manager.WriteSharedConfigText(body.ConfigToml); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		text, _ := s.Manager.ReadSharedConfigText()
+		path, present, updated := s.Manager.SharedConfigInfo()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"configPath":    path,
+			"configToml":    text,
+			"configPresent": present,
+			"configUpdated": updated,
+		})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
@@ -387,6 +443,15 @@ func parseProfileUpload(raw []byte) (manager.JSONProfile, error) {
 		}
 		if profile.Config == "" {
 			profile.Config = rawString(root["config_toml"])
+		}
+		if profile.Config == "" {
+			profile.Config = rawString(root["settings"])
+		}
+		if profile.Config == "" {
+			profile.Config = rawString(root["settingsToml"])
+		}
+		if profile.Config == "" {
+			profile.Config = rawString(root["settings_toml"])
 		}
 		return profile, nil
 	}
