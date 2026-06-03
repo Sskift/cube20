@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -44,14 +47,16 @@ func run(args []string) error {
 		return runProfile(m, args[1:])
 	case "codex":
 		return runCodex(m, args[1:])
-	case "codex-auto", "run":
+	case "codex-auto":
 		return runCodexAuto(m, args[1:])
+	case "run", "cloud-run":
+		return runCloudRun(m, args[1:])
+	case "config":
+		return runConfig(m, args[1:])
 	case "lb":
 		return runLoadBalancer(m, args[1:])
 	case "cloud":
 		return runCloud(m, args[1:])
-	case "cloud-run":
-		return runCloudRun(m, args[1:])
 	case "sync":
 		return runSync(m, args[1:])
 	case "dashboard":
@@ -185,6 +190,61 @@ func runCodexAuto(m *manager.Manager, args []string) error {
 		return err
 	}
 	return cmd.Run()
+}
+
+func runConfig(m *manager.Manager, args []string) error {
+	if len(args) == 0 {
+		args = []string{"edit"}
+	}
+	switch args[0] {
+	case "edit":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: cube config edit")
+		}
+		return editCodexConfig(m)
+	case "path":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: cube config path")
+		}
+		fmt.Println(manager.CodexConfigPath(m.LiveCodexHome))
+		return nil
+	default:
+		return fmt.Errorf("usage: cube config [edit|path]")
+	}
+}
+
+func editCodexConfig(m *manager.Manager) error {
+	path := manager.CodexConfigPath(m.LiveCodexHome)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(path, []byte{}, 0o600); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	editor := strings.TrimSpace(os.Getenv("EDITOR"))
+	if editor == "" {
+		editor = "vim"
+	}
+	parts := splitArgs(editor)
+	if len(parts) == 0 {
+		parts = []string{"vim"}
+	}
+	cmd := exec.Command(parts[0], append(parts[1:], path)...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func splitArgs(input string) []string {
+	if strings.TrimSpace(input) == "" {
+		return []string{}
+	}
+	return strings.Fields(input)
 }
 
 func runLoadBalancer(m *manager.Manager, args []string) error {
@@ -706,12 +766,7 @@ func listAccounts(m *manager.Manager) error {
 		return nil
 	}
 
-	sharedPath, sharedPresent, _ := m.SharedConfigInfo()
-	sharedStatus := "missing"
-	if sharedPresent {
-		sharedStatus = "ready"
-	}
-	fmt.Printf("shared settings: %s (%s)\n", sharedPath, sharedStatus)
+	fmt.Printf("codex config: %s\n", manager.CodexConfigPath(m.LiveCodexHome))
 	fmt.Printf("%-18s %-10s %-8s %s\n", "ID", "STATUS", "AUTH", "CODEX_HOME")
 	for _, account := range accounts {
 		auth := "missing"
@@ -791,11 +846,12 @@ func printHelp() {
 	fmt.Println("  cube auth deploy <id>")
 	fmt.Println("  cube codex <account-id> [codex args...]")
 	fmt.Println("  cube codex-auto [codex args...]")
-	fmt.Println("  cube run [codex args...]")
+	fmt.Println("  cube run [--server <url>] [--token <token>] [-- codex args...]")
+	fmt.Println("  cube config edit")
+	fmt.Println("  cube config path")
 	fmt.Println("  cube lb [status|pick|reset]")
 	fmt.Println("  cube cloud status")
 	fmt.Println("  cube cloud config --server <url> --token <token>")
-	fmt.Println("  cube cloud-run [--server <url>] [--token <token>] [-- codex args...]")
 	fmt.Println("  cube sync push <id|--all> [--server <url>] [--token <token>]")
 	fmt.Println("  cube sync pull <id> [--server <url>] [--token <token>] [--deploy]")
 	fmt.Println("  cube sync claim [--server <url>] [--token <token>] [--deploy]")

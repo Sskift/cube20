@@ -15,16 +15,20 @@ The first milestone focuses on two local surfaces:
 - Settings file: `~/.cube20/settings.toml`
 - Account homes: `~/.codex-accounts/<account-id>`
 
-Each account home is intended to hold a Codex profile snapshot:
+Each account home is intended to hold a Codex auth snapshot:
 
 - `auth.json`
-- `config.toml`
 
 `settings.toml` defaults to the official Codex home rules: `$CODEX_HOME` when
 set, otherwise `~/.codex`. It also records the managed account directory so the
 dashboard can discover existing managed profiles. Cloud clients can also store
 `cloud_url` and `cloud_token` there so sync commands do not need environment
 variables on every run.
+
+Codex `config.toml` is local-machine state. `cube run` does not download or
+overwrite it; it links each temporary account profile back to the local
+`$CODEX_HOME/config.toml` (or `~/.codex/config.toml`). Use `cube config edit`
+to open that local Codex config file.
 
 Treat every account home like a secret-bearing directory.
 
@@ -41,7 +45,8 @@ cube accounts usage work-plus
 cube profile deploy work-plus
 cube dashboard
 cube cloud config --server https://cube.example.com --token <token>
-cube cloud-run
+cube run
+cube config edit
 cube sync push work-plus
 cube sync pull work-plus --deploy
 cube sync daemon --all --pull --interval 60s
@@ -93,10 +98,14 @@ back down, or claim the next load-balanced account.
 # snapshot locally, run Codex in the current directory, then push refreshed auth
 # back to the cloud when Codex exits.
 cd ~/work/a
-./bin/cube cloud-run
+./bin/cube run
 
 cd ~/work/b
-./bin/cube cloud-run -- --model gpt-5
+./bin/cube run -- --model gpt-5
+
+# Codex config stays local. This opens $CODEX_HOME/config.toml, or
+# ~/.codex/config.toml when CODEX_HOME is not set.
+./bin/cube config edit
 
 # Send one local managed auth snapshot to the cloud.
 ./bin/cube sync push work-plus

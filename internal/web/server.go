@@ -299,10 +299,9 @@ func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	account, err := s.Manager.UpsertJSONProfile(manager.JSONProfile{
-		ID:     snapshot.ID,
-		Label:  snapshot.Label,
-		Auth:   snapshot.Auth,
-		Config: snapshot.Config,
+		ID:    snapshot.ID,
+		Label: snapshot.Label,
+		Auth:  snapshot.Auth,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

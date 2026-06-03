@@ -99,12 +99,7 @@ func (a *App) renderAccounts() error {
 	fmt.Println("===================")
 	fmt.Printf("state: %s\n", a.Manager.StatePath)
 	fmt.Printf("settings: %s\n", a.Manager.SettingsPath)
-	sharedPath, sharedPresent, _ := a.Manager.SharedConfigInfo()
-	sharedStatus := "missing"
-	if sharedPresent {
-		sharedStatus = "ready"
-	}
-	fmt.Printf("shared: %s (%s)\n", sharedPath, sharedStatus)
+	fmt.Printf("config: %s\n", manager.CodexConfigPath(a.Manager.LiveCodexHome))
 	fmt.Printf("live: %s\n", a.Manager.LiveCodexHome)
 	fmt.Printf("homes: %s\n", a.Manager.AccountsDir)
 	fmt.Println()
