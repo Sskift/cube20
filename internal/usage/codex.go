@@ -11,15 +11,25 @@ import (
 )
 
 type Summary struct {
-	Status       string `json:"status"`
-	Detail       string `json:"detail,omitempty"`
-	FilesScanned int    `json:"filesScanned"`
-	Events       int    `json:"events"`
-	Today        Tokens `json:"today"`
-	SevenDays    Tokens `json:"sevenDays"`
-	AllTime      Tokens `json:"allTime"`
-	LatestAt     string `json:"latestAt,omitempty"`
-	LatestModel  string `json:"latestModel,omitempty"`
+	Status       string       `json:"status"`
+	Detail       string       `json:"detail,omitempty"`
+	FilesScanned int          `json:"filesScanned"`
+	Events       int          `json:"events"`
+	Today        Tokens       `json:"today"`
+	SevenDays    Tokens       `json:"sevenDays"`
+	AllTime      Tokens       `json:"allTime"`
+	LatestAt     string       `json:"latestAt,omitempty"`
+	LatestModel  string       `json:"latestModel,omitempty"`
+	Models       []ModelUsage `json:"models,omitempty"`
+	models       map[string]*ModelUsage
+}
+
+type ModelUsage struct {
+	Model     string `json:"model"`
+	Today     Tokens `json:"today"`
+	SevenDays Tokens `json:"sevenDays"`
+	AllTime   Tokens `json:"allTime"`
+	LatestAt  string `json:"latestAt,omitempty"`
 }
 
 type Tokens struct {
@@ -60,6 +70,7 @@ func SummarizeCodexHome(codexHome string, now time.Time) Summary {
 	if result.Events == 0 {
 		result.Detail = "no token_count events"
 	}
+	result.finishModels()
 	return result
 }
 
@@ -189,6 +200,7 @@ func parseTokenEvent(value map[string]any, state *fileState, startToday, startSe
 			result.LatestModel = state.currentModel
 		}
 	}
+	addModelTokens(result, state.currentModel, delta, eventTime, startToday, startSevenDays)
 	result.Events++
 }
 
@@ -205,6 +217,50 @@ func addTokens(target *Tokens, delta cumulativeTokens) {
 	target.CachedInput += delta.cachedInput
 	target.Output += delta.output
 	target.Total += delta.input + delta.output
+}
+
+func addModelTokens(result *Summary, model string, delta cumulativeTokens, eventTime, startToday, startSevenDays time.Time) {
+	model = normalizeModel(model)
+	if model == "" {
+		model = "unknown"
+	}
+	if result.models == nil {
+		result.models = map[string]*ModelUsage{}
+	}
+	bucket := result.models[model]
+	if bucket == nil {
+		bucket = &ModelUsage{Model: model}
+		result.models[model] = bucket
+	}
+	addTokens(&bucket.AllTime, delta)
+	if !eventTime.IsZero() {
+		if eventTime.After(startSevenDays) || eventTime.Equal(startSevenDays) {
+			addTokens(&bucket.SevenDays, delta)
+		}
+		if eventTime.After(startToday) || eventTime.Equal(startToday) {
+			addTokens(&bucket.Today, delta)
+		}
+		if bucket.LatestAt == "" || eventTime.After(parseTime(bucket.LatestAt)) {
+			bucket.LatestAt = eventTime.Format(time.RFC3339)
+		}
+	}
+}
+
+func (s *Summary) finishModels() {
+	if len(s.models) == 0 {
+		return
+	}
+	s.Models = make([]ModelUsage, 0, len(s.models))
+	for _, model := range s.models {
+		s.Models = append(s.Models, *model)
+	}
+	sort.Slice(s.Models, func(i, j int) bool {
+		if s.Models[i].SevenDays.Total != s.Models[j].SevenDays.Total {
+			return s.Models[i].SevenDays.Total > s.Models[j].SevenDays.Total
+		}
+		return s.Models[i].Model < s.Models[j].Model
+	})
+	s.models = nil
 }
 
 func stringAt(value map[string]any, key string) (string, bool) {

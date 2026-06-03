@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"cube20/internal/manager"
+	"cube20/internal/quota"
 	"cube20/internal/tui"
+	"cube20/internal/usage"
 	"cube20/internal/web"
 )
 
@@ -57,6 +59,8 @@ func run(args []string) error {
 		return runLoadBalancer(m, args[1:])
 	case "cloud":
 		return runCloud(m, args[1:])
+	case "clients":
+		return runClients(m, args[1:])
 	case "sync":
 		return runSync(m, args[1:])
 	case "dashboard":
@@ -312,9 +316,75 @@ func runCloud(m *manager.Manager, args []string) error {
 		return printCloudStatus(m)
 	case "config":
 		return configureCloud(m, args[1:])
+	case "quota":
+		return runCloudQuota(m, args[1:])
 	default:
-		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token>]")
+		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token>|quota <account-id>]")
 	}
+}
+
+func runClients(m *manager.Manager, args []string) error {
+	if len(args) == 0 {
+		args = []string{"list"}
+	}
+	switch args[0] {
+	case "list":
+		clients, err := m.ListClients()
+		if err != nil {
+			return err
+		}
+		if len(clients) == 0 {
+			fmt.Println("no clients")
+			return nil
+		}
+		fmt.Printf("%-24s %-22s %-8s %s\n", "ID", "LABEL", "ACTIVE", "LAST_SEEN")
+		for _, client := range clients {
+			lastSeen := "-"
+			if !client.LastSeenAt.IsZero() {
+				lastSeen = client.LastSeenAt.Format(time.RFC3339)
+			}
+			fmt.Printf("%-24s %-22s %-8t %s\n", client.ID, client.Label, client.Active, lastSeen)
+		}
+		return nil
+	case "create":
+		label := ""
+		if len(args) > 1 {
+			label = strings.Join(args[1:], " ")
+		}
+		client, token, err := m.CreateClient(label)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("client: %s\nlabel: %s\ntoken: %s\n", client.ID, client.Label, token)
+		return nil
+	case "revoke":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: cube clients revoke <client-id>")
+		}
+		if err := m.RevokeClient(args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("revoked %s\n", args[1])
+		return nil
+	default:
+		return fmt.Errorf("usage: cube clients [list|create [label]|revoke <client-id>]")
+	}
+}
+
+func runCloudQuota(m *manager.Manager, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: cube cloud quota <account-id>")
+	}
+	opts := defaultCloudSyncOptions(m)
+	if opts.Server == "" {
+		return fmt.Errorf("missing cloud server; run cube cloud config --server <url> --token <token>, or set CUBE_CLOUD_URL")
+	}
+	var result quota.Result
+	if err := cloudJSON(context.Background(), http.MethodGet, opts, "/api/sync/quota/"+url.PathEscape(args[0]), nil, &result); err != nil {
+		return err
+	}
+	printQuotaResult(result)
+	return nil
 }
 
 func printCloudStatus(m *manager.Manager) error {
@@ -529,25 +599,32 @@ func runCloudRun(m *manager.Manager, args []string) error {
 	if err != nil {
 		return err
 	}
-	account, err := claimProfile(context.Background(), m, opts, false)
+	snapshot, err := claimProfileSnapshot(context.Background(), opts)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "cube: cloud selected %s (%s)\n", account.ID, account.CodexHome)
+	codexHome, err := writeSnapshotToTempHome(m, snapshot)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(codexHome)
 
-	cmd, err := m.CodexCommand(account.ID, codexArgs)
-	if err != nil {
-		return err
-	}
+	fmt.Fprintf(os.Stderr, "cube: cloud selected %s; using temporary CODEX_HOME\n", snapshot.ID)
+	cmd := codexCommandForHome(codexHome, codexArgs)
 	runErr := cmd.Run()
-	pushErr := pushSnapshot(context.Background(), m, opts, account.ID)
-	if runErr != nil && pushErr != nil {
-		return fmt.Errorf("codex failed: %w; auth push failed: %v", runErr, pushErr)
+	authErr := pushAuthFromHome(context.Background(), opts, snapshot, codexHome)
+	usageErr := pushUsageFromHome(context.Background(), opts, snapshot.ID, codexHome)
+
+	if runErr != nil {
+		if authErr != nil || usageErr != nil {
+			return fmt.Errorf("codex failed: %w; auth upload: %v; usage upload: %v", runErr, authErr, usageErr)
+		}
+		return runErr
 	}
-	if pushErr != nil {
-		return pushErr
+	if authErr != nil {
+		return authErr
 	}
-	return runErr
+	return usageErr
 }
 
 func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, []string, error) {
@@ -585,6 +662,85 @@ func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, 
 		return opts, nil, fmt.Errorf("missing cloud server; run cube cloud config --server <url> --token <token>, pass --server, or set CUBE_CLOUD_URL")
 	}
 	return opts, codexArgs, nil
+}
+
+func claimProfileSnapshot(ctx context.Context, opts cloudSyncOptions) (manager.ProfileSnapshot, error) {
+	var snapshot manager.ProfileSnapshot
+	if err := cloudJSON(ctx, http.MethodPost, opts, "/api/sync/claim", nil, &snapshot); err != nil {
+		return manager.ProfileSnapshot{}, err
+	}
+	if strings.TrimSpace(snapshot.ID) == "" {
+		return manager.ProfileSnapshot{}, errors.New("cloud claim returned an empty account id")
+	}
+	if len(snapshot.Auth) == 0 || string(snapshot.Auth) == "null" {
+		return manager.ProfileSnapshot{}, fmt.Errorf("cloud claim for %s returned no auth", snapshot.ID)
+	}
+	return snapshot, nil
+}
+
+func writeSnapshotToTempHome(m *manager.Manager, snapshot manager.ProfileSnapshot) (string, error) {
+	codexHome, err := os.MkdirTemp("", "cube20-run-*")
+	if err != nil {
+		return "", err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(codexHome)
+		}
+	}()
+	authPath := filepath.Join(codexHome, "auth.json")
+	if err := os.WriteFile(authPath, snapshot.Auth, 0o600); err != nil {
+		return "", err
+	}
+	localConfig := manager.CodexConfigPath(m.LiveCodexHome)
+	if _, err := os.Stat(localConfig); err == nil {
+		if err := os.Symlink(localConfig, filepath.Join(codexHome, "config.toml")); err != nil {
+			return "", err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	cleanup = false
+	return codexHome, nil
+}
+
+func codexCommandForHome(codexHome string, args []string) *exec.Cmd {
+	cmd := exec.Command("codex", args...)
+	cmd.Env = setEnv(os.Environ(), "CODEX_HOME", codexHome)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
+}
+
+func pushAuthFromHome(ctx context.Context, opts cloudSyncOptions, snapshot manager.ProfileSnapshot, codexHome string) error {
+	authRaw, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		return err
+	}
+	snapshot.Auth = authRaw
+	snapshot.Config = ""
+	snapshot.SourceClient = opts.Client
+	snapshot.UpdatedAt = time.Now()
+
+	var account manager.AccountView
+	if err := cloudJSON(ctx, http.MethodPost, opts, "/api/sync/push", snapshot, &account); err != nil {
+		return err
+	}
+	return nil
+}
+
+func pushUsageFromHome(ctx context.Context, opts cloudSyncOptions, accountID, codexHome string) error {
+	summary := usage.SummarizeCodexHome(codexHome, time.Now())
+	body := struct {
+		AccountID string        `json:"accountId"`
+		Usage     usage.Summary `json:"usage"`
+	}{
+		AccountID: accountID,
+		Usage:     summary,
+	}
+	return cloudJSON(ctx, http.MethodPost, opts, "/api/sync/usage", body, nil)
 }
 
 func pushSnapshot(ctx context.Context, m *manager.Manager, opts cloudSyncOptions, id string) error {
@@ -628,8 +784,8 @@ func claimSnapshot(ctx context.Context, m *manager.Manager, opts cloudSyncOption
 }
 
 func claimProfile(ctx context.Context, m *manager.Manager, opts cloudSyncOptions, deploy bool) (manager.Account, error) {
-	var snapshot manager.ProfileSnapshot
-	if err := cloudJSON(ctx, http.MethodPost, opts, "/api/sync/claim", nil, &snapshot); err != nil {
+	snapshot, err := claimProfileSnapshot(ctx, opts)
+	if err != nil {
 		return manager.Account{}, err
 	}
 	account, err := m.UpsertProfileSnapshot(snapshot)
@@ -783,6 +939,11 @@ func printQuota(m *manager.Manager, id string) error {
 	if err != nil {
 		return err
 	}
+	printQuotaResult(result)
+	return nil
+}
+
+func printQuotaResult(result quota.Result) {
 	fmt.Printf("status: %s\n", result.Status)
 	if result.Plan != "" {
 		fmt.Printf("plan: %s\n", result.Plan)
@@ -800,7 +961,6 @@ func printQuota(m *manager.Manager, id string) error {
 		}
 		fmt.Printf("%s: used=%s remaining=%s%s\n", quota.Label, quota.UsedDisplay, quota.RemainingDisplay, reset)
 	}
-	return nil
 }
 
 func printUsage(m *manager.Manager, id string) error {
@@ -829,11 +989,40 @@ func emptyDash(value string) string {
 	return value
 }
 
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	next := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			next = append(next, prefix+value)
+			replaced = true
+		} else {
+			next = append(next, item)
+		}
+	}
+	if !replaced {
+		next = append(next, prefix+value)
+	}
+	return next
+}
+
 func printHelp() {
-	fmt.Println("cube - local Codex account-pool manager")
+	fmt.Println("cube - Codex account-pool manager")
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  cube")
+	fmt.Println("  cube run [--server <url>] [--token <token>] [-- codex args...]")
+	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...>")
+	fmt.Println("  cube cloud quota <account-id>")
+	fmt.Println("  cube config edit")
+	fmt.Println("  cube config path")
+	fmt.Println("  cube clients list")
+	fmt.Println("  cube clients create [label]")
+	fmt.Println("  cube clients revoke <client-id>")
+	fmt.Println("  cube dashboard [--host 127.0.0.1] [--port 8720] [--cloud-token <admin-token>]")
+	fmt.Println()
+	fmt.Println("Legacy/local admin tools:")
 	fmt.Println("  cube accounts list")
 	fmt.Println("  cube accounts add <id> [label]")
 	fmt.Println("  cube accounts import [id] [label]")
@@ -846,15 +1035,10 @@ func printHelp() {
 	fmt.Println("  cube auth deploy <id>")
 	fmt.Println("  cube codex <account-id> [codex args...]")
 	fmt.Println("  cube codex-auto [codex args...]")
-	fmt.Println("  cube run [--server <url>] [--token <token>] [-- codex args...]")
-	fmt.Println("  cube config edit")
-	fmt.Println("  cube config path")
 	fmt.Println("  cube lb [status|pick|reset]")
 	fmt.Println("  cube cloud status")
-	fmt.Println("  cube cloud config --server <url> --token <token>")
 	fmt.Println("  cube sync push <id|--all> [--server <url>] [--token <token>]")
 	fmt.Println("  cube sync pull <id> [--server <url>] [--token <token>] [--deploy]")
 	fmt.Println("  cube sync claim [--server <url>] [--token <token>] [--deploy]")
 	fmt.Println("  cube sync daemon <id|--all> [--server <url>] [--token <token>] [--pull] [--interval 60s]")
-	fmt.Println("  cube dashboard [--host 127.0.0.1] [--port 8720] [--cloud-token <token>]")
 }

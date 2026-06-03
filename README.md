@@ -1,54 +1,60 @@
 # cube20
 
-`cube20` is a local Codex profile-pool manager. Its binary command is `cube`.
+`cube20` is a Codex account-pool manager. Its binary command is `cube`.
 
-The first milestone focuses on two local surfaces:
+The cloud deployment model is:
 
-- A terminal TUI for account inventory and account-scoped Codex commands.
-- A localhost dashboard for browser-based monitoring and control.
+- One cloud `cube dashboard` server owns the account pool, auth snapshots,
+  quota refreshes, usage stats, and the hosted dashboard.
+- Local machines store only the cloud URL/PAT and their own Codex
+  `config.toml`.
+- `cube run` asks the cloud server which credential to use, runs Codex with a
+  temporary `CODEX_HOME`, uploads refreshed auth and usage, then deletes the
+  temporary local auth copy.
 
 ## Storage
 
-`cube` keeps dashboard metadata outside the repository:
+Local `cube` keeps only client/runtime metadata outside the repository:
 
 - State file: `~/.cube20/state.json`
 - Settings file: `~/.cube20/settings.toml`
-- Account homes: `~/.codex-accounts/<account-id>`
+- Optional legacy account homes: `~/.codex-accounts/<account-id>`
 
-Each account home is intended to hold a Codex auth snapshot:
+Cloud servers should set `CUBE_DATABASE_URL` or `database_url` in
+`settings.toml`. When configured, account auth, client PATs, usage stats, quota
+cache, and load-balancer cursor are persisted in Postgres.
 
-- `auth.json`
+The managed Postgres tables are created automatically:
+
+- `cube_accounts`
+- `cube_clients`
+- `cube_usage`
+- `cube_quota_cache`
+- `cube_meta`
 
 `settings.toml` defaults to the official Codex home rules: `$CODEX_HOME` when
-set, otherwise `~/.codex`. It also records the managed account directory so the
-dashboard can discover existing managed profiles. Cloud clients can also store
-`cloud_url` and `cloud_token` there so sync commands do not need environment
-variables on every run.
+set, otherwise `~/.codex`. Cloud clients can store `cloud_url` and
+`cloud_token` there so `cube run` and `cube cloud quota` do not need
+environment variables on every run.
 
 Codex `config.toml` is local-machine state. `cube run` does not download or
-overwrite it; it links each temporary account profile back to the local
-`$CODEX_HOME/config.toml` (or `~/.codex/config.toml`). Use `cube config edit`
-to open that local Codex config file.
-
-Treat every account home like a secret-bearing directory.
+overwrite it; it links the temporary Codex home back to the local
+`$CODEX_HOME/config.toml` or `~/.codex/config.toml`. Use `cube config edit` to
+open that local Codex config file.
 
 ## Commands
 
 ```shell
 cube
-cube accounts list
-cube accounts add work-plus
-cube accounts import
-cube accounts login work-plus
-cube accounts quota work-plus
-cube accounts usage work-plus
-cube profile deploy work-plus
 cube dashboard
-cube cloud config --server https://cube.example.com --token <token>
+cube clients create macbook-a
+cube clients list
+cube clients revoke client-macbook-a
+cube cloud config --server https://cube.example.com --token <cube_pat_...>
+cube cloud quota work-plus
 cube run
 cube config edit
 cube sync push work-plus
-cube sync pull work-plus --deploy
 cube sync daemon --all --pull --interval 60s
 ```
 
@@ -66,11 +72,13 @@ go build -o bin/cube ./cmd/cube
 
 The dashboard listens on `http://127.0.0.1:8720` by default.
 
-For a central dashboard, bind it to the network and require a shared bearer
+For a central dashboard, bind it to the network and require an admin bearer
 token:
 
 ```shell
-CUBE_CLOUD_TOKEN="$(openssl rand -hex 32)" ./bin/cube dashboard --host 0.0.0.0 --port 8720
+export CUBE_DATABASE_URL=postgres://cube:secret@db.example.com:5432/cube?sslmode=require
+export CUBE_CLOUD_TOKEN="$(openssl rand -hex 32)"
+./bin/cube dashboard --host 0.0.0.0 --port 8720
 ```
 
 You can also persist the token in `~/.cube20/settings.toml` on the server:
@@ -84,29 +92,57 @@ Open the hosted dashboard with `?token=<token>` once; the browser stores that
 token locally and sends it on future API requests. Put the service behind HTTPS
 before sending real `auth.json` data over the network.
 
-## Cloud Sync
+## Cloud Clients
 
-Cloud sync turns one `cube dashboard` process into the central account pool.
-Local machines can push refreshed auth snapshots to it, pull a named account
-back down, or claim the next load-balanced account.
+Each local machine should authenticate with its own PAT. Create PATs on the
+cloud server:
+
+```shell
+./bin/cube clients create macbook-a
+./bin/cube clients create workstation-b
+./bin/cube clients list
+./bin/cube clients revoke client-macbook-a
+```
+
+Give each local operator only their generated `cube_pat_...` token. The PAT can
+claim credentials, upload refreshed auth, upload usage, and request remote
+quota refreshes. It is not the dashboard admin token.
+
+## Cloud Run
 
 ```shell
 # Save this once on each local machine.
-./bin/cube cloud config --server https://cube.example.com --token <same token as the dashboard>
+./bin/cube cloud config --server https://cube.example.com --token <cube_pat_...>
 
-# Ask the cloud load balancer for the next ready account, write that auth
-# snapshot locally, run Codex in the current directory, then push refreshed auth
-# back to the cloud when Codex exits.
+# Ask the cloud load balancer for the next ready account, run Codex with a
+# temporary auth snapshot, then upload refreshed auth and token usage.
 cd ~/work/a
 ./bin/cube run
 
 cd ~/work/b
 ./bin/cube run -- --model gpt-5
 
+# Ask the server to refresh and return quota. This does not read local auth.
+./bin/cube cloud quota work-plus
+
 # Codex config stays local. This opens $CODEX_HOME/config.toml, or
 # ~/.codex/config.toml when CODEX_HOME is not set.
 ./bin/cube config edit
+```
 
+Environment variables still work and override the saved settings:
+
+```shell
+export CUBE_CLOUD_URL=https://cube.example.com
+export CUBE_CLOUD_TOKEN=<cube_pat_...>
+```
+
+## Cloud Sync Admin Tools
+
+These commands are migration/debug tools for moving existing local auth
+snapshots into the cloud pool. Normal local usage should prefer `cube run`.
+
+```shell
 # Send one local managed auth snapshot to the cloud.
 ./bin/cube sync push work-plus
 
@@ -118,32 +154,33 @@ cd ~/work/b
 ./bin/cube sync pull work-plus --deploy
 ```
 
-Environment variables still work and override the saved settings:
-
-```shell
-export CUBE_CLOUD_URL=https://cube.example.com
-export CUBE_CLOUD_TOKEN=<token>
-```
-
 The cloud endpoints are:
 
 - `POST /api/sync/push`
 - `GET /api/sync/pull/<id>`
 - `POST /api/sync/claim`
+- `POST /api/sync/usage`
+- `GET /api/sync/quota/<id>`
+- `GET /api/stats`
+- `GET /api/refresh-queue`
+- `GET|POST /api/clients`
 
-All `/api/*` routes require `Authorization: Bearer <token>` when
-`CUBE_CLOUD_TOKEN` or `--cloud-token` is configured.
+Admin routes require `Authorization: Bearer <admin-token>` when
+`CUBE_CLOUD_TOKEN` or `--cloud-token` is configured. Sync routes accept either
+the admin token or a client PAT.
 
 ## Quota
 
-`cube accounts quota <id>` reads the account profile's `auth.json`. For ChatGPT
-OAuth logins it calls the hard-coded ChatGPT usage endpoint and normalizes the
-5h, 7d, and code-review windows. API-key-only Codex profiles are reported as
-unsupported because ChatGPT subscription quota is not available from an API key.
+On a local client, use `cube cloud quota <id>`. It asks the cloud server to
+refresh quota using the server-owned auth snapshot and returns the result. For
+ChatGPT OAuth logins the server calls the ChatGPT usage endpoint and normalizes
+the 5h, 7d, and code-review windows. API-key-only Codex profiles are reported
+as unsupported because ChatGPT subscription quota is not available from an API
+key.
 
-## Local Usage
+## Usage Stats
 
-`cube accounts usage <id>` scans the profile's local Codex session JSONL files
-under `sessions/` and `archived_sessions/`. It reports today, seven-day, and
-all-time token totals. This is an observation aid only; account selection should
-still prioritize subscription quota from `cube accounts quota`.
+`cube run` summarizes the temporary Codex session JSONL files after Codex exits
+and uploads today, seven-day, all-time, and per-model token totals to the cloud.
+The dashboard shows the cleaned account view, connected clients, per-account
+usage, and the 5h quota refresh queue.

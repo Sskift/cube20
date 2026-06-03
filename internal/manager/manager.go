@@ -2,7 +2,10 @@ package manager
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -19,6 +22,7 @@ import (
 	"cube20/internal/quota"
 	"cube20/internal/usage"
 
+	_ "github.com/lib/pq"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -65,8 +69,62 @@ type AccountView struct {
 }
 
 type State struct {
-	Version  int       `json:"version"`
-	Accounts []Account `json:"accounts"`
+	Version    int                     `json:"version"`
+	Accounts   []Account               `json:"accounts"`
+	Clients    []Client                `json:"clients,omitempty"`
+	Usage      map[string]AccountUsage `json:"usage,omitempty"`
+	QuotaCache map[string]QuotaCache   `json:"quotaCache,omitempty"`
+}
+
+type Client struct {
+	ID         string     `json:"id"`
+	Label      string     `json:"label"`
+	TokenHash  string     `json:"tokenHash,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	LastSeenAt time.Time  `json:"lastSeenAt,omitempty"`
+	RevokedAt  *time.Time `json:"revokedAt,omitempty"`
+}
+
+type ClientView struct {
+	ID         string     `json:"id"`
+	Label      string     `json:"label"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	LastSeenAt time.Time  `json:"lastSeenAt,omitempty"`
+	RevokedAt  *time.Time `json:"revokedAt,omitempty"`
+	Active     bool       `json:"active"`
+}
+
+type AccountUsage struct {
+	AccountID   string             `json:"accountId"`
+	ClientID    string             `json:"clientId,omitempty"`
+	UpdatedAt   time.Time          `json:"updatedAt"`
+	LatestAt    string             `json:"latestAt,omitempty"`
+	LatestModel string             `json:"latestModel,omitempty"`
+	Today       usage.Tokens       `json:"today"`
+	SevenDays   usage.Tokens       `json:"sevenDays"`
+	AllTime     usage.Tokens       `json:"allTime"`
+	Models      []usage.ModelUsage `json:"models,omitempty"`
+}
+
+type QuotaCache struct {
+	AccountID string        `json:"accountId"`
+	UpdatedAt time.Time     `json:"updatedAt"`
+	Result    quota.Result  `json:"result"`
+	FiveHour  *quota.Window `json:"fiveHour,omitempty"`
+}
+
+type RefreshQueueItem struct {
+	AccountID          string        `json:"accountId"`
+	Label              string        `json:"label"`
+	Status             AccountStatus `json:"status"`
+	AuthPresent        bool          `json:"authPresent"`
+	UpdatedAt          time.Time     `json:"updatedAt,omitempty"`
+	ResetsAt           string        `json:"resetsAt,omitempty"`
+	RemainingDisplay   string        `json:"remainingDisplay,omitempty"`
+	RemainingPercent   float64       `json:"remainingPercent,omitempty"`
+	UsedPercent        float64       `json:"usedPercent,omitempty"`
+	QuotaStatus        quota.Status  `json:"quotaStatus,omitempty"`
+	RefreshOrderReason string        `json:"refreshOrderReason,omitempty"`
 }
 
 type roundRobinState struct {
@@ -99,6 +157,7 @@ type Settings struct {
 	SharedConfigPath string `json:"sharedConfigPath" toml:"shared_settings_path"`
 	CloudURL         string `json:"cloudUrl" toml:"cloud_url"`
 	CloudToken       string `json:"cloudToken" toml:"cloud_token"`
+	DatabaseURL      string `json:"databaseUrl" toml:"database_url"`
 }
 
 type JSONProfile struct {
@@ -128,6 +187,7 @@ type Manager struct {
 	SharedConfigPath string
 	CloudURL         string
 	CloudToken       string
+	DatabaseURL      string
 }
 
 func New() (*Manager, error) {
@@ -155,6 +215,7 @@ func New() (*Manager, error) {
 		SharedConfigPath: settings.SharedConfigPath,
 		CloudURL:         settings.CloudURL,
 		CloudToken:       settings.CloudToken,
+		DatabaseURL:      settings.DatabaseURL,
 	}, nil
 }
 
@@ -171,6 +232,9 @@ func (m *Manager) Ensure() error {
 		}
 		_ = m.syncSharedConfigFromCodexHome(m.LiveCodexHome, false)
 	}
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		return m.ensurePostgres()
+	}
 	return nil
 }
 
@@ -178,10 +242,13 @@ func (m *Manager) Load() (State, error) {
 	if err := m.Ensure(); err != nil {
 		return State{}, err
 	}
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		return m.loadPostgresState()
+	}
 
 	data, err := os.ReadFile(m.StatePath)
 	if errors.Is(err, os.ErrNotExist) {
-		return State{Version: 1, Accounts: []Account{}}, nil
+		return normalizeState(State{Version: 1, Accounts: []Account{}}), nil
 	}
 	if err != nil {
 		return State{}, err
@@ -191,15 +258,34 @@ func (m *Manager) Load() (State, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return State{}, err
 	}
+	return normalizeState(state), nil
+}
+
+func normalizeState(state State) State {
 	if state.Version == 0 {
 		state.Version = 1
 	}
-	return state, nil
+	if state.Accounts == nil {
+		state.Accounts = []Account{}
+	}
+	if state.Clients == nil {
+		state.Clients = []Client{}
+	}
+	if state.Usage == nil {
+		state.Usage = map[string]AccountUsage{}
+	}
+	if state.QuotaCache == nil {
+		state.QuotaCache = map[string]QuotaCache{}
+	}
+	return state
 }
 
 func (m *Manager) Save(state State) error {
 	if err := m.Ensure(); err != nil {
 		return err
+	}
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		return m.savePostgresState(state)
 	}
 	state.Version = 1
 	data, err := json.MarshalIndent(state, "", "  ")
@@ -211,6 +297,594 @@ func (m *Manager) Save(state State) error {
 		return err
 	}
 	return os.Rename(tmpPath, m.StatePath)
+}
+
+func (m *Manager) postgresDB(ctx context.Context) (*sql.DB, error) {
+	databaseURL := strings.TrimSpace(m.DatabaseURL)
+	if databaseURL == "" {
+		return nil, errors.New("database_url is not configured")
+	}
+	db, err := sql.Open("postgres", databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func (m *Manager) ensurePostgres() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS cube_accounts (
+			id text PRIMARY KEY,
+			label text NOT NULL DEFAULT '',
+			plan text NOT NULL DEFAULT '',
+			status text NOT NULL DEFAULT 'ready',
+			codex_home text NOT NULL DEFAULT '',
+			auth_json jsonb,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			last_error text NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS cube_clients (
+			id text PRIMARY KEY,
+			label text NOT NULL DEFAULT '',
+			token_hash text NOT NULL,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			last_seen_at timestamptz,
+			revoked_at timestamptz
+		)`,
+		`CREATE TABLE IF NOT EXISTS cube_usage (
+			account_id text PRIMARY KEY,
+			client_id text NOT NULL DEFAULT '',
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			latest_at text NOT NULL DEFAULT '',
+			latest_model text NOT NULL DEFAULT '',
+			today jsonb NOT NULL DEFAULT '{}'::jsonb,
+			seven_days jsonb NOT NULL DEFAULT '{}'::jsonb,
+			all_time jsonb NOT NULL DEFAULT '{}'::jsonb,
+			models jsonb NOT NULL DEFAULT '[]'::jsonb
+		)`,
+		`CREATE TABLE IF NOT EXISTS cube_quota_cache (
+			account_id text PRIMARY KEY,
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			result jsonb NOT NULL DEFAULT '{}'::jsonb,
+			five_hour jsonb
+		)`,
+		`CREATE TABLE IF NOT EXISTS cube_meta (
+			key text PRIMARY KEY,
+			value text NOT NULL DEFAULT '',
+			updated_at timestamptz NOT NULL DEFAULT now()
+		)`,
+	}
+	for _, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) loadPostgresState() (State, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	defer db.Close()
+
+	state := normalizeState(State{Version: 1})
+	accountRows, err := db.QueryContext(ctx, `SELECT id, label, plan, status, codex_home, created_at, updated_at, last_error, auth_json::text FROM cube_accounts ORDER BY id`)
+	if err != nil {
+		return State{}, err
+	}
+	defer accountRows.Close()
+	for accountRows.Next() {
+		var account Account
+		var statusText string
+		var authText sql.NullString
+		if err := accountRows.Scan(
+			&account.ID,
+			&account.Label,
+			&account.Plan,
+			&statusText,
+			&account.CodexHome,
+			&account.CreatedAt,
+			&account.UpdatedAt,
+			&account.LastError,
+			&authText,
+		); err != nil {
+			return State{}, err
+		}
+		account.Status = AccountStatus(statusText)
+		if account.Status == "" {
+			account.Status = StatusReady
+		}
+		if strings.TrimSpace(account.CodexHome) == "" {
+			account.CodexHome = filepath.Join(m.AccountsDir, account.ID)
+		}
+		if authText.Valid && strings.TrimSpace(authText.String) != "" {
+			if err := m.materializeAuth(account, []byte(authText.String)); err != nil {
+				return State{}, err
+			}
+		}
+		state.Accounts = append(state.Accounts, account)
+	}
+	if err := accountRows.Err(); err != nil {
+		return State{}, err
+	}
+
+	clientRows, err := db.QueryContext(ctx, `SELECT id, label, token_hash, created_at, last_seen_at, revoked_at FROM cube_clients ORDER BY id`)
+	if err != nil {
+		return State{}, err
+	}
+	defer clientRows.Close()
+	for clientRows.Next() {
+		var client Client
+		var lastSeen sql.NullTime
+		var revoked sql.NullTime
+		if err := clientRows.Scan(&client.ID, &client.Label, &client.TokenHash, &client.CreatedAt, &lastSeen, &revoked); err != nil {
+			return State{}, err
+		}
+		if lastSeen.Valid {
+			client.LastSeenAt = lastSeen.Time
+		}
+		if revoked.Valid {
+			client.RevokedAt = &revoked.Time
+		}
+		state.Clients = append(state.Clients, client)
+	}
+	if err := clientRows.Err(); err != nil {
+		return State{}, err
+	}
+
+	usageRows, err := db.QueryContext(ctx, `SELECT account_id, client_id, updated_at, latest_at, latest_model, today::text, seven_days::text, all_time::text, models::text FROM cube_usage`)
+	if err != nil {
+		return State{}, err
+	}
+	defer usageRows.Close()
+	for usageRows.Next() {
+		var stat AccountUsage
+		var todayText, sevenText, allText, modelsText string
+		if err := usageRows.Scan(&stat.AccountID, &stat.ClientID, &stat.UpdatedAt, &stat.LatestAt, &stat.LatestModel, &todayText, &sevenText, &allText, &modelsText); err != nil {
+			return State{}, err
+		}
+		_ = json.Unmarshal([]byte(todayText), &stat.Today)
+		_ = json.Unmarshal([]byte(sevenText), &stat.SevenDays)
+		_ = json.Unmarshal([]byte(allText), &stat.AllTime)
+		_ = json.Unmarshal([]byte(modelsText), &stat.Models)
+		state.Usage[stat.AccountID] = stat
+	}
+	if err := usageRows.Err(); err != nil {
+		return State{}, err
+	}
+
+	quotaRows, err := db.QueryContext(ctx, `SELECT account_id, updated_at, result::text, five_hour::text FROM cube_quota_cache`)
+	if err != nil {
+		return State{}, err
+	}
+	defer quotaRows.Close()
+	for quotaRows.Next() {
+		var cache QuotaCache
+		var resultText string
+		var fiveText sql.NullString
+		if err := quotaRows.Scan(&cache.AccountID, &cache.UpdatedAt, &resultText, &fiveText); err != nil {
+			return State{}, err
+		}
+		_ = json.Unmarshal([]byte(resultText), &cache.Result)
+		if fiveText.Valid && strings.TrimSpace(fiveText.String) != "" {
+			var window quota.Window
+			if err := json.Unmarshal([]byte(fiveText.String), &window); err == nil {
+				cache.FiveHour = &window
+			}
+		}
+		state.QuotaCache[cache.AccountID] = cache
+	}
+	if err := quotaRows.Err(); err != nil {
+		return State{}, err
+	}
+	return normalizeState(state), nil
+}
+
+func (m *Manager) savePostgresState(state State) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, table := range []string{"cube_accounts", "cube_clients", "cube_usage", "cube_quota_cache"} {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			return err
+		}
+	}
+
+	state = normalizeState(state)
+	now := time.Now()
+	for _, account := range state.Accounts {
+		if account.CreatedAt.IsZero() {
+			account.CreatedAt = now
+		}
+		if account.UpdatedAt.IsZero() {
+			account.UpdatedAt = now
+		}
+		if account.Status == "" {
+			account.Status = StatusReady
+		}
+		if strings.TrimSpace(account.CodexHome) == "" {
+			account.CodexHome = filepath.Join(m.AccountsDir, account.ID)
+		}
+		authJSON, err := m.readAccountAuthJSON(account)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_accounts
+			(id, label, plan, status, codex_home, auth_json, created_at, updated_at, last_error)
+			VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)`,
+			account.ID,
+			account.Label,
+			account.Plan,
+			string(account.Status),
+			account.CodexHome,
+			authJSON,
+			account.CreatedAt,
+			account.UpdatedAt,
+			account.LastError,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, client := range state.Clients {
+		if client.CreatedAt.IsZero() {
+			client.CreatedAt = now
+		}
+		var lastSeen any
+		if !client.LastSeenAt.IsZero() {
+			lastSeen = client.LastSeenAt
+		}
+		var revoked any
+		if client.RevokedAt != nil {
+			revoked = *client.RevokedAt
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_clients
+			(id, label, token_hash, created_at, last_seen_at, revoked_at)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			client.ID,
+			client.Label,
+			client.TokenHash,
+			client.CreatedAt,
+			lastSeen,
+			revoked,
+		); err != nil {
+			return err
+		}
+	}
+
+	for accountID, stat := range state.Usage {
+		if stat.AccountID == "" {
+			stat.AccountID = accountID
+		}
+		if stat.UpdatedAt.IsZero() {
+			stat.UpdatedAt = now
+		}
+		today, err := jsonText(stat.Today)
+		if err != nil {
+			return err
+		}
+		sevenDays, err := jsonText(stat.SevenDays)
+		if err != nil {
+			return err
+		}
+		allTime, err := jsonText(stat.AllTime)
+		if err != nil {
+			return err
+		}
+		models, err := jsonText(stat.Models)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_usage
+			(account_id, client_id, updated_at, latest_at, latest_model, today, seven_days, all_time, models)
+			VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb)`,
+			stat.AccountID,
+			stat.ClientID,
+			stat.UpdatedAt,
+			stat.LatestAt,
+			stat.LatestModel,
+			today,
+			sevenDays,
+			allTime,
+			models,
+		); err != nil {
+			return err
+		}
+	}
+
+	for accountID, cache := range state.QuotaCache {
+		if cache.AccountID == "" {
+			cache.AccountID = accountID
+		}
+		if cache.UpdatedAt.IsZero() {
+			cache.UpdatedAt = now
+		}
+		result, err := jsonText(cache.Result)
+		if err != nil {
+			return err
+		}
+		var fiveHour sql.NullString
+		if cache.FiveHour != nil {
+			fiveHour, err = jsonText(*cache.FiveHour)
+			if err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_quota_cache
+			(account_id, updated_at, result, five_hour)
+			VALUES ($1, $2, $3::jsonb, $4::jsonb)`,
+			cache.AccountID,
+			cache.UpdatedAt,
+			result,
+			fiveHour,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (m *Manager) materializeAuth(account Account, raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	if !json.Valid(raw) {
+		return fmt.Errorf("stored auth for %s is not valid JSON", account.ID)
+	}
+	if err := os.MkdirAll(account.CodexHome, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(account.CodexHome, authFileName), prettyJSON(raw), fileModeFor(authFileName))
+}
+
+func (m *Manager) readAccountAuthJSON(account Account) (sql.NullString, error) {
+	raw, err := os.ReadFile(filepath.Join(account.CodexHome, authFileName))
+	if errors.Is(err, os.ErrNotExist) {
+		return sql.NullString{}, nil
+	}
+	if err != nil {
+		return sql.NullString{}, err
+	}
+	if !json.Valid(raw) {
+		return sql.NullString{}, fmt.Errorf("%s is not valid JSON", filepath.Join(account.CodexHome, authFileName))
+	}
+	return sql.NullString{String: string(prettyJSON(raw)), Valid: true}, nil
+}
+
+func jsonText(value any) (sql.NullString, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return sql.NullString{}, err
+	}
+	return sql.NullString{String: string(data), Valid: true}, nil
+}
+
+func (m *Manager) CreateClient(label string) (ClientView, string, error) {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		label = "client"
+	}
+	state, err := m.Load()
+	if err != nil {
+		return ClientView{}, "", err
+	}
+	used := map[string]bool{}
+	for _, client := range state.Clients {
+		used[client.ID] = true
+	}
+	id := uniqueFromUsed(label, used)
+	if !strings.HasPrefix(id, "client-") {
+		id = uniqueFromUsed("client-"+id, used)
+	}
+	token, err := generatePAT()
+	if err != nil {
+		return ClientView{}, "", err
+	}
+	now := time.Now()
+	client := Client{
+		ID:        id,
+		Label:     label,
+		TokenHash: hashToken(token),
+		CreatedAt: now,
+	}
+	state.Clients = append(state.Clients, client)
+	if err := m.Save(state); err != nil {
+		return ClientView{}, "", err
+	}
+	return clientView(client), token, nil
+}
+
+func (m *Manager) ListClients() ([]ClientView, error) {
+	state, err := m.Load()
+	if err != nil {
+		return nil, err
+	}
+	views := make([]ClientView, 0, len(state.Clients))
+	for _, client := range state.Clients {
+		views = append(views, clientView(client))
+	}
+	sort.Slice(views, func(i, j int) bool {
+		if views[i].Active != views[j].Active {
+			return views[i].Active
+		}
+		return views[i].ID < views[j].ID
+	})
+	return views, nil
+}
+
+func (m *Manager) RevokeClient(id string) error {
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := range state.Clients {
+		if state.Clients[i].ID == id {
+			state.Clients[i].RevokedAt = &now
+			return m.Save(state)
+		}
+	}
+	return fmt.Errorf("client %q not found", id)
+}
+
+func (m *Manager) AuthenticateClientToken(token string) (ClientView, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ClientView{}, false
+	}
+	hash := hashToken(token)
+	state, err := m.Load()
+	if err != nil {
+		return ClientView{}, false
+	}
+	for _, client := range state.Clients {
+		if client.RevokedAt != nil || client.TokenHash == "" {
+			continue
+		}
+		if subtleStringEqual(client.TokenHash, hash) {
+			return clientView(client), true
+		}
+	}
+	return ClientView{}, false
+}
+
+func (m *Manager) TouchClient(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := range state.Clients {
+		if state.Clients[i].ID == id {
+			state.Clients[i].LastSeenAt = now
+			return m.Save(state)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) RecordUsage(accountID, clientID string, summary usage.Summary) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return errors.New("usage account id is required")
+	}
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	if state.Usage == nil {
+		state.Usage = map[string]AccountUsage{}
+	}
+	state.Usage[accountID] = AccountUsage{
+		AccountID:   accountID,
+		ClientID:    strings.TrimSpace(clientID),
+		UpdatedAt:   time.Now(),
+		LatestAt:    summary.LatestAt,
+		LatestModel: summary.LatestModel,
+		Today:       summary.Today,
+		SevenDays:   summary.SevenDays,
+		AllTime:     summary.AllTime,
+		Models:      summary.Models,
+	}
+	return m.Save(state)
+}
+
+func (m *Manager) UsageStats() (map[string]AccountUsage, error) {
+	state, err := m.Load()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]AccountUsage{}
+	for id, stat := range state.Usage {
+		out[id] = stat
+	}
+	return out, nil
+}
+
+func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
+	accounts, err := m.ListAccounts()
+	if err != nil {
+		return nil, err
+	}
+	state, err := m.Load()
+	if err != nil {
+		return nil, err
+	}
+	items := make([]RefreshQueueItem, 0, len(accounts))
+	for _, account := range accounts {
+		cache := state.QuotaCache[account.ID]
+		item := RefreshQueueItem{
+			AccountID:   account.ID,
+			Label:       account.Label,
+			Status:      account.Status,
+			AuthPresent: account.AuthPresent,
+			UpdatedAt:   cache.UpdatedAt,
+			QuotaStatus: cache.Result.Status,
+		}
+		if cache.FiveHour != nil {
+			item.ResetsAt = cache.FiveHour.ResetsAt
+			item.RemainingDisplay = cache.FiveHour.RemainingDisplay
+			item.RemainingPercent = cache.FiveHour.RemainingPercent
+			item.UsedPercent = cache.FiveHour.UsedPercent
+		}
+		switch {
+		case !account.AuthPresent:
+			item.RefreshOrderReason = "auth missing"
+		case cache.FiveHour == nil:
+			item.RefreshOrderReason = "quota not checked"
+		case cache.FiveHour.ResetsAt == "":
+			item.RefreshOrderReason = "reset unknown"
+		default:
+			item.RefreshOrderReason = "5h reset order"
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		ti := parseRFC3339(items[i].ResetsAt)
+		tj := parseRFC3339(items[j].ResetsAt)
+		if !ti.IsZero() && !tj.IsZero() {
+			return ti.Before(tj)
+		}
+		if !ti.IsZero() {
+			return true
+		}
+		if !tj.IsZero() {
+			return false
+		}
+		return items[i].AccountID < items[j].AccountID
+	})
+	return items, nil
 }
 
 func (m *Manager) UpdateSettings(liveCodexHome, accountsDir, sharedConfigPath string) (Settings, error) {
@@ -225,6 +899,7 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir, sharedConfigPath st
 		SharedConfigPath: m.SharedConfigPath,
 		CloudURL:         m.CloudURL,
 		CloudToken:       m.CloudToken,
+		DatabaseURL:      m.DatabaseURL,
 	}
 	if strings.TrimSpace(liveCodexHome) != "" {
 		settings.LiveCodexHome = expandPath(liveCodexHome, home)
@@ -247,6 +922,7 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir, sharedConfigPath st
 	m.SharedConfigPath = settings.SharedConfigPath
 	m.CloudURL = settings.CloudURL
 	m.CloudToken = settings.CloudToken
+	m.DatabaseURL = settings.DatabaseURL
 	if err := m.Ensure(); err != nil {
 		return Settings{}, err
 	}
@@ -260,6 +936,7 @@ func (m *Manager) UpdateCloudSettings(cloudURL, cloudToken string) (Settings, er
 		SharedConfigPath: m.SharedConfigPath,
 		CloudURL:         m.CloudURL,
 		CloudToken:       m.CloudToken,
+		DatabaseURL:      m.DatabaseURL,
 	}
 	if strings.TrimSpace(cloudURL) != "" {
 		settings.CloudURL = strings.TrimSpace(cloudURL)
@@ -290,6 +967,7 @@ func (m *Manager) ReadSettingsText() (string, error) {
 			SharedConfigPath: m.SharedConfigPath,
 			CloudURL:         m.CloudURL,
 			CloudToken:       m.CloudToken,
+			DatabaseURL:      m.DatabaseURL,
 		}
 		if err := writeSettings(m.SettingsPath, settings); err != nil {
 			return "", err
@@ -314,6 +992,7 @@ func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
 		SharedConfigPath: m.SharedConfigPath,
 		CloudURL:         m.CloudURL,
 		CloudToken:       m.CloudToken,
+		DatabaseURL:      m.DatabaseURL,
 	}, home)
 	if err != nil {
 		return Settings{}, err
@@ -330,6 +1009,7 @@ func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
 	m.SharedConfigPath = settings.SharedConfigPath
 	m.CloudURL = settings.CloudURL
 	m.CloudToken = settings.CloudToken
+	m.DatabaseURL = settings.DatabaseURL
 	if err := m.Ensure(); err != nil {
 		return Settings{}, err
 	}
@@ -793,6 +1473,48 @@ func duplicateAccount(state State, id, identity string) (Account, bool) {
 	return Account{}, false
 }
 
+func clientView(client Client) ClientView {
+	return ClientView{
+		ID:         client.ID,
+		Label:      client.Label,
+		CreatedAt:  client.CreatedAt,
+		LastSeenAt: client.LastSeenAt,
+		RevokedAt:  client.RevokedAt,
+		Active:     client.RevokedAt == nil,
+	}
+}
+
+func generatePAT() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return "cube_pat_" + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return fmt.Sprintf("%x", sum)
+}
+
+func subtleStringEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func parseRFC3339(value string) time.Time {
+	if strings.TrimSpace(value) == "" {
+		return time.Time{}
+	}
+	out, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return out
+}
+
 func authIdentity(auth map[string]any) string {
 	if tokens, ok := auth["tokens"].(map[string]any); ok {
 		if accountID, ok := tokens["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
@@ -1227,6 +1949,17 @@ func (m *Manager) ResetRoundRobin() error {
 	if err := m.Ensure(); err != nil {
 		return err
 	}
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		db, err := m.postgresDB(ctx)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		_, err = db.ExecContext(ctx, `DELETE FROM cube_meta WHERE key = 'round_robin_last_account_id'`)
+		return err
+	}
 	err := os.Remove(filepath.Join(m.StateDir, roundRobinFileName))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -1237,6 +1970,24 @@ func (m *Manager) ResetRoundRobin() error {
 func (m *Manager) loadRoundRobinState() (roundRobinState, error) {
 	if err := m.Ensure(); err != nil {
 		return roundRobinState{}, err
+	}
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		db, err := m.postgresDB(ctx)
+		if err != nil {
+			return roundRobinState{}, err
+		}
+		defer db.Close()
+		var value string
+		err = db.QueryRowContext(ctx, `SELECT value FROM cube_meta WHERE key = 'round_robin_last_account_id'`).Scan(&value)
+		if errors.Is(err, sql.ErrNoRows) {
+			return roundRobinState{}, nil
+		}
+		if err != nil {
+			return roundRobinState{}, err
+		}
+		return roundRobinState{LastAccountID: value}, nil
 	}
 	data, err := os.ReadFile(filepath.Join(m.StateDir, roundRobinFileName))
 	if errors.Is(err, os.ErrNotExist) {
@@ -1254,6 +2005,19 @@ func (m *Manager) loadRoundRobinState() (roundRobinState, error) {
 
 func (m *Manager) saveRoundRobinState(state roundRobinState) error {
 	if err := m.Ensure(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		db, err := m.postgresDB(ctx)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		_, err = db.ExecContext(ctx, `INSERT INTO cube_meta (key, value, updated_at)
+			VALUES ('round_robin_last_account_id', $1, now())
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, state.LastAccountID)
 		return err
 	}
 	path := filepath.Join(m.StateDir, roundRobinFileName)
@@ -1275,7 +2039,37 @@ func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, erro
 		return quota.Result{}, err
 	}
 	_ = m.syncLiveAuthToManaged(account)
-	return quota.FetchForCodexHome(ctx, account.CodexHome, time.Now())
+	result, err := quota.FetchForCodexHome(ctx, account.CodexHome, time.Now())
+	_ = m.recordQuotaResult(id, result)
+	return result, err
+}
+
+func (m *Manager) recordQuotaResult(id string, result quota.Result) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	if state.QuotaCache == nil {
+		state.QuotaCache = map[string]QuotaCache{}
+	}
+	var fiveHour *quota.Window
+	for _, window := range result.Quotas {
+		if window.Key == "five_hour" || strings.EqualFold(window.Label, "5h") {
+			copy := window
+			fiveHour = &copy
+			break
+		}
+	}
+	state.QuotaCache[id] = QuotaCache{
+		AccountID: id,
+		UpdatedAt: time.Now(),
+		Result:    result,
+		FiveHour:  fiveHour,
+	}
+	return m.Save(state)
 }
 
 func (m *Manager) syncLiveAuthToManaged(account Account) error {
@@ -1576,7 +2370,17 @@ func defaultSettings(home string) Settings {
 		SharedConfigPath: filepath.Join(home, defaultStateDirName, sharedSettingsFileName),
 		CloudURL:         strings.TrimSpace(os.Getenv("CUBE_CLOUD_URL")),
 		CloudToken:       strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")),
+		DatabaseURL:      firstNonEmpty(os.Getenv("CUBE_DATABASE_URL"), os.Getenv("DATABASE_URL")),
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func loadSettings(path string, defaults Settings, home string) (Settings, error) {
@@ -1625,6 +2429,7 @@ func parseSettingsData(data []byte, defaults Settings, home string) (Settings, b
 	settings.AccountsDir = expandPath(settings.AccountsDir, home)
 	settings.CloudURL = strings.TrimSpace(settings.CloudURL)
 	settings.CloudToken = strings.TrimSpace(settings.CloudToken)
+	settings.DatabaseURL = strings.TrimSpace(settings.DatabaseURL)
 	if strings.TrimSpace(settings.SharedConfigPath) == "" {
 		settings.SharedConfigPath = defaults.SharedConfigPath
 		changed = true

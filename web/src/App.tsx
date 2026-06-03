@@ -104,12 +104,46 @@ interface UsageToken {
   output: number;
 }
 
-interface UsageSummary {
-  status: string;
-  filesScanned: number;
-  events: number;
+interface ModelUsage {
+  model: string;
   today: UsageToken;
   sevenDays: UsageToken;
+  allTime: UsageToken;
+  latestAt?: string;
+}
+
+interface AccountUsage {
+  accountId: string;
+  clientId?: string;
+  updatedAt: string;
+  latestAt?: string;
+  latestModel?: string;
+  today: UsageToken;
+  sevenDays: UsageToken;
+  allTime: UsageToken;
+  models?: ModelUsage[];
+}
+
+interface Client {
+  id: string;
+  label: string;
+  createdAt: string;
+  lastSeenAt?: string;
+  active: boolean;
+}
+
+interface RefreshQueueItem {
+  accountId: string;
+  label: string;
+  status: AccountStatus;
+  authPresent: boolean;
+  updatedAt?: string;
+  resetsAt?: string;
+  remainingDisplay?: string;
+  remainingPercent?: number;
+  usedPercent?: number;
+  quotaStatus?: string;
+  refreshOrderReason?: string;
 }
 
 interface LoadBalanceAccount {
@@ -178,6 +212,18 @@ function tokens(value?: number) {
   return Math.round(value).toString();
 }
 
+function shortTime(value?: string) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function accountName(account?: Account) {
   if (!account) return "-";
   return account.label || shortID(account.id);
@@ -221,7 +267,9 @@ export default function App() {
   const [settingsToml, setSettingsToml] = useState("");
   const [sharedConfigToml, setSharedConfigToml] = useState("");
   const [quotas, setQuotas] = useState<Record<string, QuotaResult>>({});
-  const [usages, setUsages] = useState<Record<string, UsageSummary>>({});
+  const [stats, setStats] = useState<Record<string, AccountUsage>>({});
+  const [clients, setClients] = useState<Client[]>([]);
+  const [refreshQueue, setRefreshQueue] = useState<RefreshQueueItem[]>([]);
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -232,6 +280,13 @@ export default function App() {
   const readyCount = accounts.filter((account) => account.status === "ready").length;
   const activeAccount = accounts.find((account) => account.active);
   const eligibleCount = lb?.eligible.length ?? 0;
+  const activeClientCount = clients.filter((client) => client.active).length;
+  const sevenDayTokenTotal = Object.values(stats).reduce((total, item) => total + (item.sevenDays?.total || 0), 0);
+  const refreshByAccount = useMemo(() => {
+    const map = new Map<string, RefreshQueueItem>();
+    for (const item of refreshQueue) map.set(item.accountId, item);
+    return map;
+  }, [refreshQueue]);
   const [asideOpen, setAsideOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => (typeof window === "undefined" ? true : window.innerWidth >= 1180));
   const [compactShell, setCompactShell] = useState(() => (typeof window === "undefined" ? false : window.innerWidth < 1180));
@@ -239,16 +294,22 @@ export default function App() {
   async function loadAll(preferredId = selectedId) {
     setLoading(true);
     try {
-      const [metaData, accountData, lbData, settingsData, codexConfigData] = await Promise.all([
+      const [metaData, accountData, lbData, settingsData, codexConfigData, statsData, clientData, queueData] = await Promise.all([
         apiJSON<Meta>("/api/meta"),
         apiJSON<Account[]>("/api/accounts"),
         apiJSON<LoadBalanceStatus>("/api/lb/status"),
         apiJSON<SettingsPayload>("/api/settings"),
         apiJSON<CodexConfigPayload>("/api/codex-config"),
+        apiJSON<Record<string, AccountUsage>>("/api/stats"),
+        apiJSON<Client[]>("/api/clients"),
+        apiJSON<RefreshQueueItem[]>("/api/refresh-queue"),
       ]);
       setMeta(metaData);
       setAccounts(accountData);
       setLB(lbData);
+      setStats(statsData);
+      setClients(clientData);
+      setRefreshQueue(queueData);
       setLiveHome(settingsData.liveCodexHome);
       setAccountsDir(settingsData.accountsDir);
       setSharedConfigPath(settingsData.sharedSettingsPath || settingsData.sharedConfigPath || codexConfigData.configPath);
@@ -396,6 +457,8 @@ export default function App() {
     try {
       const result = await apiJSON<QuotaResult>(`/api/accounts/${encodeURIComponent(id)}/quota`);
       setQuotas((current) => ({ ...current, [id]: result }));
+      const queue = await apiJSON<RefreshQueueItem[]>("/api/refresh-queue");
+      setRefreshQueue(queue);
       if (!quiet) setMessage("Quota refreshed");
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Quota failed";
@@ -408,14 +471,6 @@ export default function App() {
     await withBusy(async () => {
       await Promise.all(accounts.map((account) => fetchQuota(account.id, true)));
       setMessage("All quotas refreshed");
-    });
-  }
-
-  async function fetchUsage(id: string) {
-    await withBusy(async () => {
-      const result = await apiJSON<UsageSummary>(`/api/accounts/${encodeURIComponent(id)}/usage`);
-      setUsages((current) => ({ ...current, [id]: result }));
-      setMessage("Local usage refreshed");
     });
   }
 
@@ -617,12 +672,17 @@ export default function App() {
             <div className="hidden grid-cols-2 gap-2 min-[640px]:gap-3 lg:grid xl:grid-cols-4">
               <MetricCard icon={<Database size={18} />} label="Accounts" value={accounts.length.toString()} status="success" />
               <MetricCard icon={<CheckCircle2 size={18} />} label="Ready Pool" value={readyCount.toString()} status="success" />
-              <MetricCard icon={<Route size={18} />} label="LB Eligible" value={eligibleCount.toString()} status="warning" />
               <MetricCard
-                icon={<Settings size={18} />}
-                label="Shared Settings"
-                value={meta?.sharedConfigPresent ? "1" : "0"}
-                status={meta?.sharedConfigPresent ? "success" : "warning"}
+                icon={<Gauge size={18} />}
+                label="7d Tokens"
+                value={tokens(sevenDayTokenTotal)}
+                status={sevenDayTokenTotal > 0 ? "success" : "warning"}
+              />
+              <MetricCard
+                icon={<ShieldCheck size={18} />}
+                label="Clients"
+                value={`${activeClientCount}/${clients.length}`}
+                status={activeClientCount > 0 ? "success" : "warning"}
               />
             </div>
 
@@ -648,8 +708,8 @@ export default function App() {
                       <Chip color="accent" size="sm" variant="soft">
                         {eligibleCount} lb
                       </Chip>
-                      <Chip color={meta?.sharedConfigPresent ? "success" : "warning"} size="sm" variant="soft">
-                        shared settings {meta?.sharedConfigPresent ? "ready" : "missing"}
+                      <Chip color={activeClientCount > 0 ? "success" : "warning"} size="sm" variant="soft">
+                        {activeClientCount} clients
                       </Chip>
                     </div>
                   </div>
@@ -704,9 +764,9 @@ export default function App() {
                             account={account}
                             isSelected={account.id === selectedId}
                             quota={quotas[account.id]}
-                            usage={usages[account.id]}
+                            refresh={refreshByAccount.get(account.id)}
+                            usage={stats[account.id]}
                             onFetchQuota={() => fetchQuota(account.id)}
-                            onFetchUsage={() => fetchUsage(account.id)}
                             onSelect={() => setSelectedId(account.id)}
                           />
                         ))
@@ -739,20 +799,46 @@ export default function App() {
                   {eligibleCount} eligible
                 </Chip>
               </Card.Header>
-              <Card.Content className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto] md:items-center">
-                <div className="min-w-0 rounded-lg bg-slate-50 p-3">
-                  <div className="text-xs font-medium uppercase text-slate-500">Last selected</div>
-                  <div className="path-text mt-1 font-mono text-sm text-slate-800">{lb?.lastAccountId || "-"}</div>
+              <Card.Content className="gap-4">
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto] md:items-center">
+                  <div className="min-w-0 rounded-lg bg-slate-50 p-3">
+                    <div className="text-xs font-medium uppercase text-slate-500">Last selected</div>
+                    <div className="path-text mt-1 font-mono text-sm text-slate-800">{lb?.lastAccountId || "-"}</div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button className="gap-2" variant="primary" onPress={pickNext}>
+                      <Play size={15} />
+                      Pick next
+                    </Button>
+                    <Button className="gap-2" variant="secondary" onPress={resetLB}>
+                      <RotateCcw size={15} />
+                      Reset
+                    </Button>
+                  </div>
                 </div>
-                <div className="flex flex-wrap gap-2">
-                  <Button className="gap-2" variant="primary" onPress={pickNext}>
-                    <Play size={15} />
-                    Pick next
-                  </Button>
-                  <Button className="gap-2" variant="secondary" onPress={resetLB}>
-                    <RotateCcw size={15} />
-                    Reset
-                  </Button>
+                <div className="rounded-lg border border-slate-200 bg-slate-50">
+                  <div className="border-b border-slate-200 px-3 py-2 text-xs font-semibold uppercase text-slate-500">5h refresh queue</div>
+                  <div className="divide-y divide-slate-200">
+                    {refreshQueue.slice(0, 8).map((item, index) => {
+                      const account = accounts.find((entry) => entry.id === item.accountId);
+                      return (
+                        <div key={item.accountId} className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-3 py-2 text-xs">
+                          <span className="font-mono text-slate-400">{index + 1}</span>
+                          <div className="min-w-0">
+                            <div className="truncate font-medium text-slate-800">
+                              {account ? accountName(account) : item.label || shortID(item.accountId)}
+                            </div>
+                            <div className="truncate text-slate-500">{item.refreshOrderReason || item.quotaStatus || item.status}</div>
+                          </div>
+                          <div className="text-right text-slate-600">
+                            <div className="font-medium">{item.remainingDisplay || "-"}</div>
+                            <div>{shortTime(item.resetsAt)}</div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {!refreshQueue.length && <div className="px-3 py-4 text-xs text-slate-500">No quota checks yet</div>}
+                  </div>
                 </div>
               </Card.Content>
             </Card>
@@ -900,11 +986,13 @@ export default function App() {
   }
 
   function DetailsPanel() {
+    const selectedStats = selected ? stats[selected.id] : undefined;
+    const selectedRefresh = selected ? refreshByAccount.get(selected.id) : undefined;
     return (
       <div className="flex h-full min-h-0 flex-col bg-white">
         <div className="border-b border-slate-200 px-5 py-4">
           <div className="text-sm font-semibold text-slate-950">Selected account</div>
-          <div className="path-text mt-1 text-xs text-slate-500">{selected ? selected.codexHome : "No account selected"}</div>
+          <div className="mt-1 text-xs text-slate-500">{selected ? `${selected.status} · ${selected.authPresent ? "auth ready" : "auth missing"}` : "No account selected"}</div>
         </div>
         <div className="flex-1 space-y-4 overflow-auto p-5">
           {selected ? (
@@ -949,15 +1037,12 @@ export default function App() {
               </Card>
 
               <Card className="border border-slate-200 shadow-none">
-                <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">Files</Card.Header>
+                <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">Cloud signals</Card.Header>
                 <Card.Content className="gap-3 text-xs">
-                  <FileLine icon={<ShieldCheck size={15} />} label="auth.json" present={selected.authPresent} path={selected.authPath} />
-                  <FileLine
-                    icon={<Settings size={15} />}
-                    label="shared settings.toml"
-                    present={Boolean(meta?.sharedConfigPresent)}
-                    path={meta?.sharedSettingsPath || meta?.sharedConfigPath || selected.configPath}
-                  />
+                  <SignalLine label="7d tokens" value={tokens(selectedStats?.sevenDays?.total)} />
+                  <SignalLine label="latest model" value={selectedStats?.latestModel || selectedStats?.models?.[0]?.model || "-"} />
+                  <SignalLine label="last client" value={selectedStats?.clientId || "-"} />
+                  <SignalLine label="5h reset" value={selectedRefresh?.resetsAt ? shortTime(selectedRefresh.resetsAt) : selectedRefresh?.refreshOrderReason || "-"} />
                 </Card.Content>
               </Card>
             </>
@@ -1200,21 +1285,23 @@ function MobileAccountCard({
   account,
   isSelected,
   onFetchQuota,
-  onFetchUsage,
   onSelect,
   quota,
+  refresh,
   usage,
 }: {
   account: Account;
   isSelected: boolean;
   onFetchQuota: () => void;
-  onFetchUsage: () => void;
   onSelect: () => void;
   quota?: QuotaResult;
-  usage?: UsageSummary;
+  refresh?: RefreshQueueItem;
+  usage?: AccountUsage;
 }) {
   const summary = quotaSummary(quota);
   const hint = quotaHint(quota);
+  const latestModel = usage?.latestModel || usage?.models?.[0]?.model || "-";
+  const fiveHour = refresh?.remainingDisplay || summary.label;
 
   return (
     <div
@@ -1255,8 +1342,8 @@ function MobileAccountCard({
         <Chip color={account.authPresent ? "success" : "danger"} size="sm" variant="soft">
           auth
         </Chip>
-        <Chip color={account.configPresent ? "accent" : "warning"} size="sm" variant="soft">
-          shared settings
+        <Chip color={refresh?.quotaStatus === "supported" ? "success" : "warning"} size="sm" variant="soft">
+          5h {fiveHour}
         </Chip>
       </div>
 
@@ -1283,29 +1370,19 @@ function MobileAccountCard({
           <div className="mt-3 flex items-center justify-between gap-2 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
             {usage ? (
               <div className="min-w-0">
-                <div className="font-semibold text-slate-900">{tokens(usage.today?.total)} today</div>
-                <div>{tokens(usage.sevenDays?.total)} over 7d</div>
+                <div className="font-semibold text-slate-900">{tokens(usage.sevenDays?.total)} over 7d</div>
+                <div className="truncate">latest model {latestModel}</div>
               </div>
             ) : (
-              <span className="font-medium text-slate-700">Local usage</span>
-            )}
-            {!usage && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={(event) => event.stopPropagation()}
-                onPress={() => {
-                  onFetchUsage();
-                }}
-              >
-                Load
-              </Button>
+              <span className="font-medium text-slate-700">No cloud usage yet</span>
             )}
           </div>
 
           <div className="mt-3 rounded-md bg-slate-50 p-2">
-            <div className="mb-1 text-[11px] font-semibold uppercase leading-4 text-slate-400">CODEX_HOME</div>
-            <code className="cube-mobile-path path-text block text-xs leading-5 text-slate-500">{account.codexHome}</code>
+            <div className="mb-1 text-[11px] font-semibold uppercase leading-4 text-slate-400">5h refresh</div>
+            <div className="text-xs leading-5 text-slate-600">
+              {refresh?.resetsAt ? `${shortTime(refresh.resetsAt)} · ${refresh.refreshOrderReason || "queued"}` : refresh?.refreshOrderReason || "quota not checked"}
+            </div>
           </div>
         </>
       ) : (
@@ -1316,7 +1393,7 @@ function MobileAccountCard({
           </div>
           <div className="min-w-0 rounded-md bg-slate-50 p-2">
             <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">Usage</div>
-            <div className="truncate font-medium text-slate-700">{usage ? `${tokens(usage.today?.total)} today` : "Not loaded"}</div>
+            <div className="truncate font-medium text-slate-700">{usage ? `${tokens(usage.sevenDays?.total)} 7d` : "No data"}</div>
           </div>
         </div>
       )}
@@ -1357,29 +1434,11 @@ function FieldLabel({ children, text }: { children: ReactNode; text: string }) {
   );
 }
 
-function FileLine({
-  icon,
-  label,
-  path,
-  present,
-}: {
-  icon: ReactNode;
-  label: string;
-  path: string;
-  present: boolean;
-}) {
+function SignalLine({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg bg-slate-50 p-3">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2 font-medium text-slate-900">
-          {icon}
-          <span>{label}</span>
-        </div>
-        <Chip color={present ? "success" : "danger"} size="sm" variant="soft">
-          {present ? "ready" : "missing"}
-        </Chip>
-      </div>
-      <div className="path-text font-mono text-slate-500">{path}</div>
+    <div className="flex items-center justify-between gap-3 rounded-lg bg-slate-50 p-3">
+      <span className="text-slate-500">{label}</span>
+      <span className="min-w-0 truncate text-right font-medium text-slate-900">{value}</span>
     </div>
   );
 }

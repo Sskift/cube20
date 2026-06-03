@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"cube20/internal/manager"
+	"cube20/internal/usage"
 	"cube20/web"
 )
 
@@ -19,6 +20,13 @@ type Server struct {
 	Host       string
 	Port       int
 	CloudToken string
+}
+
+type authContextKey struct{}
+
+type requestAuth struct {
+	Admin    bool
+	ClientID string
 }
 
 func (s *Server) ListenAndServe() error {
@@ -30,23 +38,32 @@ func (s *Server) ListenAndServe() error {
 	}
 
 	mux := http.NewServeMux()
-	api := func(handler http.HandlerFunc) http.HandlerFunc {
-		return s.withAPIAuth(handler)
+	admin := func(handler http.HandlerFunc) http.HandlerFunc {
+		return s.withAdminAuth(handler)
 	}
-	mux.HandleFunc("/api/sync/push", api(s.handleSyncPush))
-	mux.HandleFunc("/api/sync/pull/", api(s.handleSyncPull))
-	mux.HandleFunc("/api/sync/claim", api(s.handleSyncClaim))
-	mux.HandleFunc("/api/accounts/import-json", api(s.handleImportJSON))
-	mux.HandleFunc("/api/accounts/import-live", api(s.handleImportLive))
-	mux.HandleFunc("/api/accounts/pick", api(s.handleLBPick))
-	mux.HandleFunc("/api/lb/pick", api(s.handleLBPick))
-	mux.HandleFunc("/api/lb/reset", api(s.handleLBReset))
-	mux.HandleFunc("/api/lb/status", api(s.handleLBStatus))
-	mux.HandleFunc("/api/accounts", api(s.handleAccounts))
-	mux.HandleFunc("/api/accounts/", api(s.handleAccountAction))
-	mux.HandleFunc("/api/meta", api(s.handleMeta))
-	mux.HandleFunc("/api/settings", api(s.handleSettings))
-	mux.HandleFunc("/api/codex-config", api(s.handleCodexConfig))
+	sync := func(handler http.HandlerFunc) http.HandlerFunc {
+		return s.withSyncAuth(handler)
+	}
+	mux.HandleFunc("/api/sync/push", sync(s.handleSyncPush))
+	mux.HandleFunc("/api/sync/pull/", sync(s.handleSyncPull))
+	mux.HandleFunc("/api/sync/claim", sync(s.handleSyncClaim))
+	mux.HandleFunc("/api/sync/usage", sync(s.handleSyncUsage))
+	mux.HandleFunc("/api/sync/quota/", sync(s.handleSyncQuota))
+	mux.HandleFunc("/api/clients", admin(s.handleClients))
+	mux.HandleFunc("/api/clients/", admin(s.handleClientAction))
+	mux.HandleFunc("/api/stats", admin(s.handleStats))
+	mux.HandleFunc("/api/refresh-queue", admin(s.handleRefreshQueue))
+	mux.HandleFunc("/api/accounts/import-json", admin(s.handleImportJSON))
+	mux.HandleFunc("/api/accounts/import-live", admin(s.handleImportLive))
+	mux.HandleFunc("/api/accounts/pick", admin(s.handleLBPick))
+	mux.HandleFunc("/api/lb/pick", admin(s.handleLBPick))
+	mux.HandleFunc("/api/lb/reset", admin(s.handleLBReset))
+	mux.HandleFunc("/api/lb/status", admin(s.handleLBStatus))
+	mux.HandleFunc("/api/accounts", admin(s.handleAccounts))
+	mux.HandleFunc("/api/accounts/", admin(s.handleAccountAction))
+	mux.HandleFunc("/api/meta", admin(s.handleMeta))
+	mux.HandleFunc("/api/settings", admin(s.handleSettings))
+	mux.HandleFunc("/api/codex-config", admin(s.handleCodexConfig))
 
 	distSub, err := fs.Sub(webdist.DistFS, "dist")
 	if err != nil {
@@ -62,21 +79,46 @@ func (s *Server) ListenAndServe() error {
 	return http.ListenAndServe(addr, mux)
 }
 
-func (s *Server) withAPIAuth(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.apiAuthorized(r) {
-			next(w, r)
+		if auth, ok := s.adminAuthorized(r); ok {
+			next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
 			return
 		}
-		writeError(w, http.StatusUnauthorized, "missing or invalid cloud token")
+		writeError(w, http.StatusUnauthorized, "missing or invalid admin token")
 	}
 }
 
-func (s *Server) apiAuthorized(r *http.Request) bool {
+func (s *Server) withSyncAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if auth, ok := s.adminAuthorized(r); ok {
+			next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
+			return
+		}
+		token := requestToken(r)
+		if client, ok := s.Manager.AuthenticateClientToken(token); ok {
+			_ = s.Manager.TouchClient(client.ID)
+			auth := requestAuth{ClientID: client.ID}
+			next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
+			return
+		}
+		writeError(w, http.StatusUnauthorized, "missing or invalid PAT")
+	}
+}
+
+func (s *Server) adminAuthorized(r *http.Request) (requestAuth, bool) {
 	expected := strings.TrimSpace(s.CloudToken)
 	if expected == "" {
-		return true
+		return requestAuth{Admin: true}, true
 	}
+	candidate := requestToken(r)
+	if len(candidate) != len(expected) {
+		return requestAuth{}, false
+	}
+	return requestAuth{Admin: true}, subtle.ConstantTimeCompare([]byte(candidate), []byte(expected)) == 1
+}
+
+func requestToken(r *http.Request) string {
 	candidate := strings.TrimSpace(r.Header.Get("X-Cube-Token"))
 	if candidate == "" {
 		auth := strings.TrimSpace(r.Header.Get("Authorization"))
@@ -87,10 +129,12 @@ func (s *Server) apiAuthorized(r *http.Request) bool {
 	if candidate == "" {
 		candidate = strings.TrimSpace(r.URL.Query().Get("token"))
 	}
-	if len(candidate) != len(expected) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(candidate), []byte(expected)) == 1
+	return candidate
+}
+
+func authFromRequest(r *http.Request) requestAuth {
+	auth, _ := r.Context().Value(authContextKey{}).(requestAuth)
+	return auth
 }
 
 func staticHandler(dist fs.FS) http.Handler {
@@ -298,11 +342,7 @@ func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	account, err := s.Manager.UpsertJSONProfile(manager.JSONProfile{
-		ID:    snapshot.ID,
-		Label: snapshot.Label,
-		Auth:  snapshot.Auth,
-	})
+	account, err := s.Manager.UpsertProfileSnapshot(snapshot)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -349,6 +389,125 @@ func (s *Server) handleSyncClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (s *Server) handleSyncUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		AccountID string        `json:"accountId"`
+		Usage     usage.Summary `json:"usage"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	auth := authFromRequest(r)
+	if err := s.Manager.RecordUsage(body.AccountID, auth.ClientID, body.Usage); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleSyncQuota(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/sync/quota/"), "/")
+	if id == "" {
+		id = strings.TrimSpace(r.URL.Query().Get("id"))
+	}
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing account id")
+		return
+	}
+	result, err := s.Manager.FetchQuota(r.Context(), id)
+	if err != nil {
+		if result.Status != "" {
+			writeJSON(w, http.StatusOK, result)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		clients, err := s.Manager.ListClients()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, clients)
+	case http.MethodPost:
+		var body struct {
+			Label string `json:"label"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+		}
+		client, token, err := s.Manager.CreateClient(body.Label)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"client": client,
+			"token":  token,
+		})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) handleClientAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/clients/"), "/")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing client id")
+		return
+	}
+	if err := s.Manager.RevokeClient(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "id": id})
+}
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	stats, err := s.Manager.UsageStats()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) handleRefreshQueue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	queue, err := s.Manager.RefreshQueue()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, queue)
 }
 
 func (s *Server) refreshBeforeExport(id string) {
