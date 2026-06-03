@@ -190,7 +190,7 @@
 .cube-view-tabs {
   display: grid;
   min-width: 0;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(6.25rem, 1fr));
   gap: 0.375rem;
   border: 1px solid #e2e8f0;
   border-radius: 0.75rem;

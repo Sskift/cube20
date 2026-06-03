@@ -13,11 +13,14 @@ import {
 } from "@heroui/react";
 import {
   CheckCircle2,
+  Copy,
   Database,
   FileJson,
   FolderCog,
   Gauge,
   Info,
+  KeyRound,
+  LogOut,
   PanelRightClose,
   PanelRightOpen,
   Play,
@@ -29,6 +32,8 @@ import {
   ShieldCheck,
   Trash2,
   UploadCloud,
+  UserRound,
+  Users,
 } from "lucide-react";
 
 type AccountStatus = "ready" | "drain" | "disabled";
@@ -159,7 +164,22 @@ interface LoadBalanceStatus {
   excluded: LoadBalanceAccount[];
 }
 
-type DashboardView = "accounts" | "load-balancer" | "runtime" | "import" | "settings";
+interface PersonalPayload {
+  mode: "admin" | "client";
+  admin: boolean;
+  client?: Client;
+  clients?: Client[];
+  usage?: AccountUsage[] | Record<string, AccountUsage>;
+  totals?: {
+    today: UsageToken;
+    sevenDays: UsageToken;
+    allTime: UsageToken;
+  };
+  refreshQueue?: RefreshQueueItem[];
+}
+
+type AccessMode = "unknown" | "admin" | "personal";
+type DashboardView = "accounts" | "load-balancer" | "people" | "runtime" | "import" | "settings";
 
 const CLOUD_TOKEN_KEY = "cube20.cloudToken";
 let cloudTokenSynced = false;
@@ -179,6 +199,33 @@ function cloudToken() {
     }
   }
   return window.localStorage.getItem(CLOUD_TOKEN_KEY) || "";
+}
+
+function saveCloudToken(token: string) {
+  if (typeof window === "undefined") return;
+  cloudTokenSynced = true;
+  const trimmed = token.trim();
+  if (trimmed) {
+    window.localStorage.setItem(CLOUD_TOKEN_KEY, trimmed);
+  } else {
+    window.localStorage.removeItem(CLOUD_TOKEN_KEY);
+  }
+}
+
+function cloudOrigin() {
+  if (typeof window === "undefined") return "";
+  return window.location.origin;
+}
+
+function maskSecret(value: string) {
+  if (!value) return "-";
+  if (value.length <= 14) return `${value.slice(0, 3)}...`;
+  return `${value.slice(0, 10)}...${value.slice(-6)}`;
+}
+
+async function copyText(value: string) {
+  if (!value || typeof navigator === "undefined" || !navigator.clipboard) return;
+  await navigator.clipboard.writeText(value);
 }
 
 async function apiJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -401,10 +448,15 @@ export default function App() {
   const [stats, setStats] = useState<Record<string, AccountUsage>>({});
   const [clients, setClients] = useState<Client[]>([]);
   const [refreshQueue, setRefreshQueue] = useState<RefreshQueueItem[]>([]);
+  const [personal, setPersonal] = useState<PersonalPayload | null>(null);
+  const [accessMode, setAccessMode] = useState<AccessMode>("unknown");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [activeView, setActiveView] = useState<DashboardView>("accounts");
+  const [clientLabel, setClientLabel] = useState("");
+  const [createdClientToken, setCreatedClientToken] = useState("");
+  const [tokenInput, setTokenInput] = useState(() => cloudToken());
   const quotaAutoKeyRef = useRef("");
 
   const selected = useMemo(() => accounts.find((account) => account.id === selectedId), [accounts, selectedId]);
@@ -413,6 +465,11 @@ export default function App() {
   const eligibleCount = lb?.eligible.length ?? 0;
   const activeClientCount = clients.filter((client) => client.active).length;
   const sevenDayTokenTotal = Object.values(stats).reduce((total, item) => total + (item.sevenDays?.total || 0), 0);
+  const personalUsage = useMemo(() => {
+    if (!personal?.usage) return [] as AccountUsage[];
+    if (Array.isArray(personal.usage)) return personal.usage;
+    return Object.values(personal.usage);
+  }, [personal]);
   const refreshByAccount = useMemo(() => {
     const map = new Map<string, RefreshQueueItem>();
     for (const item of refreshQueue) map.set(item.accountId, item);
@@ -421,6 +478,13 @@ export default function App() {
   const [asideOpen, setAsideOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => (typeof window === "undefined" ? true : window.innerWidth >= 1180));
   const [compactShell, setCompactShell] = useState(() => (typeof window === "undefined" ? false : window.innerWidth < 1180));
+
+  async function loadPersonal() {
+    const payload = await apiJSON<PersonalPayload>("/api/me");
+    setPersonal(payload);
+    setAccessMode(payload.admin ? "admin" : "personal");
+    return payload;
+  }
 
   async function loadAll(preferredId = selectedId) {
     setLoading(true);
@@ -449,8 +513,16 @@ export default function App() {
       if (!accountData.some((account) => account.id === preferredId)) {
         setSelectedId(accountData.find((account) => account.active)?.id || accountData[0]?.id || "");
       }
+      setAccessMode("admin");
+      void loadPersonal().catch(() => undefined);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Load failed");
+      try {
+        const payload = await loadPersonal();
+        if (!payload.admin) setMessage("");
+      } catch {
+        setAccessMode("unknown");
+        setMessage(error instanceof Error ? error.message : "Load failed");
+      }
     } finally {
       setLoading(false);
     }
@@ -674,6 +746,46 @@ export default function App() {
     });
   }
 
+  async function createClient() {
+    await withBusy(async () => {
+      const result = await apiJSON<{ client: Client; token: string }>("/api/clients", {
+        method: "POST",
+        body: JSON.stringify({ label: clientLabel }),
+      });
+      setCreatedClientToken(result.token);
+      setClientLabel("");
+      setMessage(`Created ${result.client.id}`);
+      await loadAll(selectedId);
+    });
+  }
+
+  async function revokeClient(id: string) {
+    if (!window.confirm(`Revoke ${id}?`)) return;
+    await withBusy(async () => {
+      await apiJSON(`/api/clients/${encodeURIComponent(id)}`, { method: "DELETE" });
+      setMessage(`Revoked ${id}`);
+      await loadAll(selectedId);
+    });
+  }
+
+  async function applyToken() {
+    saveCloudToken(tokenInput);
+    setMessage("Token saved");
+    await loadAll(selectedId);
+  }
+
+  async function clearToken() {
+    saveCloudToken("");
+    setTokenInput("");
+    setPersonal(null);
+    setAccounts([]);
+    setClients([]);
+    setStats({});
+    setRefreshQueue([]);
+    setAccessMode("unknown");
+    setMessage("Token cleared");
+  }
+
   const sidebar = (
     <div className="flex h-full min-h-0 flex-col border-r border-slate-200 bg-white">
       <div className="flex items-center gap-3 border-b border-slate-200 px-4 py-4">
@@ -699,6 +811,13 @@ export default function App() {
           active={activeView === "load-balancer"}
           badge={eligibleCount.toString()}
           onPress={() => selectView("load-balancer")}
+        />
+        <NavItem
+          icon={<Users size={17} />}
+          label="People"
+          active={activeView === "people"}
+          badge={activeClientCount.toString()}
+          onPress={() => selectView("people")}
         />
         <NavItem icon={<Settings size={17} />} label="Runtime" active={activeView === "runtime"} onPress={openRuntimePanel} />
         <NavItem icon={<FileJson size={17} />} label="Import auth" active={activeView === "import"} onPress={() => selectView("import")} />
@@ -763,6 +882,34 @@ export default function App() {
     </div>
   );
 
+  if (!loading && accessMode === "personal" && personal) {
+    return (
+      <PersonalDashboard
+        busy={busy}
+        message={message}
+        personal={personal}
+        tokenInput={tokenInput}
+        usage={personalUsage}
+        onApplyToken={applyToken}
+        onClearToken={clearToken}
+        onRefresh={() => loadAll("")}
+        onTokenInput={setTokenInput}
+      />
+    );
+  }
+
+  if (!loading && accessMode === "unknown" && !accounts.length) {
+    return (
+      <TokenGate
+        busy={busy}
+        message={message}
+        tokenInput={tokenInput}
+        onApplyToken={applyToken}
+        onTokenInput={setTokenInput}
+      />
+    );
+  }
+
   return (
     <AppLayout
       aside={<DetailsPanel />}
@@ -801,6 +948,13 @@ export default function App() {
             icon={<Route size={15} />}
             label="LB"
             onPress={() => selectView("load-balancer")}
+          />
+          <ViewTab
+            active={activeView === "people"}
+            badge={activeClientCount.toString()}
+            icon={<Users size={15} />}
+            label="People"
+            onPress={() => selectView("people")}
           />
           <ViewTab active={activeView === "runtime"} icon={<Settings size={15} />} label="Runtime" onPress={openRuntimePanel} />
           <ViewTab active={activeView === "import"} icon={<FileJson size={15} />} label="Import" onPress={() => selectView("import")} />
@@ -982,6 +1136,94 @@ export default function App() {
                 </div>
               </Card.Content>
             </Card>
+          </section>
+        )}
+
+        {activeView === "people" && (
+          <section className="cube-view-panel">
+            <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+              <Card className="border border-slate-200 bg-white shadow-sm">
+                <Card.Header className="border-b border-slate-200 px-5 py-4">
+                  <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
+                    <KeyRound size={17} />
+                    New PAT
+                  </h2>
+                </Card.Header>
+                <Card.Content className="gap-4">
+                  <FieldLabel text="client label">
+                    <Input
+                      fullWidth
+                      placeholder="liushiao-local"
+                      value={clientLabel}
+                      variant="secondary"
+                      onChange={(event) => setClientLabel(event.currentTarget.value)}
+                    />
+                  </FieldLabel>
+                  <Button className="gap-2" isDisabled={busy} variant="primary" onPress={createClient}>
+                    <KeyRound size={15} />
+                    Create PAT
+                  </Button>
+                  {createdClientToken && (
+                    <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+                      <div className="mb-2 text-xs font-semibold uppercase text-emerald-700">Token</div>
+                      <div className="path-text font-mono text-xs text-emerald-950">{createdClientToken}</div>
+                      <div className="mt-3 grid grid-cols-1 gap-2">
+                        <CopyLine
+                          label="Dashboard"
+                          value={`${cloudOrigin()}/?token=${createdClientToken}`}
+                        />
+                        <CopyLine
+                          label="Local config"
+                          value={`cube cloud config --server ${cloudOrigin()} --token ${createdClientToken}`}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </Card.Content>
+              </Card>
+
+              <Card className="border border-slate-200 bg-white shadow-sm">
+                <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+                  <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
+                    <Users size={17} />
+                    People
+                  </h2>
+                  <Chip color={activeClientCount > 0 ? "success" : "warning"} variant="soft">
+                    {activeClientCount}/{clients.length}
+                  </Chip>
+                </Card.Header>
+                <Card.Content className="p-0">
+                  <div className="divide-y divide-slate-200">
+                    {clients.map((client) => (
+                      <div key={client.id} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-3">
+                        <div className="min-w-0">
+                          <div className="flex min-w-0 flex-wrap items-center gap-2">
+                            <span className="truncate text-sm font-semibold text-slate-950">{client.label || client.id}</span>
+                            <Chip color={client.active ? "success" : "danger"} size="sm" variant="soft">
+                              {client.active ? "active" : "revoked"}
+                            </Chip>
+                          </div>
+                          <div className="mt-1 font-mono text-xs text-slate-500">{client.id}</div>
+                          <div className="mt-1 text-xs text-slate-500">last seen {shortTime(client.lastSeenAt)}</div>
+                        </div>
+                        <Button
+                          aria-label={`Revoke ${client.id}`}
+                          className="gap-2"
+                          isDisabled={busy || !client.active}
+                          size="sm"
+                          variant="danger-soft"
+                          onPress={() => revokeClient(client.id)}
+                        >
+                          <Trash2 size={14} />
+                          Revoke
+                        </Button>
+                      </div>
+                    ))}
+                    {!clients.length && <div className="px-4 py-6 text-sm text-slate-500">No clients</div>}
+                  </div>
+                </Card.Content>
+              </Card>
+            </div>
           </section>
         )}
 
@@ -1201,6 +1443,216 @@ export default function App() {
       </div>
     );
   }
+}
+
+function TokenGate({
+  busy,
+  message,
+  onApplyToken,
+  onTokenInput,
+  tokenInput,
+}: {
+  busy: boolean;
+  message: string;
+  onApplyToken: () => Promise<void>;
+  onTokenInput: (value: string) => void;
+  tokenInput: string;
+}) {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-slate-50 p-4">
+      <Card className="w-full max-w-xl border border-slate-200 bg-white shadow-sm">
+        <Card.Header className="border-b border-slate-200 px-5 py-4">
+          <h1 className="flex items-center gap-2 text-base font-semibold text-slate-950">
+            <ShieldCheck size={18} />
+            cube20
+          </h1>
+        </Card.Header>
+        <Card.Content className="gap-4">
+          <FieldLabel text="admin token or PAT">
+            <Input
+              fullWidth
+              value={tokenInput}
+              variant="secondary"
+              onChange={(event) => onTokenInput(event.currentTarget.value)}
+            />
+          </FieldLabel>
+          <Button className="gap-2" isDisabled={busy || !tokenInput.trim()} variant="primary" onPress={onApplyToken}>
+            <KeyRound size={15} />
+            Continue
+          </Button>
+          {message && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+              {message}
+            </div>
+          )}
+        </Card.Content>
+      </Card>
+    </div>
+  );
+}
+
+function PersonalDashboard({
+  busy,
+  message,
+  onApplyToken,
+  onClearToken,
+  onRefresh,
+  onTokenInput,
+  personal,
+  tokenInput,
+  usage,
+}: {
+  busy: boolean;
+  message: string;
+  onApplyToken: () => Promise<void>;
+  onClearToken: () => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onTokenInput: (value: string) => void;
+  personal: PersonalPayload;
+  tokenInput: string;
+  usage: AccountUsage[];
+}) {
+  const client = personal.client;
+  const totals = personal.totals;
+  const browserToken = cloudToken();
+  const configCommand = `cube cloud config --server ${cloudOrigin()} --token ${browserToken || "<cube_pat_...>"}`;
+
+  return (
+    <AppLayout
+      className="h-screen bg-slate-50"
+      navbar={
+        <div className="cube-navbar flex min-h-14 w-full items-center justify-between gap-3 border-b border-slate-200 bg-white px-4 py-2">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-slate-950 text-white">
+              <UserRound size={18} />
+            </div>
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold text-slate-950">My page</div>
+              <div className="truncate text-xs text-slate-500">{client?.label || client?.id || "client"}</div>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button aria-label="Refresh" className="gap-2" isDisabled={busy} size="sm" variant="secondary" onPress={onRefresh}>
+              <RefreshCw size={15} />
+              <span className="hidden sm:inline">Refresh</span>
+            </Button>
+            <Button aria-label="Clear token" className="gap-2" isDisabled={busy} size="sm" variant="danger-soft" onPress={onClearToken}>
+              <LogOut size={15} />
+              <span className="hidden sm:inline">Token</span>
+            </Button>
+          </div>
+        </div>
+      }
+    >
+      <div className="cube-content mx-auto flex w-full max-w-6xl flex-col gap-4 p-3 sm:p-4 lg:gap-5 lg:p-6">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <MetricCard icon={<UserRound size={18} />} label="Client" value={client?.active ? "Active" : "Inactive"} status={client?.active ? "success" : "danger"} />
+          <MetricCard icon={<Gauge size={18} />} label="7d Tokens" value={tokens(totals?.sevenDays?.total)} status={(totals?.sevenDays?.total || 0) > 0 ? "success" : "warning"} />
+          <MetricCard icon={<Database size={18} />} label="Accounts Used" value={usage.length.toString()} status={usage.length ? "success" : "warning"} />
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+          <Card className="border border-slate-200 bg-white shadow-sm">
+            <Card.Header className="border-b border-slate-200 px-5 py-4">
+              <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
+                <UserRound size={17} />
+                Profile
+              </h2>
+            </Card.Header>
+            <Card.Content className="gap-3 text-sm">
+              <SignalLine label="client id" value={client?.id || "-"} />
+              <SignalLine label="label" value={client?.label || "-"} />
+              <SignalLine label="last seen" value={shortTime(client?.lastSeenAt)} />
+              <SignalLine label="browser token" value={maskSecret(browserToken)} />
+            </Card.Content>
+          </Card>
+
+          <Card className="border border-slate-200 bg-white shadow-sm">
+            <Card.Header className="border-b border-slate-200 px-5 py-4">
+              <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
+                <KeyRound size={17} />
+                Access
+              </h2>
+            </Card.Header>
+            <Card.Content className="gap-4">
+              <FieldLabel text="token">
+                <Input
+                  fullWidth
+                  value={tokenInput}
+                  variant="secondary"
+                  onChange={(event) => onTokenInput(event.currentTarget.value)}
+                />
+              </FieldLabel>
+              <div className="flex flex-wrap gap-2">
+                <Button className="gap-2" isDisabled={busy || !tokenInput.trim()} variant="primary" onPress={onApplyToken}>
+                  <Save size={15} />
+                  Save token
+                </Button>
+                <Button className="gap-2" variant="secondary" onPress={() => copyText(configCommand)}>
+                  <Copy size={15} />
+                  Copy config
+                </Button>
+              </div>
+              <CopyLine label="Local config" value={configCommand} />
+              <CopyLine label="Dashboard" value={`${cloudOrigin()}/?token=${browserToken || "<cube_pat_...>"}`} />
+            </Card.Content>
+          </Card>
+        </div>
+
+        <Card className="border border-slate-200 bg-white shadow-sm">
+          <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+            <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
+              <Gauge size={17} />
+              Usage
+            </h2>
+            <Chip color="accent" variant="soft">
+              {tokens(totals?.allTime?.total)} all
+            </Chip>
+          </Card.Header>
+          <Card.Content className="p-0">
+            <div className="divide-y divide-slate-200">
+              {usage.map((item) => (
+                <div key={item.accountId} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-3 text-sm">
+                  <div className="min-w-0">
+                    <div className="truncate font-semibold text-slate-950">{shortID(item.accountId)}</div>
+                    <div className="truncate text-xs text-slate-500">{item.latestModel || item.models?.[0]?.model || "no model"} · {shortTime(item.latestAt || item.updatedAt)}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-semibold text-slate-950">{tokens(item.sevenDays?.total)} 7d</div>
+                    <div className="text-xs text-slate-500">{tokens(item.today?.total)} today</div>
+                  </div>
+                </div>
+              ))}
+              {!usage.length && <div className="px-4 py-6 text-sm text-slate-500">No usage yet</div>}
+            </div>
+          </Card.Content>
+        </Card>
+
+        {message && (
+          <Card className="border border-teal-200 bg-teal-50 text-teal-900">
+            <Card.Content className="flex flex-row items-start gap-2 p-4 text-sm">
+              <Info size={16} className="mt-0.5 shrink-0" />
+              <span>{message}</span>
+            </Card.Content>
+          </Card>
+        )}
+      </div>
+    </AppLayout>
+  );
+}
+
+function CopyLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-lg bg-slate-50 p-3">
+      <div className="min-w-0">
+        <div className="mb-1 text-[11px] font-semibold uppercase text-slate-400">{label}</div>
+        <div className="path-text font-mono text-xs text-slate-700">{value}</div>
+      </div>
+      <Button aria-label={`Copy ${label}`} size="sm" variant="secondary" onPress={() => copyText(value)}>
+        <Copy size={14} />
+      </Button>
+    </div>
+  );
 }
 
 function quotaSeverity(usedPercent: number) {

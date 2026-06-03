@@ -49,6 +49,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/sync/claim", sync(s.handleSyncClaim))
 	mux.HandleFunc("/api/sync/usage", sync(s.handleSyncUsage))
 	mux.HandleFunc("/api/sync/quota/", sync(s.handleSyncQuota))
+	mux.HandleFunc("/api/me", sync(s.handleMe))
 	mux.HandleFunc("/api/clients", admin(s.handleClients))
 	mux.HandleFunc("/api/clients/", admin(s.handleClientAction))
 	mux.HandleFunc("/api/stats", admin(s.handleStats))
@@ -495,6 +496,98 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	auth := authFromRequest(r)
+	clients, err := s.Manager.ListClients()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	stats, err := s.Manager.UsageStats()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	queue, err := s.Manager.RefreshQueue()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if auth.Admin {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"mode":         "admin",
+			"admin":        true,
+			"clients":      clients,
+			"usage":        stats,
+			"refreshQueue": queue,
+		})
+		return
+	}
+
+	var currentClient manager.ClientView
+	for _, client := range clients {
+		if client.ID == auth.ClientID {
+			currentClient = client
+			break
+		}
+	}
+	if currentClient.ID == "" {
+		writeError(w, http.StatusUnauthorized, "client token is no longer active")
+		return
+	}
+
+	accountIDs := map[string]bool{}
+	clientUsage := []manager.AccountUsage{}
+	totals := struct {
+		Today     usage.Tokens `json:"today"`
+		SevenDays usage.Tokens `json:"sevenDays"`
+		AllTime   usage.Tokens `json:"allTime"`
+	}{}
+	for accountID, stat := range stats {
+		if stat.ClientID != auth.ClientID {
+			continue
+		}
+		if stat.AccountID == "" {
+			stat.AccountID = accountID
+		}
+		accountIDs[stat.AccountID] = true
+		clientUsage = append(clientUsage, stat)
+		totals.Today = addTokens(totals.Today, stat.Today)
+		totals.SevenDays = addTokens(totals.SevenDays, stat.SevenDays)
+		totals.AllTime = addTokens(totals.AllTime, stat.AllTime)
+	}
+
+	clientQueue := []manager.RefreshQueueItem{}
+	for _, item := range queue {
+		if accountIDs[item.AccountID] {
+			clientQueue = append(clientQueue, item)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"mode":         "client",
+		"admin":        false,
+		"client":       currentClient,
+		"usage":        clientUsage,
+		"totals":       totals,
+		"refreshQueue": clientQueue,
+	})
+}
+
+func addTokens(left, right usage.Tokens) usage.Tokens {
+	left.Input += right.Input
+	left.CachedInput += right.CachedInput
+	left.Output += right.Output
+	left.Total += right.Total
+	return left
 }
 
 func (s *Server) handleRefreshQueue(w http.ResponseWriter, r *http.Request) {
