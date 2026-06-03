@@ -28,6 +28,7 @@ const (
 	StatusSupported     Status = "supported"
 	StatusUnsupported   Status = "unsupported_api_key"
 	StatusNotConfigured Status = "not_configured"
+	StatusRefreshInvalid Status = "refresh_token_invalidated"
 	StatusError         Status = "error"
 )
 
@@ -131,7 +132,11 @@ func FetchForCodexHome(ctx context.Context, codexHome string, now time.Time) (Re
 		if refreshToken != "" {
 			refreshed, refreshErr := refreshAuthFile(ctx, authPath, data, refreshToken)
 			if refreshErr != nil {
-				result.Status = StatusError
+				if isRefreshTokenInvalidated(refreshErr) {
+					result.Status = StatusRefreshInvalid
+				} else {
+					result.Status = StatusError
+				}
 				result.Source = "auth.json refresh_token"
 				result.Detail = sanitizeErr(refreshErr)
 				return result, refreshErr
@@ -156,7 +161,11 @@ func FetchForCodexHome(ctx context.Context, codexHome string, now time.Time) (Re
 	if errors.Is(err, errUnauthorized) && refreshToken != "" {
 		refreshed, refreshErr := refreshAuthFile(ctx, authPath, data, refreshToken)
 		if refreshErr != nil {
-			result.Status = StatusError
+			if isRefreshTokenInvalidated(refreshErr) {
+				result.Status = StatusRefreshInvalid
+			} else {
+				result.Status = StatusError
+			}
 			result.Source = "auth.json refresh_token"
 			result.Detail = sanitizeErr(refreshErr)
 			return result, refreshErr
@@ -407,6 +416,25 @@ func sanitizeErr(err error) string {
 		}
 	}
 	return msg
+}
+
+func isRefreshTokenInvalidated(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"refresh_token_reused",
+		"invalid_grant",
+		"invalid refresh",
+		"refresh token returned http 401",
+		"refresh token returned http 403",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func accountFromIDToken(idToken string) string {

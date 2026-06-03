@@ -1,4 +1,4 @@
-import type { FormEvent, ReactNode, RefObject } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Avatar,
@@ -10,7 +10,6 @@ import {
   Separator,
   Skeleton,
   TextArea,
-  Tooltip,
 } from "@heroui/react";
 import {
   CheckCircle2,
@@ -34,13 +33,10 @@ import {
 } from "lucide-react";
 import {
   AppLayout,
-  DataGrid,
   DropZone,
   EmptyState,
   KPI,
   NativeSelect,
-  type DataGridColumn,
-  type DataGridSelection,
 } from "@heroui-pro/react";
 
 type AccountStatus = "ready" | "drain" | "disabled";
@@ -124,6 +120,8 @@ interface LoadBalanceStatus {
   excluded: LoadBalanceAccount[];
 }
 
+type DashboardView = "accounts" | "load-balancer" | "import" | "settings";
+
 async function apiJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -167,6 +165,15 @@ function quotaSummary(quota?: QuotaResult) {
   return { label: quota.status, value: 0, color: "default" as const };
 }
 
+function quotaHint(quota?: QuotaResult) {
+  if (!quota) return "";
+  if (quota.status === "refresh_token_invalidated") return "Stored token expired. Re-login or import a fresh auth.json.";
+  if (quota.status === "unsupported_api_key") return "API-key auth cannot expose subscription balance.";
+  if (quota.status === "not_configured") return "auth.json is missing.";
+  if (quota.status === "error") return quota.detail || "Quota check failed.";
+  return "";
+}
+
 export default function App() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [meta, setMeta] = useState<Meta | null>(null);
@@ -182,18 +189,15 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const accountsSectionRef = useRef<HTMLElement | null>(null);
-  const lbSectionRef = useRef<HTMLElement | null>(null);
-  const importSectionRef = useRef<HTMLElement | null>(null);
+  const [activeView, setActiveView] = useState<DashboardView>("accounts");
   const quotaAutoKeyRef = useRef("");
 
   const selected = useMemo(() => accounts.find((account) => account.id === selectedId), [accounts, selectedId]);
-  const selectedKeys = useMemo<DataGridSelection>(() => (selectedId ? new Set<string>([selectedId]) : new Set<string>()), [selectedId]);
   const readyCount = accounts.filter((account) => account.status === "ready").length;
   const missingConfigCount = accounts.filter((account) => !account.configPresent).length;
   const activeAccount = accounts.find((account) => account.active);
   const eligibleCount = lb?.eligible.length ?? 0;
-  const [asideOpen, setAsideOpen] = useState(() => (typeof window === "undefined" ? true : window.innerWidth >= 1180));
+  const [asideOpen, setAsideOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => (typeof window === "undefined" ? true : window.innerWidth >= 1180));
   const [compactShell, setCompactShell] = useState(() => (typeof window === "undefined" ? false : window.innerWidth < 1180));
 
@@ -231,7 +235,7 @@ export default function App() {
       const wide = window.innerWidth >= 1180;
       setCompactShell(!wide);
       setSidebarOpen(wide);
-      setAsideOpen(wide);
+      if (!wide) setAsideOpen(false);
     }
     syncShellToViewport();
     window.addEventListener("resize", syncShellToViewport);
@@ -254,14 +258,13 @@ export default function App() {
     }
   }, [accounts, loading]);
 
-  function scrollToSection(ref: RefObject<HTMLElement | null>) {
-    ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  function selectView(view: DashboardView) {
+    setActiveView(view);
     if (compactShell) setSidebarOpen(false);
   }
 
   function openSettingsPanel() {
-    setAsideOpen(true);
-    if (compactShell) setSidebarOpen(false);
+    selectView("settings");
   }
 
   async function withBusy(action: () => Promise<void>) {
@@ -406,144 +409,6 @@ export default function App() {
     });
   }
 
-  const columns = useMemo<DataGridColumn<Account>[]>(
-    () => [
-      {
-        id: "account",
-        header: "Account",
-        isRowHeader: true,
-        allowsSorting: true,
-        width: 240,
-        minWidth: 200,
-        pinned: "start",
-        sortFn: (a, b) => accountName(a).localeCompare(accountName(b)),
-        cell: (account) => (
-          <div className="flex min-w-0 items-center gap-3">
-            <Avatar className="shrink-0" color="accent" size="md" variant="soft">
-              <Avatar.Fallback>{(account.label || account.id).slice(0, 2).toUpperCase()}</Avatar.Fallback>
-            </Avatar>
-            <div className="min-w-0">
-              <div className="flex min-w-0 items-center gap-2">
-                <span className="truncate text-sm font-semibold text-slate-950">{accountName(account)}</span>
-                {account.active && (
-                  <Chip color="accent" size="sm" variant="soft">
-                    active
-                  </Chip>
-                )}
-              </div>
-              <Tooltip>
-                <Tooltip.Trigger className="inline-flex max-w-full">
-                  <span className="truncate font-mono text-xs text-slate-500">{shortID(account.id)}</span>
-                </Tooltip.Trigger>
-                <Tooltip.Content>{account.id}</Tooltip.Content>
-              </Tooltip>
-            </div>
-          </div>
-        ),
-      },
-      {
-        id: "status",
-        header: "Status",
-        width: 96,
-        minWidth: 88,
-        allowsSorting: true,
-        accessorKey: "status",
-        cell: (account) => (
-          <Chip
-            color={account.status === "ready" ? "success" : account.status === "drain" ? "warning" : "danger"}
-            size="sm"
-            variant="soft"
-          >
-            {account.status}
-          </Chip>
-        ),
-      },
-      {
-        id: "files",
-        header: "Files",
-        width: 132,
-        minWidth: 124,
-        cell: (account) => (
-          <div className="flex flex-wrap gap-1.5">
-            <Chip color={account.authPresent ? "success" : "danger"} size="sm" variant="soft">
-              auth
-            </Chip>
-            <Chip color={account.configPresent ? "accent" : "warning"} size="sm" variant="soft">
-              config
-            </Chip>
-          </div>
-        ),
-      },
-      {
-        id: "quota",
-        header: "Quota",
-        width: 190,
-        minWidth: 180,
-        cell: (account) => {
-          const summary = quotaSummary(quotas[account.id]);
-          return (
-            <div className="flex min-w-0 flex-col gap-1.5">
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate text-xs font-medium text-slate-700">{summary.label}</span>
-                <Tooltip>
-                  <Tooltip.Trigger>
-                    <Button aria-label={`Check quota for ${accountName(account)}`} size="sm" variant="ghost" onPress={() => fetchQuota(account.id)}>
-                      <Gauge size={14} />
-                    </Button>
-                  </Tooltip.Trigger>
-                  <Tooltip.Content>Check quota</Tooltip.Content>
-                </Tooltip>
-              </div>
-              <ProgressBar aria-label="Quota remaining" color={summary.color} size="sm" value={summary.value} />
-            </div>
-          );
-        },
-      },
-      {
-        id: "usage",
-        header: "Local Usage",
-        width: 140,
-        minWidth: 132,
-        cell: (account) => {
-          const usage = usages[account.id];
-          if (!usage) {
-            return (
-              <Tooltip>
-                <Tooltip.Trigger>
-                  <Button aria-label={`Load local usage for ${accountName(account)}`} size="sm" variant="ghost" onPress={() => fetchUsage(account.id)}>
-                    <RefreshCw size={14} />
-                  </Button>
-                </Tooltip.Trigger>
-                <Tooltip.Content>Load usage</Tooltip.Content>
-              </Tooltip>
-            );
-          }
-          return (
-            <div className="text-xs text-slate-600">
-              <div className="font-semibold text-slate-900">{tokens(usage.today?.total)} today</div>
-              <div>{tokens(usage.sevenDays?.total)} over 7d</div>
-            </div>
-          );
-        },
-      },
-      {
-        id: "home",
-        header: "CODEX_HOME",
-        width: 272,
-        minWidth: 240,
-        cell: (account) => (
-          <Tooltip>
-            <Tooltip.Trigger className="block max-w-full text-left">
-              <code className="path-text line-clamp-2 text-xs leading-5 text-slate-500">{account.codexHome}</code>
-            </Tooltip.Trigger>
-            <Tooltip.Content>{account.codexHome}</Tooltip.Content>
-          </Tooltip>
-        ),
-      },
-    ],
-    [quotas, usages],
-  );
-
   const sidebar = (
     <div className="flex h-full min-h-0 flex-col border-r border-slate-200 bg-white">
       <div className="flex items-center gap-3 border-b border-slate-200 px-4 py-4">
@@ -556,10 +421,22 @@ export default function App() {
         </div>
       </div>
       <div className="flex flex-1 flex-col gap-1 px-3 py-4 text-sm">
-        <NavItem icon={<Database size={17} />} label="Accounts" active badge={accounts.length.toString()} onPress={() => scrollToSection(accountsSectionRef)} />
-        <NavItem icon={<Route size={17} />} label="Load Balancer" badge={eligibleCount.toString()} onPress={() => scrollToSection(lbSectionRef)} />
-        <NavItem icon={<FileJson size={17} />} label="Import auth" onPress={() => scrollToSection(importSectionRef)} />
-        <NavItem icon={<FolderCog size={17} />} label="Settings" onPress={openSettingsPanel} />
+        <NavItem
+          icon={<Database size={17} />}
+          label="Accounts"
+          active={activeView === "accounts"}
+          badge={accounts.length.toString()}
+          onPress={() => selectView("accounts")}
+        />
+        <NavItem
+          icon={<Route size={17} />}
+          label="Load Balancer"
+          active={activeView === "load-balancer"}
+          badge={eligibleCount.toString()}
+          onPress={() => selectView("load-balancer")}
+        />
+        <NavItem icon={<FileJson size={17} />} label="Import auth" active={activeView === "import"} onPress={() => selectView("import")} />
+        <NavItem icon={<FolderCog size={17} />} label="Settings" active={activeView === "settings"} onPress={openSettingsPanel} />
       </div>
       <div className="border-t border-slate-200 p-3">
         <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
@@ -635,199 +512,197 @@ export default function App() {
       sidebarVariant="sidebar"
     >
       <div className="cube-content mx-auto flex w-full max-w-[1500px] flex-col gap-4 p-3 sm:p-4 lg:gap-5 lg:p-6">
-        <div className="hidden grid-cols-2 gap-2 min-[640px]:gap-3 lg:grid xl:grid-cols-4">
-          <MetricCard icon={<Database size={18} />} label="Accounts" value={accounts.length.toString()} status="success" />
-          <MetricCard icon={<CheckCircle2 size={18} />} label="Ready Pool" value={readyCount.toString()} status="success" />
-          <MetricCard icon={<Route size={18} />} label="LB Eligible" value={eligibleCount.toString()} status="warning" />
-          <MetricCard icon={<CircleSlash size={18} />} label="Missing Settings" value={missingConfigCount.toString()} status="danger" />
+        <div className="cube-view-tabs" role="tablist" aria-label="Dashboard views">
+          <ViewTab
+            active={activeView === "accounts"}
+            badge={accounts.length.toString()}
+            icon={<Database size={15} />}
+            label="Accounts"
+            onPress={() => selectView("accounts")}
+          />
+          <ViewTab
+            active={activeView === "load-balancer"}
+            badge={eligibleCount.toString()}
+            icon={<Route size={15} />}
+            label="LB"
+            onPress={() => selectView("load-balancer")}
+          />
+          <ViewTab active={activeView === "import"} icon={<FileJson size={15} />} label="Import" onPress={() => selectView("import")} />
+          <ViewTab active={activeView === "settings"} icon={<FolderCog size={15} />} label="Settings" onPress={openSettingsPanel} />
         </div>
 
-        <section ref={accountsSectionRef} className="scroll-mt-20">
-          <Card className="overflow-hidden border border-slate-200 bg-white shadow-sm">
-          <Card.Header className="cube-accounts-header border-b border-slate-200 px-4 py-3 sm:px-5 sm:py-4">
-            <div className="cube-accounts-title min-w-0">
-              <div className="flex min-w-0 items-center gap-2.5">
-                <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-slate-100 text-slate-700">
-                  <Database size={16} />
-                </div>
-                <div className="min-w-0">
-                  <h2 className="text-base font-semibold leading-5 text-slate-950">Accounts</h2>
-                  <p className="path-text text-xs text-slate-500">
-                    {accounts.length} profiles · Active: {accountName(activeAccount)}
-                  </p>
-                </div>
-              </div>
-              <div className="cube-accounts-chips">
-                <Chip color="success" size="sm" variant="soft">
-                  {readyCount} ready
-                </Chip>
-                <Chip color="accent" size="sm" variant="soft">
-                  {eligibleCount} lb
-                </Chip>
-                <Chip color={missingConfigCount ? "warning" : "success"} size="sm" variant="soft">
-                  {missingConfigCount} missing settings
-                </Chip>
-              </div>
+        {activeView === "accounts" && (
+          <>
+            <div className="hidden grid-cols-2 gap-2 min-[640px]:gap-3 lg:grid xl:grid-cols-4">
+              <MetricCard icon={<Database size={18} />} label="Accounts" value={accounts.length.toString()} status="success" />
+              <MetricCard icon={<CheckCircle2 size={18} />} label="Ready Pool" value={readyCount.toString()} status="success" />
+              <MetricCard icon={<Route size={18} />} label="LB Eligible" value={eligibleCount.toString()} status="warning" />
+              <MetricCard icon={<CircleSlash size={18} />} label="Missing Settings" value={missingConfigCount.toString()} status="danger" />
             </div>
-            <div className="cube-account-toolbar">
-              <Button
-                aria-label="Switch selected account"
-                className="cube-action-button gap-2"
-                isDisabled={!selected || busy}
-                size="sm"
-                variant="primary"
-                onPress={activateAccount}
-              >
-                <Play size={15} />
-                <span className="cube-action-label">Switch</span>
-              </Button>
-              <Button
-                aria-label="Import current live auth"
-                className="cube-action-button gap-2"
-                isDisabled={busy}
-                size="sm"
-                variant="secondary"
-                onPress={importLive}
-              >
-                <UploadCloud size={15} />
-                <span className="cube-action-label">Import live</span>
-              </Button>
-            </div>
-          </Card.Header>
-          <Card.Content className="p-0">
-            {!loading && accounts.length > 0 && (
-              <QuotaOverview
-                accounts={accounts}
-                busy={busy}
-                quotas={quotas}
-                selectedId={selectedId}
-                onRefreshAll={refreshAllQuotas}
-                onSelect={(id) => setSelectedId(id)}
-              />
-            )}
-            {loading ? (
-              <div className="space-y-3 p-5">
-                <Skeleton className="h-16 rounded-xl" />
-                <Skeleton className="h-16 rounded-xl" />
-                <Skeleton className="h-16 rounded-xl" />
-              </div>
-            ) : (
-              <>
-                <div className="grid gap-3 p-3 sm:grid-cols-2 lg:hidden">
-                  {accounts.length ? (
-                    accounts.map((account) => (
-                      <MobileAccountCard
-                        key={account.id}
-                        account={account}
-                        isSelected={account.id === selectedId}
-                        quota={quotas[account.id]}
-                        usage={usages[account.id]}
-                        onFetchQuota={() => fetchQuota(account.id)}
-                        onFetchUsage={() => fetchUsage(account.id)}
-                        onSelect={() => setSelectedId(account.id)}
-                      />
-                    ))
-                  ) : (
-                    <EmptyState size="md" className="py-8">
-                      <EmptyState.Media variant="icon">
-                        <Database size={24} />
-                      </EmptyState.Media>
-                      <EmptyState.Title>No accounts yet</EmptyState.Title>
-                      <EmptyState.Description>Import your current Codex profile or upload an auth.json snapshot.</EmptyState.Description>
-                    </EmptyState>
+
+            <section className="cube-view-panel">
+              <Card className="overflow-hidden border border-slate-200 bg-white shadow-sm">
+                <Card.Header className="cube-accounts-header border-b border-slate-200 px-4 py-3 sm:px-5 sm:py-4">
+                  <div className="cube-accounts-title min-w-0">
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-slate-100 text-slate-700">
+                        <Database size={16} />
+                      </div>
+                      <div className="min-w-0">
+                        <h2 className="text-base font-semibold leading-5 text-slate-950">Accounts</h2>
+                        <p className="path-text text-xs text-slate-500">
+                          {accounts.length} profiles · Active: {accountName(activeAccount)}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="cube-accounts-chips">
+                      <Chip color="success" size="sm" variant="soft">
+                        {readyCount} ready
+                      </Chip>
+                      <Chip color="accent" size="sm" variant="soft">
+                        {eligibleCount} lb
+                      </Chip>
+                      <Chip color={missingConfigCount ? "warning" : "success"} size="sm" variant="soft">
+                        {missingConfigCount} missing settings
+                      </Chip>
+                    </div>
+                  </div>
+                  <div className="cube-account-toolbar">
+                    <Button
+                      aria-label="Switch selected account"
+                      className="cube-action-button gap-2"
+                      isDisabled={!selected || busy}
+                      size="sm"
+                      variant="primary"
+                      onPress={activateAccount}
+                    >
+                      <Play size={15} />
+                      <span className="cube-action-label">Switch</span>
+                    </Button>
+                    <Button
+                      aria-label="Import current live auth"
+                      className="cube-action-button gap-2"
+                      isDisabled={busy}
+                      size="sm"
+                      variant="secondary"
+                      onPress={importLive}
+                    >
+                      <UploadCloud size={15} />
+                      <span className="cube-action-label">Import live</span>
+                    </Button>
+                  </div>
+                </Card.Header>
+                <Card.Content className="p-0">
+                  {!loading && accounts.length > 0 && (
+                    <QuotaOverview
+                      accounts={accounts}
+                      busy={busy}
+                      quotas={quotas}
+                      selectedId={selectedId}
+                      onRefreshAll={refreshAllQuotas}
+                      onSelect={(id) => setSelectedId(id)}
+                    />
                   )}
-                </div>
-                <div className="hidden lg:block">
-                  <DataGrid
-                    aria-label="Codex accounts"
-                    allowsColumnResize
-                    className="account-grid"
-                    columns={columns}
-                    contentClassName="min-w-[1080px]"
-                    data={accounts}
-                    getRowId={(account) => account.id}
-                    onRowAction={(key) => setSelectedId(String(key))}
-                    onSelectionChange={(keys) => {
-                      if (keys === "all") return;
-                      const first = Array.from(keys)[0];
-                      if (first) setSelectedId(String(first));
-                    }}
-                    renderEmptyState={() => (
-                      <EmptyState size="lg" className="py-12">
-                        <EmptyState.Media variant="icon">
-                          <Database size={28} />
-                        </EmptyState.Media>
-                        <EmptyState.Title>No accounts yet</EmptyState.Title>
-                        <EmptyState.Description>Import your current Codex profile or upload an auth.json snapshot.</EmptyState.Description>
-                      </EmptyState>
-                    )}
-                    scrollContainerClassName="max-h-[calc(100vh-310px)] min-h-[360px] overflow-auto"
-                    selectedKeys={selectedKeys}
-                    selectionBehavior="replace"
-                    selectionMode="single"
-                    variant="secondary"
-                  />
-                </div>
-              </>
-            )}
-          </Card.Content>
-        </Card>
-        </section>
+                  {loading ? (
+                    <div className="space-y-3 p-5">
+                      <Skeleton className="h-16 rounded-xl" />
+                      <Skeleton className="h-16 rounded-xl" />
+                      <Skeleton className="h-16 rounded-xl" />
+                    </div>
+                  ) : (
+                    <div className="account-card-grid p-3 sm:p-4">
+                      {accounts.length ? (
+                        accounts.map((account) => (
+                          <MobileAccountCard
+                            key={account.id}
+                            account={account}
+                            isSelected={account.id === selectedId}
+                            quota={quotas[account.id]}
+                            usage={usages[account.id]}
+                            onFetchQuota={() => fetchQuota(account.id)}
+                            onFetchUsage={() => fetchUsage(account.id)}
+                            onSelect={() => setSelectedId(account.id)}
+                          />
+                        ))
+                      ) : (
+                        <EmptyState size="md" className="account-card-grid__empty py-8">
+                          <EmptyState.Media variant="icon">
+                            <Database size={24} />
+                          </EmptyState.Media>
+                          <EmptyState.Title>No accounts yet</EmptyState.Title>
+                          <EmptyState.Description>Import your current Codex profile or upload an auth.json snapshot.</EmptyState.Description>
+                        </EmptyState>
+                      )}
+                    </div>
+                  )}
+                </Card.Content>
+              </Card>
+            </section>
+          </>
+        )}
 
-        <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
-          <section ref={lbSectionRef} className="scroll-mt-20">
-          <Card className="border border-slate-200 bg-white shadow-sm">
-            <Card.Header className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
-              <div>
-                <h2 className="text-base font-semibold text-slate-950">Load balancer</h2>
-                <p className="text-xs text-slate-500">Round-robin account assignment for `cube run`.</p>
-              </div>
-              <Chip color="success" variant="soft">
-                {eligibleCount} eligible
-              </Chip>
-            </Card.Header>
-            <Card.Content className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto] md:items-center">
-              <div className="min-w-0 rounded-lg bg-slate-50 p-3">
-                <div className="text-xs font-medium uppercase text-slate-500">Last selected</div>
-                <div className="path-text mt-1 font-mono text-sm text-slate-800">{lb?.lastAccountId || "-"}</div>
-              </div>
-              <div className="flex gap-2">
-                <Button className="gap-2" variant="primary" onPress={pickNext}>
-                  <Play size={15} />
-                  Pick next
-                </Button>
-                <Button className="gap-2" variant="secondary" onPress={resetLB}>
-                  <RotateCcw size={15} />
-                  Reset
-                </Button>
-              </div>
-            </Card.Content>
-          </Card>
+        {activeView === "load-balancer" && (
+          <section className="cube-view-panel">
+            <Card className="border border-slate-200 bg-white shadow-sm">
+              <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+                <div className="min-w-0">
+                  <h2 className="text-base font-semibold text-slate-950">Load balancer</h2>
+                  <p className="text-xs text-slate-500">Round-robin account assignment for `cube run`.</p>
+                </div>
+                <Chip color="success" variant="soft">
+                  {eligibleCount} eligible
+                </Chip>
+              </Card.Header>
+              <Card.Content className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto] md:items-center">
+                <div className="min-w-0 rounded-lg bg-slate-50 p-3">
+                  <div className="text-xs font-medium uppercase text-slate-500">Last selected</div>
+                  <div className="path-text mt-1 font-mono text-sm text-slate-800">{lb?.lastAccountId || "-"}</div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button className="gap-2" variant="primary" onPress={pickNext}>
+                    <Play size={15} />
+                    Pick next
+                  </Button>
+                  <Button className="gap-2" variant="secondary" onPress={resetLB}>
+                    <RotateCcw size={15} />
+                    Reset
+                  </Button>
+                </div>
+              </Card.Content>
+            </Card>
           </section>
+        )}
 
-          <section ref={importSectionRef} className="scroll-mt-20">
-          <Card className="border border-slate-200 bg-white shadow-sm">
-            <Card.Header className="border-b border-slate-200 px-5 py-4">
-              <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
-                <UploadCloud size={17} />
-                Import auth.json
-              </h2>
-            </Card.Header>
-            <Card.Content>
-              <DropZone>
-                <DropZone.Area className="min-h-32 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-5 text-center">
-                  <DropZone.Icon>
-                    <FileJson size={26} />
-                  </DropZone.Icon>
-                  <DropZone.Label>Drop or choose auth.json</DropZone.Label>
-                  <DropZone.Description>Raw Codex auth.json or cube20 profile JSON</DropZone.Description>
-                  <DropZone.Input accept=".json,application/json" onSelect={uploadFiles} />
-                </DropZone.Area>
-              </DropZone>
-            </Card.Content>
-          </Card>
+        {activeView === "import" && (
+          <section className="cube-view-panel">
+            <Card className="border border-slate-200 bg-white shadow-sm">
+              <Card.Header className="border-b border-slate-200 px-5 py-4">
+                <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
+                  <UploadCloud size={17} />
+                  Import auth.json
+                </h2>
+              </Card.Header>
+              <Card.Content>
+                <DropZone>
+                  <DropZone.Area className="min-h-32 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-5 text-center">
+                    <DropZone.Icon>
+                      <FileJson size={26} />
+                    </DropZone.Icon>
+                    <DropZone.Label>Drop or choose auth.json</DropZone.Label>
+                    <DropZone.Description>Raw Codex auth.json or cube20 profile JSON</DropZone.Description>
+                    <DropZone.Input accept=".json,application/json" onSelect={uploadFiles} />
+                  </DropZone.Area>
+                </DropZone>
+              </Card.Content>
+            </Card>
           </section>
-        </div>
+        )}
+
+        {activeView === "settings" && (
+          <section className="cube-view-panel">
+            <SettingsEditorCard />
+          </section>
+        )}
 
         {message && (
           <Card className="border border-teal-200 bg-teal-50 text-teal-900">
@@ -840,6 +715,56 @@ export default function App() {
       </div>
     </AppLayout>
   );
+
+  function SettingsEditorCard({ subtle = false }: { subtle?: boolean } = {}) {
+    return (
+      <Card className={subtle ? "border border-slate-200 shadow-none" : "border border-slate-200 bg-white shadow-sm"}>
+        <Card.Header className="border-b border-slate-100 px-4 py-3">
+          <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-950">
+            <FolderCog size={16} />
+            settings.toml
+          </h3>
+        </Card.Header>
+        <Card.Content className="gap-4">
+          <form className="flex flex-col gap-3" onSubmit={savePathSettings}>
+            <FieldLabel text="live_codex_home">
+              <Input
+                fullWidth
+                value={liveHome}
+                variant="secondary"
+                onChange={(event) => setLiveHome(event.currentTarget.value)}
+              />
+            </FieldLabel>
+            <FieldLabel text="accounts_dir">
+              <Input
+                fullWidth
+                value={accountsDir}
+                variant="secondary"
+                onChange={(event) => setAccountsDir(event.currentTarget.value)}
+              />
+            </FieldLabel>
+            <Button isDisabled={busy} type="submit" variant="primary">
+              Save paths
+            </Button>
+          </form>
+          <Separator />
+          <TextArea
+            className="min-h-44 font-mono text-xs leading-5"
+            fullWidth
+            rows={9}
+            value={settingsToml}
+            variant="secondary"
+            onChange={(event) => setSettingsToml(event.currentTarget.value)}
+          />
+          <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={saveRawSettings}>
+            <Save size={15} />
+            Save TOML
+          </Button>
+          <div className="path-text font-mono text-xs text-slate-500">{meta?.settingsPath}</div>
+        </Card.Content>
+      </Card>
+    );
+  }
 
   function DetailsPanel() {
     return (
@@ -908,51 +833,7 @@ export default function App() {
             </EmptyState>
           )}
 
-          <Card className="border border-slate-200 shadow-none">
-            <Card.Header className="border-b border-slate-100 px-4 py-3">
-              <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-950">
-                <FolderCog size={16} />
-                settings.toml
-              </h3>
-            </Card.Header>
-            <Card.Content className="gap-4">
-              <form className="flex flex-col gap-3" onSubmit={savePathSettings}>
-                <FieldLabel text="live_codex_home">
-                  <Input
-                    fullWidth
-                    value={liveHome}
-                    variant="secondary"
-                    onChange={(event) => setLiveHome(event.currentTarget.value)}
-                  />
-                </FieldLabel>
-                <FieldLabel text="accounts_dir">
-                  <Input
-                    fullWidth
-                    value={accountsDir}
-                    variant="secondary"
-                    onChange={(event) => setAccountsDir(event.currentTarget.value)}
-                  />
-                </FieldLabel>
-                <Button isDisabled={busy} type="submit" variant="primary">
-                  Save paths
-                </Button>
-              </form>
-              <Separator />
-              <TextArea
-                className="min-h-44 font-mono text-xs leading-5"
-                fullWidth
-                rows={9}
-                value={settingsToml}
-                variant="secondary"
-                onChange={(event) => setSettingsToml(event.currentTarget.value)}
-              />
-              <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={saveRawSettings}>
-                <Save size={15} />
-                Save TOML
-              </Button>
-              <div className="path-text font-mono text-xs text-slate-500">{meta?.settingsPath}</div>
-            </Card.Content>
-          </Card>
+          <SettingsEditorCard subtle />
         </div>
       </div>
     );
@@ -1056,6 +937,7 @@ function QuotaProviderCard({
 }) {
   const windows = quota?.quotas || [];
   const tightestWindow = [...windows].sort((a, b) => b.usedPercent - a.usedPercent)[0];
+  const hint = quotaHint(quota);
   const headline =
     quota?.status === "supported" && windows.length
       ? `${tightestWindow.remainingDisplay} left`
@@ -1077,7 +959,7 @@ function QuotaProviderCard({
     <button
       aria-label={`Select ${accountName(account)} quota card`}
       className={`quota-provider-card status-${severity}${isSelected ? " is-selected" : ""}`}
-      title={quota?.detail || account.codexHome}
+      title={hint || quota?.detail || account.codexHome}
       type="button"
       onClick={onSelect}
     >
@@ -1108,7 +990,7 @@ function QuotaProviderCard({
           })}
         </div>
       ) : (
-        <div className="quota-provider-empty">{quota?.detail || (account.authPresent ? "Waiting for quota data" : "auth.json missing")}</div>
+        <div className="quota-provider-empty">{hint || (account.authPresent ? "Waiting for quota data" : "auth.json missing")}</div>
       )}
     </button>
   );
@@ -1129,6 +1011,8 @@ function NavItem({
 }) {
   return (
     <button
+      aria-current={active ? "page" : undefined}
+      aria-pressed={active}
       className={`cube-nav-button flex h-10 w-full items-center gap-3 rounded-xl px-3 text-left text-sm ${
         active ? "bg-slate-950 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"
       }`}
@@ -1142,6 +1026,34 @@ function NavItem({
           {badge}
         </span>
       )}
+    </button>
+  );
+}
+
+function ViewTab({
+  active,
+  badge,
+  icon,
+  label,
+  onPress,
+}: {
+  active: boolean;
+  badge?: string;
+  icon: ReactNode;
+  label: string;
+  onPress: () => void;
+}) {
+  return (
+    <button
+      aria-selected={active}
+      className={`cube-view-tab${active ? " is-active" : ""}`}
+      role="tab"
+      type="button"
+      onClick={onPress}
+    >
+      {icon}
+      <span>{label}</span>
+      {badge && <strong>{badge}</strong>}
     </button>
   );
 }
@@ -1164,6 +1076,7 @@ function MobileAccountCard({
   usage?: UsageSummary;
 }) {
   const summary = quotaSummary(quota);
+  const hint = quotaHint(quota);
 
   return (
     <div
@@ -1226,6 +1139,7 @@ function MobileAccountCard({
               </Button>
             </div>
             <ProgressBar aria-label="Quota remaining" color={summary.color} size="sm" value={summary.value} />
+            {hint && <div className="quota-card-hint mt-2 text-xs leading-5 text-slate-500">{hint}</div>}
           </div>
 
           <div className="mt-3 flex items-center justify-between gap-2 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
