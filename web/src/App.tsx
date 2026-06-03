@@ -132,7 +132,7 @@ interface LoadBalanceStatus {
   excluded: LoadBalanceAccount[];
 }
 
-type DashboardView = "accounts" | "load-balancer" | "import" | "settings";
+type DashboardView = "accounts" | "load-balancer" | "runtime" | "import" | "settings";
 
 async function apiJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
@@ -274,6 +274,17 @@ export default function App() {
     }
   }, [accounts, loading]);
 
+  useEffect(() => {
+    if (loading || !accounts.some((account) => account.authPresent)) return;
+    const timer = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      for (const account of accounts) {
+        if (account.authPresent) void fetchQuota(account.id, true);
+      }
+    }, 180_000);
+    return () => window.clearInterval(timer);
+  }, [accounts, loading]);
+
   function selectView(view: DashboardView) {
     setActiveView(view);
     if (compactShell) setSidebarOpen(false);
@@ -281,6 +292,10 @@ export default function App() {
 
   function openSettingsPanel() {
     selectView("settings");
+  }
+
+  function openRuntimePanel() {
+    selectView("runtime");
   }
 
   async function withBusy(action: () => Promise<void>) {
@@ -394,6 +409,18 @@ export default function App() {
     });
   }
 
+  async function saveRuntimeSettingsPath(event: FormEvent) {
+    event.preventDefault();
+    await withBusy(async () => {
+      await apiJSON<Meta>("/api/settings", {
+        method: "PATCH",
+        body: JSON.stringify({ liveCodexHome: liveHome, accountsDir, sharedSettingsPath: sharedConfigPath }),
+      });
+      setMessage("Runtime path saved");
+      await loadAll(selectedId);
+    });
+  }
+
   async function saveRawSettings() {
     await withBusy(async () => {
       const settings = await apiJSON<SettingsPayload>("/api/settings", {
@@ -465,6 +492,7 @@ export default function App() {
           badge={eligibleCount.toString()}
           onPress={() => selectView("load-balancer")}
         />
+        <NavItem icon={<Settings size={17} />} label="Runtime" active={activeView === "runtime"} onPress={openRuntimePanel} />
         <NavItem icon={<FileJson size={17} />} label="Import auth" active={activeView === "import"} onPress={() => selectView("import")} />
         <NavItem icon={<FolderCog size={17} />} label="Settings" active={activeView === "settings"} onPress={openSettingsPanel} />
       </div>
@@ -557,6 +585,7 @@ export default function App() {
             label="LB"
             onPress={() => selectView("load-balancer")}
           />
+          <ViewTab active={activeView === "runtime"} icon={<Settings size={15} />} label="Runtime" onPress={openRuntimePanel} />
           <ViewTab active={activeView === "import"} icon={<FileJson size={15} />} label="Import" onPress={() => selectView("import")} />
           <ViewTab active={activeView === "settings"} icon={<FolderCog size={15} />} label="Settings" onPress={openSettingsPanel} />
         </div>
@@ -733,10 +762,15 @@ export default function App() {
           </section>
         )}
 
-        {activeView === "settings" && (
-          <section className="cube-view-panel flex flex-col gap-4">
-            <SettingsEditorCard />
+        {activeView === "runtime" && (
+          <section className="cube-view-panel">
             <SharedSettingsCard />
+          </section>
+        )}
+
+        {activeView === "settings" && (
+          <section className="cube-view-panel">
+            <SettingsEditorCard />
           </section>
         )}
 
@@ -779,14 +813,6 @@ export default function App() {
                 onChange={(event) => setAccountsDir(event.currentTarget.value)}
               />
             </FieldLabel>
-            <FieldLabel text="shared_settings_path">
-              <Input
-                fullWidth
-                value={sharedConfigPath}
-                variant="secondary"
-                onChange={(event) => setSharedConfigPath(event.currentTarget.value)}
-              />
-            </FieldLabel>
             <Button isDisabled={busy} type="submit" variant="primary">
               Save paths
             </Button>
@@ -820,9 +846,20 @@ export default function App() {
           </h3>
         </Card.Header>
         <Card.Content className="gap-4">
-          <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
-            <div className="path-text font-mono">{sharedConfigPath || meta?.sharedSettingsPath || meta?.sharedConfigPath || "-"}</div>
-          </div>
+          <form className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end" onSubmit={saveRuntimeSettingsPath}>
+            <FieldLabel text="shared_settings_path">
+              <Input
+                fullWidth
+                value={sharedConfigPath}
+                variant="secondary"
+                onChange={(event) => setSharedConfigPath(event.currentTarget.value)}
+              />
+            </FieldLabel>
+            <Button isDisabled={busy} type="submit" variant="secondary">
+              Save path
+            </Button>
+          </form>
+          <Separator />
           <TextArea
             className="min-h-64 font-mono text-xs leading-5"
             fullWidth
@@ -913,7 +950,6 @@ export default function App() {
           )}
 
           <SettingsEditorCard subtle />
-          <SharedSettingsCard subtle />
         </div>
       </div>
     );
