@@ -28,7 +28,6 @@ import {
   RotateCcw,
   Route,
   Save,
-  Settings,
   ShieldCheck,
   Trash2,
   UploadCloud,
@@ -71,13 +70,6 @@ interface SettingsPayload {
   accountsDir: string;
   sharedConfigPath: string;
   sharedSettingsPath?: string;
-}
-
-interface CodexConfigPayload {
-  configPath: string;
-  configToml: string;
-  configPresent: boolean;
-  configUpdated?: string;
 }
 
 interface QuotaItem {
@@ -179,7 +171,7 @@ interface PersonalPayload {
 }
 
 type AccessMode = "unknown" | "admin" | "personal";
-type DashboardView = "accounts" | "load-balancer" | "people" | "runtime" | "import" | "settings";
+type DashboardView = "accounts" | "load-balancer" | "people" | "import" | "settings";
 
 const CLOUD_TOKEN_KEY = "cube20.cloudToken";
 let cloudTokenSynced = false;
@@ -441,9 +433,7 @@ export default function App() {
   const [status, setStatus] = useState<AccountStatus>("ready");
   const [liveHome, setLiveHome] = useState("");
   const [accountsDir, setAccountsDir] = useState("");
-  const [sharedConfigPath, setSharedConfigPath] = useState("");
   const [settingsToml, setSettingsToml] = useState("");
-  const [sharedConfigToml, setSharedConfigToml] = useState("");
   const [quotas, setQuotas] = useState<Record<string, QuotaResult>>({});
   const [stats, setStats] = useState<Record<string, AccountUsage>>({});
   const [clients, setClients] = useState<Client[]>([]);
@@ -489,12 +479,11 @@ export default function App() {
   async function loadAll(preferredId = selectedId) {
     setLoading(true);
     try {
-      const [metaData, accountData, lbData, settingsData, codexConfigData, statsData, clientData, queueData] = await Promise.all([
+      const [metaData, accountData, lbData, settingsData, statsData, clientData, queueData] = await Promise.all([
         apiJSON<Meta>("/api/meta"),
         apiJSON<Account[]>("/api/accounts"),
         apiJSON<LoadBalanceStatus>("/api/lb/status"),
         apiJSON<SettingsPayload>("/api/settings"),
-        apiJSON<CodexConfigPayload>("/api/codex-config"),
         apiJSON<Record<string, AccountUsage>>("/api/stats"),
         apiJSON<Client[]>("/api/clients"),
         apiJSON<RefreshQueueItem[]>("/api/refresh-queue"),
@@ -507,9 +496,7 @@ export default function App() {
       setRefreshQueue(queueData);
       setLiveHome(settingsData.liveCodexHome);
       setAccountsDir(settingsData.accountsDir);
-      setSharedConfigPath(settingsData.sharedSettingsPath || settingsData.sharedConfigPath || codexConfigData.configPath);
       setSettingsToml(settingsData.settingsToml);
-      setSharedConfigToml(codexConfigData.configToml);
       if (!accountData.some((account) => account.id === preferredId)) {
         setSelectedId(accountData.find((account) => account.active)?.id || accountData[0]?.id || "");
       }
@@ -578,10 +565,6 @@ export default function App() {
 
   function openSettingsPanel() {
     selectView("settings");
-  }
-
-  function openRuntimePanel() {
-    selectView("runtime");
   }
 
   async function withBusy(action: () => Promise<void>) {
@@ -682,21 +665,9 @@ export default function App() {
     await withBusy(async () => {
       await apiJSON<Meta>("/api/settings", {
         method: "PATCH",
-        body: JSON.stringify({ liveCodexHome: liveHome, accountsDir, sharedSettingsPath: sharedConfigPath }),
+        body: JSON.stringify({ liveCodexHome: liveHome, accountsDir }),
       });
       setMessage("Settings paths saved");
-      await loadAll(selectedId);
-    });
-  }
-
-  async function saveRuntimeSettingsPath(event: FormEvent) {
-    event.preventDefault();
-    await withBusy(async () => {
-      await apiJSON<Meta>("/api/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ liveCodexHome: liveHome, accountsDir, sharedSettingsPath: sharedConfigPath }),
-      });
-      setMessage("Runtime path saved");
       await loadAll(selectedId);
     });
   }
@@ -709,22 +680,8 @@ export default function App() {
       });
       setLiveHome(settings.liveCodexHome);
       setAccountsDir(settings.accountsDir);
-      setSharedConfigPath(settings.sharedSettingsPath || settings.sharedConfigPath);
       setSettingsToml(settings.settingsToml);
       setMessage("settings.toml saved");
-      await loadAll(selectedId);
-    });
-  }
-
-  async function saveSharedConfig() {
-    await withBusy(async () => {
-      const config = await apiJSON<CodexConfigPayload>("/api/codex-config", {
-        method: "PUT",
-        body: JSON.stringify({ configToml: sharedConfigToml }),
-      });
-      setSharedConfigPath(config.configPath);
-      setSharedConfigToml(config.configToml);
-      setMessage("Shared settings saved");
       await loadAll(selectedId);
     });
   }
@@ -819,7 +776,6 @@ export default function App() {
           badge={activeClientCount.toString()}
           onPress={() => selectView("people")}
         />
-        <NavItem icon={<Settings size={17} />} label="Runtime" active={activeView === "runtime"} onPress={openRuntimePanel} />
         <NavItem icon={<FileJson size={17} />} label="Import auth" active={activeView === "import"} onPress={() => selectView("import")} />
         <NavItem icon={<FolderCog size={17} />} label="Settings" active={activeView === "settings"} onPress={openSettingsPanel} />
       </div>
@@ -934,33 +890,6 @@ export default function App() {
       sidebarVariant="sidebar"
     >
       <div className="cube-content mx-auto flex w-full max-w-[1500px] flex-col gap-4 p-3 sm:p-4 lg:gap-5 lg:p-6">
-        <div className="cube-view-tabs" role="tablist" aria-label="Dashboard views">
-          <ViewTab
-            active={activeView === "accounts"}
-            badge={accounts.length.toString()}
-            icon={<Database size={15} />}
-            label="Accounts"
-            onPress={() => selectView("accounts")}
-          />
-          <ViewTab
-            active={activeView === "load-balancer"}
-            badge={eligibleCount.toString()}
-            icon={<Route size={15} />}
-            label="LB"
-            onPress={() => selectView("load-balancer")}
-          />
-          <ViewTab
-            active={activeView === "people"}
-            badge={activeClientCount.toString()}
-            icon={<Users size={15} />}
-            label="People"
-            onPress={() => selectView("people")}
-          />
-          <ViewTab active={activeView === "runtime"} icon={<Settings size={15} />} label="Runtime" onPress={openRuntimePanel} />
-          <ViewTab active={activeView === "import"} icon={<FileJson size={15} />} label="Import" onPress={() => selectView("import")} />
-          <ViewTab active={activeView === "settings"} icon={<FolderCog size={15} />} label="Settings" onPress={openSettingsPanel} />
-        </div>
-
         {activeView === "accounts" && (
           <>
             <div className="hidden grid-cols-2 gap-2 min-[640px]:gap-3 lg:grid xl:grid-cols-4">
@@ -1252,12 +1181,6 @@ export default function App() {
           </section>
         )}
 
-        {activeView === "runtime" && (
-          <section className="cube-view-panel">
-            <SharedSettingsCard />
-          </section>
-        )}
-
         {activeView === "settings" && (
           <section className="cube-view-panel">
             <SettingsEditorCard />
@@ -1321,47 +1244,6 @@ export default function App() {
             Save TOML
           </Button>
           <div className="path-text font-mono text-xs text-slate-500">{meta?.settingsPath}</div>
-        </Card.Content>
-      </Card>
-    );
-  }
-
-  function SharedSettingsCard({ subtle = false }: { subtle?: boolean } = {}) {
-    return (
-      <Card className={subtle ? "border border-slate-200 shadow-none" : "border border-slate-200 bg-white shadow-sm"}>
-        <Card.Header className="border-b border-slate-100 px-4 py-3">
-          <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-950">
-            <Settings size={16} />
-            Shared settings.toml
-          </h3>
-        </Card.Header>
-        <Card.Content className="gap-4">
-          <form className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end" onSubmit={saveRuntimeSettingsPath}>
-            <FieldLabel text="shared_settings_path">
-              <Input
-                fullWidth
-                value={sharedConfigPath}
-                variant="secondary"
-                onChange={(event) => setSharedConfigPath(event.currentTarget.value)}
-              />
-            </FieldLabel>
-            <Button isDisabled={busy} type="submit" variant="secondary">
-              Save path
-            </Button>
-          </form>
-          <Separator />
-          <TextArea
-            className="min-h-64 font-mono text-xs leading-5"
-            fullWidth
-            rows={14}
-            value={sharedConfigToml}
-            variant="secondary"
-            onChange={(event) => setSharedConfigToml(event.currentTarget.value)}
-          />
-          <Button className="gap-2" isDisabled={busy} variant="primary" onPress={saveSharedConfig}>
-            <Save size={15} />
-            Save shared settings
-          </Button>
         </Card.Content>
       </Card>
     );
@@ -1841,34 +1723,6 @@ function NavItem({
           {badge}
         </span>
       )}
-    </button>
-  );
-}
-
-function ViewTab({
-  active,
-  badge,
-  icon,
-  label,
-  onPress,
-}: {
-  active: boolean;
-  badge?: string;
-  icon: ReactNode;
-  label: string;
-  onPress: () => void;
-}) {
-  return (
-    <button
-      aria-selected={active}
-      className={`cube-view-tab${active ? " is-active" : ""}`}
-      role="tab"
-      type="button"
-      onClick={onPress}
-    >
-      {icon}
-      <span>{label}</span>
-      {badge && <strong>{badge}</strong>}
     </button>
   );
 }
