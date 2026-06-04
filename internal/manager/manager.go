@@ -181,21 +181,28 @@ type roundRobinState struct {
 }
 
 type LoadBalanceAccount struct {
-	ID             string           `json:"id"`
-	Label          string           `json:"label"`
-	Status         AccountStatus    `json:"status"`
-	AuthPresent    bool             `json:"authPresent"`
-	ConfigPresent  bool             `json:"configPresent"`
-	Active         bool             `json:"active"`
-	CodexHome      string           `json:"codexHome"`
-	OwnerMode      AccountOwnerMode `json:"ownerMode"`
-	OwnerClientID  string           `json:"ownerClientId,omitempty"`
-	Generation     int64            `json:"generation"`
-	LeaseActive    bool             `json:"leaseActive"`
-	LeaseClientID  string           `json:"leaseClientId,omitempty"`
-	LeaseExpiresAt time.Time        `json:"leaseExpiresAt,omitempty"`
-	Eligible       bool             `json:"eligible"`
-	Reason         string           `json:"reason,omitempty"`
+	ID                    string           `json:"id"`
+	Label                 string           `json:"label"`
+	Status                AccountStatus    `json:"status"`
+	AuthPresent           bool             `json:"authPresent"`
+	ConfigPresent         bool             `json:"configPresent"`
+	Active                bool             `json:"active"`
+	CodexHome             string           `json:"codexHome"`
+	OwnerMode             AccountOwnerMode `json:"ownerMode"`
+	OwnerClientID         string           `json:"ownerClientId,omitempty"`
+	Generation            int64            `json:"generation"`
+	LeaseActive           bool             `json:"leaseActive"`
+	LeaseClientID         string           `json:"leaseClientId,omitempty"`
+	LeaseExpiresAt        time.Time        `json:"leaseExpiresAt,omitempty"`
+	Eligible              bool             `json:"eligible"`
+	Reason                string           `json:"reason,omitempty"`
+	QuotaStatus           quota.Status     `json:"quotaStatus,omitempty"`
+	QuotaRemainingDisplay string           `json:"quotaRemainingDisplay,omitempty"`
+	QuotaRemainingPercent float64          `json:"quotaRemainingPercent,omitempty"`
+	QuotaUsedPercent      float64          `json:"quotaUsedPercent,omitempty"`
+	QuotaResetsAt         string           `json:"quotaResetsAt,omitempty"`
+	QuotaUpdatedAt        time.Time        `json:"quotaUpdatedAt,omitempty"`
+	QuotaScore            float64          `json:"quotaScore,omitempty"`
 }
 
 type LoadBalanceStatus struct {
@@ -2360,23 +2367,32 @@ func (m *Manager) SelectAccountForRun() (AccountView, error) {
 	if err != nil {
 		return AccountView{}, err
 	}
+	state, err := m.Load()
+	if err != nil {
+		return AccountView{}, err
+	}
 
-	available := make([]AccountView, 0, len(accounts))
+	type candidate struct {
+		account AccountView
+		score   float64
+	}
+	available := make([]candidate, 0, len(accounts))
 	now := time.Now()
 	for _, account := range accounts {
-		if account.OwnerMode == OwnerCloud && account.Status == StatusReady && account.AuthPresent && !accountLeaseActive(account.Account, now) {
-			available = append(available, account)
+		evaluation := loadBalanceEligibility(account, state.QuotaCache[account.ID], now)
+		if evaluation.Eligible {
+			available = append(available, candidate{account: account, score: evaluation.QuotaScore})
 		}
 	}
 	if len(available) == 0 {
-		return AccountView{}, errors.New("no ready account with auth.json is available")
+		return AccountView{}, errors.New("no ready, unleased account with auth.json and available 5h quota is available")
 	}
-	if len(available) == 1 {
-		if err := m.saveRoundRobinState(roundRobinState{LastAccountID: available[0].ID}); err != nil {
-			return AccountView{}, err
+	sort.Slice(available, func(i, j int) bool {
+		if !sameLoadBalanceScore(available[i].score, available[j].score) {
+			return available[i].score > available[j].score
 		}
-		return available[0], nil
-	}
+		return available[i].account.ID < available[j].account.ID
+	})
 
 	roundRobin, err := m.loadRoundRobinState()
 	if err != nil {
@@ -2384,18 +2400,19 @@ func (m *Manager) SelectAccountForRun() (AccountView, error) {
 	}
 	selected := available[0]
 	if roundRobin.LastAccountID != "" {
-		for i, account := range available {
-			if account.ID == roundRobin.LastAccountID {
-				selected = available[(i+1)%len(available)]
+		topLen := loadBalanceTopGroupLen(len(available), func(i int) float64 { return available[i].score })
+		for i := 0; i < topLen; i++ {
+			if available[i].account.ID == roundRobin.LastAccountID {
+				selected = available[(i+1)%topLen]
 				break
 			}
 		}
 	}
 
-	if err := m.saveRoundRobinState(roundRobinState{LastAccountID: selected.ID}); err != nil {
+	if err := m.saveRoundRobinState(roundRobinState{LastAccountID: selected.account.ID}); err != nil {
 		return AccountView{}, err
 	}
-	return selected, nil
+	return selected.account, nil
 }
 
 func (m *Manager) ClaimLease(ctx context.Context, clientID, holder string, ttl time.Duration) (LeaseSnapshot, error) {
@@ -2420,22 +2437,27 @@ func (m *Manager) ClaimLease(ctx context.Context, clientID, holder string, ttl t
 	type candidate struct {
 		index   int
 		account Account
+		score   float64
 	}
 	available := []candidate{}
 	for i, account := range state.Accounts {
-		if account.OwnerMode != OwnerCloud || account.Status != StatusReady || !m.accountAuthPresent(account) || accountLeaseActive(account, now) {
+		evaluation := loadBalanceEligibilityForAccount(account, m.accountAuthPresent(account), state.QuotaCache[account.ID], now)
+		if !evaluation.Eligible {
 			continue
 		}
-		available = append(available, candidate{index: i, account: account})
+		available = append(available, candidate{index: i, account: account, score: evaluation.QuotaScore})
 	}
 	sort.Slice(available, func(i, j int) bool {
+		if !sameLoadBalanceScore(available[i].score, available[j].score) {
+			return available[i].score > available[j].score
+		}
 		return available[i].account.ID < available[j].account.ID
 	})
 	if len(available) == 0 {
 		if err := m.Save(state); err != nil {
 			return LeaseSnapshot{}, err
 		}
-		return LeaseSnapshot{}, errors.New("no ready, unleased account with auth.json is available")
+		return LeaseSnapshot{}, errors.New("no ready, unleased account with auth.json and available 5h quota is available")
 	}
 
 	roundRobin, err := m.loadRoundRobinState()
@@ -2444,9 +2466,10 @@ func (m *Manager) ClaimLease(ctx context.Context, clientID, holder string, ttl t
 	}
 	selected := available[0]
 	if roundRobin.LastAccountID != "" {
-		for i, item := range available {
+		topLen := loadBalanceTopGroupLen(len(available), func(i int) float64 { return available[i].score })
+		for i, item := range available[:topLen] {
 			if item.account.ID == roundRobin.LastAccountID {
-				selected = available[(i+1)%len(available)]
+				selected = available[(i+1)%topLen]
 				break
 			}
 		}
@@ -2660,9 +2683,14 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 	if err != nil {
 		return LoadBalanceStatus{}, err
 	}
+	state, err := m.Load()
+	if err != nil {
+		return LoadBalanceStatus{}, err
+	}
+	now := time.Now()
 
 	status := LoadBalanceStatus{
-		Policy:        "round-robin",
+		Policy:        "quota-aware weighted round-robin",
 		StatePath:     filepath.Join(m.StateDir, roundRobinFileName),
 		LastAccountID: roundRobin.LastAccountID,
 		Eligible:      []LoadBalanceAccount{},
@@ -2684,30 +2712,187 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 			LeaseClientID:  account.LeaseClientID,
 			LeaseExpiresAt: account.LeaseExpiresAt,
 		}
-		entry.Eligible, entry.Reason = loadBalanceEligibility(account)
+		evaluation := loadBalanceEligibility(account, state.QuotaCache[account.ID], now)
+		entry.Eligible = evaluation.Eligible
+		entry.Reason = evaluation.Reason
+		entry.QuotaStatus = evaluation.QuotaStatus
+		entry.QuotaRemainingDisplay = evaluation.QuotaRemainingDisplay
+		entry.QuotaRemainingPercent = evaluation.QuotaRemainingPercent
+		entry.QuotaUsedPercent = evaluation.QuotaUsedPercent
+		entry.QuotaResetsAt = evaluation.QuotaResetsAt
+		entry.QuotaUpdatedAt = evaluation.QuotaUpdatedAt
+		entry.QuotaScore = evaluation.QuotaScore
 		if entry.Eligible {
 			status.Eligible = append(status.Eligible, entry)
 		} else {
 			status.Excluded = append(status.Excluded, entry)
 		}
 	}
+	sort.Slice(status.Eligible, func(i, j int) bool {
+		if !sameLoadBalanceScore(status.Eligible[i].QuotaScore, status.Eligible[j].QuotaScore) {
+			return status.Eligible[i].QuotaScore > status.Eligible[j].QuotaScore
+		}
+		return status.Eligible[i].ID < status.Eligible[j].ID
+	})
+	sort.Slice(status.Excluded, func(i, j int) bool {
+		return status.Excluded[i].ID < status.Excluded[j].ID
+	})
 	return status, nil
 }
 
-func loadBalanceEligibility(account AccountView) (bool, string) {
-	if account.OwnerMode != OwnerCloud {
-		return false, fmt.Sprintf("owner is %s", account.OwnerMode)
+const (
+	loadBalanceMinFiveHourRemaining = 5.0
+	loadBalanceNearResetWindow      = 90 * time.Minute
+	loadBalanceNearResetBonus       = 25.0
+	loadBalanceScoreEpsilon         = 0.01
+)
+
+type loadBalanceEvaluation struct {
+	Eligible              bool
+	Reason                string
+	QuotaStatus           quota.Status
+	QuotaRemainingDisplay string
+	QuotaRemainingPercent float64
+	QuotaUsedPercent      float64
+	QuotaResetsAt         string
+	QuotaUpdatedAt        time.Time
+	QuotaScore            float64
+}
+
+func loadBalanceEligibility(account AccountView, cache QuotaCache, now time.Time) loadBalanceEvaluation {
+	return evaluateLoadBalanceFields(
+		account.OwnerMode,
+		account.Status,
+		account.AuthPresent,
+		account.LeaseActive,
+		account.LeaseExpiresAt,
+		cache,
+		now,
+	)
+}
+
+func loadBalanceEligibilityForAccount(account Account, authPresent bool, cache QuotaCache, now time.Time) loadBalanceEvaluation {
+	return evaluateLoadBalanceFields(
+		account.OwnerMode,
+		account.Status,
+		authPresent,
+		accountLeaseActive(account, now),
+		account.LeaseExpiresAt,
+		cache,
+		now,
+	)
+}
+
+func evaluateLoadBalanceFields(ownerMode AccountOwnerMode, status AccountStatus, authPresent, leaseActive bool, leaseExpiresAt time.Time, cache QuotaCache, now time.Time) loadBalanceEvaluation {
+	evaluation := loadBalanceQuotaEvaluation(cache, now)
+	if ownerMode != OwnerCloud {
+		evaluation.Reason = fmt.Sprintf("owner is %s", ownerMode)
+		return evaluation
 	}
-	if account.Status != StatusReady {
-		return false, fmt.Sprintf("status is %s", account.Status)
+	if status != StatusReady {
+		evaluation.Reason = fmt.Sprintf("status is %s", status)
+		return evaluation
 	}
-	if !account.AuthPresent {
-		return false, "auth.json missing"
+	if !authPresent {
+		evaluation.Reason = "auth.json missing"
+		return evaluation
 	}
-	if account.LeaseActive {
-		return false, fmt.Sprintf("leased until %s", account.LeaseExpiresAt.Format(time.RFC3339))
+	if leaseActive {
+		evaluation.Reason = fmt.Sprintf("leased until %s", leaseExpiresAt.Format(time.RFC3339))
+		return evaluation
 	}
-	return true, ""
+	if evaluation.QuotaStatus == "" {
+		evaluation.Reason = "quota not checked"
+		return evaluation
+	}
+	if evaluation.QuotaStatus != quota.StatusSupported {
+		evaluation.Reason = fmt.Sprintf("quota is %s", evaluation.QuotaStatus)
+		return evaluation
+	}
+	if cache.FiveHour == nil {
+		evaluation.Reason = "5h quota missing"
+		return evaluation
+	}
+	resetAt := parseRFC3339(cache.FiveHour.ResetsAt)
+	if resetAt.IsZero() {
+		evaluation.Reason = "5h reset unknown"
+		return evaluation
+	}
+	if !resetAt.After(now) {
+		evaluation.Reason = "5h reset passed; refresh needed"
+		return evaluation
+	}
+	if cache.FiveHour.RemainingPercent <= loadBalanceMinFiveHourRemaining {
+		evaluation.Reason = fmt.Sprintf("5h quota exhausted until %s", resetAt.Format(time.RFC3339))
+		return evaluation
+	}
+	evaluation.Eligible = true
+	evaluation.Reason = ""
+	evaluation.QuotaScore = loadBalanceQuotaScore(*cache.FiveHour, now)
+	return evaluation
+}
+
+func loadBalanceQuotaEvaluation(cache QuotaCache, now time.Time) loadBalanceEvaluation {
+	evaluation := loadBalanceEvaluation{
+		QuotaStatus:    cache.Result.Status,
+		QuotaUpdatedAt: cache.UpdatedAt,
+	}
+	if cache.FiveHour == nil {
+		return evaluation
+	}
+	evaluation.QuotaRemainingDisplay = cache.FiveHour.RemainingDisplay
+	evaluation.QuotaRemainingPercent = clampPercent(cache.FiveHour.RemainingPercent)
+	evaluation.QuotaUsedPercent = clampPercent(cache.FiveHour.UsedPercent)
+	evaluation.QuotaResetsAt = cache.FiveHour.ResetsAt
+	return evaluation
+}
+
+func loadBalanceQuotaScore(window quota.Window, now time.Time) float64 {
+	remaining := clampPercent(window.RemainingPercent)
+	if remaining <= loadBalanceMinFiveHourRemaining {
+		return 0
+	}
+	score := remaining
+	resetAt := parseRFC3339(window.ResetsAt)
+	if resetAt.IsZero() {
+		return score
+	}
+	untilReset := resetAt.Sub(now)
+	if untilReset <= 0 {
+		return score
+	}
+	if untilReset < loadBalanceNearResetWindow {
+		pressure := 1 - (float64(untilReset) / float64(loadBalanceNearResetWindow))
+		score += pressure * loadBalanceNearResetBonus
+	}
+	return score
+}
+
+func loadBalanceTopGroupLen(length int, scoreAt func(int) float64) int {
+	if length == 0 {
+		return 0
+	}
+	topScore := scoreAt(0)
+	out := 1
+	for out < length && sameLoadBalanceScore(topScore, scoreAt(out)) {
+		out++
+	}
+	return out
+}
+
+func sameLoadBalanceScore(a, b float64) bool {
+	diff := a - b
+	return diff >= -loadBalanceScoreEpsilon && diff <= loadBalanceScoreEpsilon
+}
+
+func clampPercent(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
 }
 
 func (m *Manager) accountAuthPresent(account Account) bool {

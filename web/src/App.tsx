@@ -153,6 +153,13 @@ interface LoadBalanceAccount {
   leaseExpiresAt?: string;
   eligible: boolean;
   reason?: string;
+  quotaStatus?: string;
+  quotaRemainingDisplay?: string;
+  quotaRemainingPercent?: number;
+  quotaUsedPercent?: number;
+  quotaResetsAt?: string;
+  quotaUpdatedAt?: string;
+  quotaScore?: number;
 }
 
 interface LoadBalanceStatus {
@@ -458,6 +465,9 @@ export default function App() {
   const readyCount = accounts.filter((account) => account.status === "ready").length;
   const activeAccount = accounts.find((account) => account.active);
   const eligibleCount = lb?.eligible.length ?? 0;
+  const excludedCount = lb?.excluded.length ?? 0;
+  const lbTotalCount = eligibleCount + excludedCount;
+  const lbEligiblePercent = lbTotalCount ? Math.round((eligibleCount / lbTotalCount) * 100) : 0;
   const activeClientCount = clients.filter((client) => client.active).length;
   const sevenDayTokenTotal = Object.values(stats).reduce((total, item) => total + (item.sevenDays?.total || 0), 0);
   const personalUsage = useMemo(() => {
@@ -945,21 +955,12 @@ export default function App() {
 
         {activeView === "load-balancer" && (
           <section className="cube-view-panel">
-            <Card className="border border-slate-200 bg-white shadow-sm">
-              <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
-                <div className="min-w-0">
-                  <h2 className="text-base font-semibold text-slate-950">Load balancer</h2>
-                  <p className="text-xs text-slate-500">Lease-aware account assignment for cube run.</p>
-                </div>
-                <Chip color="success" variant="soft">
-                  {eligibleCount} eligible
-                </Chip>
-              </Card.Header>
-              <Card.Content className="gap-4">
-                <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto] md:items-center">
-                  <div className="min-w-0 rounded-lg bg-slate-50 p-3">
-                    <div className="text-xs font-medium uppercase text-slate-500">Last selected</div>
-                    <div className="path-text mt-1 font-mono text-sm text-slate-800">{lb?.lastAccountId || "-"}</div>
+            <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(20rem,0.9fr)]">
+              <Card className="border border-slate-200 bg-white shadow-sm">
+                <Card.Header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+                  <div className="min-w-0">
+                    <h2 className="text-base font-semibold text-slate-950">Load balancer</h2>
+                    <p className="text-xs text-slate-500">Quota-aware lease assignment for cube run.</p>
                   </div>
                   <div className="flex flex-wrap gap-2">
                     <Button className="gap-2" variant="primary" onPress={pickNext}>
@@ -971,39 +972,95 @@ export default function App() {
                       Reset
                     </Button>
                   </div>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50">
-                  <div className="border-b border-slate-200 px-3 py-2 text-xs font-semibold uppercase text-slate-500">5h refresh queue</div>
-                  <div className="divide-y divide-slate-200">
-                    {refreshQueue.slice(0, 8).map((item, index) => {
-                      const account = accounts.find((entry) => entry.id === item.accountId);
-                      return (
-                        <div key={item.accountId} className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-3 py-2 text-xs">
-                          <span className="font-mono text-slate-400">{index + 1}</span>
+                </Card.Header>
+                <Card.Content className="gap-4">
+                  <div className="lb-summary-grid">
+                    <div className="lb-pool-summary">
+                      <div className="flex min-w-0 items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-xs font-semibold uppercase text-slate-500">Pool readiness</div>
+                          <div className="mt-1 text-2xl font-semibold text-slate-950">{eligibleCount}/{lbTotalCount || 0}</div>
+                        </div>
+                        <Chip color={eligibleCount ? "success" : "danger"} variant="soft">
+                          {lbEligiblePercent}% in pool
+                        </Chip>
+                      </div>
+                      <div className="lb-stack" aria-label="Load balancer pool split">
+                        <span className="lb-stack-ready" style={{ width: `${lbEligiblePercent}%` }} />
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500">
+                        <span>{eligibleCount} in pool</span>
+                        <span>{excludedCount} out</span>
+                        <span>{lb?.policy || "quota-aware"}</span>
+                      </div>
+                    </div>
+                    <div className="lb-next-summary">
+                      <div className="text-xs font-semibold uppercase text-slate-500">Next lease candidate</div>
+                      {lb?.eligible[0] ? (
+                        <div className="mt-2 flex min-w-0 items-center gap-3">
+                          <QuotaRing value={lb.eligible[0].quotaRemainingPercent} label={lb.eligible[0].quotaRemainingDisplay} />
                           <div className="min-w-0">
-                            <div className="truncate font-medium text-slate-800">
-                              {account ? accountName(account) : item.label || shortID(item.accountId)}
+                            <div className="truncate text-sm font-semibold text-slate-950">{lbAccountName(lb.eligible[0])}</div>
+                            <div className="mt-1 truncate text-xs text-slate-500">
+                              score {scoreLabel(lb.eligible[0].quotaScore)} · reset {shortTime(lb.eligible[0].quotaResetsAt)}
                             </div>
-                            <div className="truncate text-slate-500">
-                              {item.ownerMode === "client"
-                                ? `${item.refreshOrderReason || "client reported"}${item.quotaReporterClientId ? ` · ${item.quotaReporterClientId}` : ""}`
-                                : item.leaseActive
-                                  ? `leased by ${item.leaseClientId || "client"}`
-                                  : item.refreshOrderReason || item.quotaStatus || item.status}
-                            </div>
-                          </div>
-                          <div className="text-right text-slate-600">
-                            <div className="font-medium">{item.remainingDisplay || "-"}</div>
-                            <div>{shortTime(item.leaseActive ? item.leaseExpiresAt : item.resetsAt)}</div>
                           </div>
                         </div>
-                      );
-                    })}
-                    {!refreshQueue.length && <div className="px-3 py-4 text-xs text-slate-500">No quota checks yet</div>}
+                      ) : (
+                        <div className="mt-2 text-sm font-medium text-rose-700">No assignable account</div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              </Card.Content>
-            </Card>
+
+                  <div>
+                    <div className="lb-section-head">
+                      <span>In pool</span>
+                      <Chip color={eligibleCount ? "success" : "danger"} size="sm" variant="soft">
+                        {eligibleCount}
+                      </Chip>
+                    </div>
+                    <div className="lb-account-grid">
+                      {lb?.eligible.map((account) => (
+                        <LoadBalanceAccountCard key={account.id} account={account} />
+                      ))}
+                      {!eligibleCount && <div className="lb-empty">No account currently has ready auth, no active lease, and available 5h quota.</div>}
+                    </div>
+                  </div>
+                </Card.Content>
+              </Card>
+
+              <div className="grid min-w-0 grid-cols-1 gap-4">
+                <Card className="border border-slate-200 bg-white shadow-sm">
+                  <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+                    <h2 className="text-base font-semibold text-slate-950">Out of pool</h2>
+                    <Chip color={excludedCount ? "warning" : "success"} variant="soft">
+                      {excludedCount}
+                    </Chip>
+                  </Card.Header>
+                  <Card.Content className="gap-3">
+                    {lb?.excluded.map((account) => (
+                      <LoadBalanceAccountCard key={account.id} account={account} />
+                    ))}
+                    {!excludedCount && <div className="lb-empty">Every cloud-owned account is currently assignable.</div>}
+                  </Card.Content>
+                </Card>
+
+                <Card className="border border-slate-200 bg-white shadow-sm">
+                  <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+                    <h2 className="text-base font-semibold text-slate-950">5h reset order</h2>
+                    <Chip color="accent" variant="soft">
+                      {refreshQueue.length}
+                    </Chip>
+                  </Card.Header>
+                  <Card.Content className="gap-2">
+                    {refreshQueue.slice(0, 8).map((item, index) => (
+                      <RefreshQueueBar key={item.accountId} item={item} index={index} />
+                    ))}
+                    {!refreshQueue.length && <div className="lb-empty">No quota checks yet.</div>}
+                  </Card.Content>
+                </Card>
+              </div>
+            </div>
           </section>
         )}
 
@@ -1192,13 +1249,14 @@ export default function App() {
               <Card className="border border-slate-200 shadow-none">
                 <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">Cloud signals</Card.Header>
                 <Card.Content className="gap-3 text-xs">
-                  <SignalLine label="7d tokens" value={tokens(selectedStats?.sevenDays?.total)} />
-                  <SignalLine label="latest model" value={selectedStats?.latestModel || selectedStats?.models?.[0]?.model || "-"} />
-                  <SignalLine label="last client" value={selectedStats?.clientId || "-"} />
+                  <SignalLine label="5h quota" value={selectedRefresh?.remainingDisplay ? `${selectedRefresh.remainingDisplay} left` : selectedRefresh?.refreshOrderReason || "-"} />
                   <SignalLine label="5h reset" value={selectedRefresh?.resetsAt ? shortTime(selectedRefresh.resetsAt) : selectedRefresh?.refreshOrderReason || "-"} />
+                  <SignalLine label="quota source" value={selectedRefresh?.quotaSource ? `${selectedRefresh.quotaSource}${selectedRefresh.quotaReporterClientId ? ` · ${selectedRefresh.quotaReporterClientId}` : ""}` : quotas[selected.id]?.source || "-"} />
+                  <SignalLine label="reported 7d tokens" value={selectedStats ? tokens(selectedStats.sevenDays?.total) : "No report"} />
+                  <SignalLine label="latest reported model" value={selectedStats?.latestModel || selectedStats?.models?.[0]?.model || "-"} />
+                  <SignalLine label="usage reporter" value={selectedStats ? `${selectedStats.clientId || "unknown"} · ${shortTime(selectedStats.latestAt || selectedStats.updatedAt)}` : "client reports only"} />
                   <SignalLine label="generation" value={(selected.generation || 0).toString()} />
                   <SignalLine label="owner" value={selected.ownerMode === "client" ? `client ${selected.ownerClientId || "-"}` : "cloud"} />
-                  <SignalLine label="quota source" value={selectedRefresh?.quotaSource ? `${selectedRefresh.quotaSource}${selectedRefresh.quotaReporterClientId ? ` · ${selectedRefresh.quotaReporterClientId}` : ""}` : quotas[selected.id]?.source || "-"} />
                   <SignalLine label="lease" value={selected.leaseActive ? `${selected.leaseClientId || selected.leaseHolder || "client"} until ${shortTime(selected.leaseExpiresAt)}` : "-"} />
                 </Card.Content>
               </Card>
@@ -1320,8 +1378,8 @@ function PersonalDashboard({
       <div className="cube-content mx-auto flex w-full max-w-6xl flex-col gap-4 p-3 sm:p-4 lg:gap-5 lg:p-6">
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
           <MetricCard icon={<UserRound size={18} />} label="Client" value={client?.active ? "Active" : "Inactive"} status={client?.active ? "success" : "danger"} />
-          <MetricCard icon={<Gauge size={18} />} label="7d Tokens" value={tokens(totals?.sevenDays?.total)} status={(totals?.sevenDays?.total || 0) > 0 ? "success" : "warning"} />
-          <MetricCard icon={<Database size={18} />} label="Accounts Used" value={usage.length.toString()} status={usage.length ? "success" : "warning"} />
+          <MetricCard icon={<Gauge size={18} />} label="Reported 7d Tokens" value={tokens(totals?.sevenDays?.total)} status={(totals?.sevenDays?.total || 0) > 0 ? "success" : "warning"} />
+          <MetricCard icon={<Database size={18} />} label="Accounts Reported" value={usage.length.toString()} status={usage.length ? "success" : "warning"} />
         </div>
 
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
@@ -1376,7 +1434,7 @@ function PersonalDashboard({
           <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
             <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
               <Gauge size={17} />
-              Usage
+              Reported usage
             </h2>
             <Chip color="accent" variant="soft">
               {tokens(totals?.allTime?.total)} all
@@ -1586,6 +1644,114 @@ function QuotaProviderCard({
   );
 }
 
+function clampUIPercent(value?: number) {
+  if (typeof value !== "number" || Number.isNaN(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function lbAccountName(account: LoadBalanceAccount) {
+  return account.label || shortID(account.id);
+}
+
+function scoreLabel(value?: number) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "-";
+  return value.toFixed(1);
+}
+
+function QuotaRing({ label, value }: { label?: string; value?: number }) {
+  const remaining = clampUIPercent(value);
+  const degrees = remaining * 3.6;
+  return (
+    <div
+      className="lb-quota-ring"
+      style={{ background: `conic-gradient(#10b981 ${degrees}deg, #e2e8f0 0deg)` }}
+    >
+      <span>{label || (value === undefined ? "-" : `${Math.round(remaining)}%`)}</span>
+    </div>
+  );
+}
+
+function LoadBalanceAccountCard({ account }: { account: LoadBalanceAccount }) {
+  const remaining = clampUIPercent(account.quotaRemainingPercent);
+  const quotaLabel = account.quotaRemainingDisplay || account.quotaStatus || "-";
+
+  return (
+    <div className={`lb-account-card ${account.eligible ? "is-eligible" : "is-excluded"}`}>
+      <div className="lb-account-top">
+        <QuotaRing label={quotaLabel} value={account.quotaRemainingPercent} />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+            <span className="truncate text-sm font-semibold text-slate-950">{lbAccountName(account)}</span>
+            <Chip color={account.eligible ? "success" : "warning"} size="sm" variant="soft">
+              {account.eligible ? "in pool" : "out"}
+            </Chip>
+            {account.leaseActive && (
+              <Chip color="accent" size="sm" variant="soft">
+                leased
+              </Chip>
+            )}
+          </div>
+          <div className="mt-1 font-mono text-xs text-slate-500">{shortID(account.id)}</div>
+        </div>
+      </div>
+
+      <div className="lb-quota-line">
+        <span>5h remaining</span>
+        <strong>{quotaLabel}</strong>
+      </div>
+      <div className="lb-quota-track">
+        <span style={{ width: `${remaining}%` }} />
+      </div>
+
+      <div className="lb-account-metrics">
+        <div>
+          <span>score</span>
+          <strong>{scoreLabel(account.quotaScore)}</strong>
+        </div>
+        <div>
+          <span>reset</span>
+          <strong>{shortTime(account.quotaResetsAt)}</strong>
+        </div>
+        <div>
+          <span>gen</span>
+          <strong>{account.generation || 0}</strong>
+        </div>
+      </div>
+
+      {account.reason && <div className="lb-reason">{account.reason}</div>}
+    </div>
+  );
+}
+
+function refreshQueueReason(item: RefreshQueueItem) {
+  if (item.ownerMode === "client") {
+    return `${item.refreshOrderReason || "client reported"}${item.quotaReporterClientId ? ` · ${item.quotaReporterClientId}` : ""}`;
+  }
+  if (item.leaseActive) return `leased by ${item.leaseClientId || "client"}`;
+  return item.refreshOrderReason || item.quotaStatus || item.status;
+}
+
+function RefreshQueueBar({ index, item }: { index: number; item: RefreshQueueItem }) {
+  const remaining = clampUIPercent(item.remainingPercent);
+  return (
+    <div className="lb-queue-row">
+      <div className="lb-queue-rank">{index + 1}</div>
+      <div className="min-w-0 flex-1">
+        <div className="flex min-w-0 items-center justify-between gap-2">
+          <span className="truncate text-sm font-semibold text-slate-900">{item.label || shortID(item.accountId)}</span>
+          <span className="shrink-0 text-xs font-semibold text-slate-700">{item.remainingDisplay || "-"}</span>
+        </div>
+        <div className="mt-1 truncate text-xs text-slate-500">
+          {refreshQueueReason(item)} · {shortTime(item.leaseActive ? item.leaseExpiresAt : item.resetsAt)}
+        </div>
+        <div className="lb-queue-track">
+          <span style={{ width: `${remaining}%` }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NavItem({
   active,
   badge,
@@ -1720,11 +1886,11 @@ function MobileAccountCard({
           <div className="mt-3 flex items-center justify-between gap-2 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
             {usage ? (
               <div className="min-w-0">
-                <div className="font-semibold text-slate-900">{tokens(usage.sevenDays?.total)} over 7d</div>
-                <div className="truncate">latest model {latestModel}</div>
+                <div className="font-semibold text-slate-900">{tokens(usage.sevenDays?.total)} reported 7d</div>
+                <div className="truncate">reported model {latestModel}</div>
               </div>
             ) : (
-              <span className="font-medium text-slate-700">No cloud usage yet</span>
+              <span className="font-medium text-slate-700">No usage report yet</span>
             )}
           </div>
 
@@ -1742,8 +1908,8 @@ function MobileAccountCard({
             <div className="truncate font-medium text-slate-700">{summary.label}</div>
           </div>
           <div className="min-w-0 rounded-md bg-slate-50 p-2">
-            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">Usage</div>
-            <div className="truncate font-medium text-slate-700">{usage ? `${tokens(usage.sevenDays?.total)} 7d` : "No data"}</div>
+            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">Report</div>
+            <div className="truncate font-medium text-slate-700">{usage ? `${tokens(usage.sevenDays?.total)} 7d` : "No report"}</div>
           </div>
         </div>
       )}

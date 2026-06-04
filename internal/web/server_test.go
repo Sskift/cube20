@@ -7,8 +7,10 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"cube20/internal/manager"
+	"cube20/internal/quota"
 )
 
 func TestAdminTokenCanAccessAdminRoute(t *testing.T) {
@@ -146,6 +148,33 @@ func newTestServer(t *testing.T) (*Server, *manager.Manager, string, string) {
 		Auth:  json.RawMessage(`{"OPENAI_API_KEY":"sk-test"}`),
 	}); err != nil {
 		t.Fatalf("UpsertJSONProfile() error = %v", err)
+	}
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	window := quota.Window{
+		Key:              "five_hour",
+		Label:            "5h",
+		UsedPercent:      0,
+		RemainingPercent: 100,
+		UsedDisplay:      "0%",
+		RemainingDisplay: "100%",
+		ResetsAt:         time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}
+	state.QuotaCache["work"] = manager.QuotaCache{
+		AccountID: "work",
+		UpdatedAt: time.Now(),
+		Result: quota.Result{
+			Status: quota.StatusSupported,
+			Plan:   "pro",
+			Quotas: []quota.Window{window},
+		},
+		FiveHour: &window,
+		Source:   manager.QuotaSourceCloud,
+	}
+	if err := m.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
 	}
 	_, pat, err := m.CreateClient("tester")
 	if err != nil {

@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"cube20/internal/quota"
 )
 
 func TestLoadBalanceStatusExcludesClientOwnedAccounts(t *testing.T) {
@@ -72,6 +75,7 @@ func TestLoadBalanceStatusIncludesCloudOwnedReadyAccount(t *testing.T) {
 		OwnerMode: OwnerCloud,
 		Status:    StatusReady,
 	})
+	saveTestQuota(t, m, "cloud-ready", 95, time.Now().Add(time.Hour))
 
 	status, err := m.LoadBalanceStatus()
 	if err != nil {
@@ -87,6 +91,68 @@ func TestLoadBalanceStatusIncludesCloudOwnedReadyAccount(t *testing.T) {
 	account := status.Eligible[0]
 	if !account.AuthPresent || account.OwnerMode != OwnerCloud || account.Status != StatusReady {
 		t.Fatalf("eligible account = %+v, want cloud-owned ready account with auth", account)
+	}
+}
+
+func TestLoadBalanceStatusExcludesExhaustedQuota(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:        "exhausted",
+		OwnerMode: OwnerCloud,
+		Status:    StatusReady,
+	})
+	saveTestQuota(t, m, "exhausted", 0, time.Now().Add(time.Hour))
+
+	status, err := m.LoadBalanceStatus()
+	if err != nil {
+		t.Fatalf("LoadBalanceStatus() error = %v", err)
+	}
+	if len(status.Eligible) != 0 {
+		t.Fatalf("eligible accounts = %v, want none", loadBalanceIDs(status.Eligible))
+	}
+
+	account := findLoadBalanceAccount(t, status.Excluded, "exhausted")
+	if !strings.HasPrefix(account.Reason, "5h quota exhausted until ") {
+		t.Fatalf("excluded reason = %q, want quota exhausted reason", account.Reason)
+	}
+	if account.QuotaRemainingPercent != 0 || account.QuotaStatus != quota.StatusSupported {
+		t.Fatalf("quota fields = %+v, want supported 0%% remaining", account)
+	}
+}
+
+func TestClaimLeaseSkipsExhaustedQuota(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m,
+		Account{ID: "exhausted"},
+		Account{ID: "available"},
+	)
+	saveTestQuota(t, m, "exhausted", 0, time.Now().Add(time.Hour))
+	saveTestQuota(t, m, "available", 80, time.Now().Add(3*time.Hour))
+
+	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimLease() error = %v", err)
+	}
+	if lease.Lease.AccountID != "available" {
+		t.Fatalf("leased account = %q, want available", lease.Lease.AccountID)
+	}
+}
+
+func TestClaimLeaseWeightsQuotaNearReset(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m,
+		Account{ID: "far-reset"},
+		Account{ID: "near-reset"},
+	)
+	saveTestQuota(t, m, "far-reset", 80, time.Now().Add(4*time.Hour))
+	saveTestQuota(t, m, "near-reset", 70, time.Now().Add(30*time.Minute))
+
+	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimLease() error = %v", err)
+	}
+	if lease.Lease.AccountID != "near-reset" {
+		t.Fatalf("leased account = %q, want near-reset", lease.Lease.AccountID)
 	}
 }
 
@@ -211,6 +277,42 @@ func saveTestAccounts(t *testing.T, m *Manager, accounts ...Account) {
 		}
 		writeTestAuth(t, account.CodexHome, account.ID)
 		state.Accounts = append(state.Accounts, account)
+	}
+	if err := m.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+}
+
+func saveTestQuota(t *testing.T, m *Manager, accountID string, remaining float64, resetAt time.Time) {
+	t.Helper()
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if state.QuotaCache == nil {
+		state.QuotaCache = map[string]QuotaCache{}
+	}
+	used := 100 - remaining
+	window := quota.Window{
+		Key:              "five_hour",
+		Label:            "5h",
+		UsedPercent:      used,
+		RemainingPercent: remaining,
+		UsedDisplay:      fmt.Sprintf("%.0f%%", used),
+		RemainingDisplay: fmt.Sprintf("%.0f%%", remaining),
+		ResetsAt:         resetAt.UTC().Format(time.RFC3339),
+	}
+	state.QuotaCache[accountID] = QuotaCache{
+		AccountID: accountID,
+		UpdatedAt: time.Now(),
+		Result: quota.Result{
+			Status: quota.StatusSupported,
+			Plan:   "pro",
+			Quotas: []quota.Window{window},
+		},
+		FiveHour: &window,
+		Source:   QuotaSourceCloud,
 	}
 	if err := m.Save(state); err != nil {
 		t.Fatalf("Save() error = %v", err)
