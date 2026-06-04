@@ -30,7 +30,6 @@ const (
 	defaultStateDirName    = ".cube20"
 	defaultAccountsDirName = ".codex-accounts"
 	settingsFileName       = "settings.toml"
-	sharedSettingsFileName = "shared-settings.toml"
 	roundRobinFileName     = "run-round-robin.json"
 	authFileName           = "auth.json"
 	configFileName         = "config.toml"
@@ -210,7 +209,7 @@ type LoadBalanceStatus struct {
 type Settings struct {
 	LiveCodexHome    string `json:"liveCodexHome" toml:"live_codex_home"`
 	AccountsDir      string `json:"accountsDir" toml:"accounts_dir"`
-	SharedConfigPath string `json:"sharedConfigPath" toml:"shared_settings_path"`
+	SharedConfigPath string `json:"sharedConfigPath" toml:"-"`
 	CloudURL         string `json:"cloudUrl" toml:"cloud_url"`
 	CloudToken       string `json:"cloudToken" toml:"cloud_token"`
 	DatabaseURL      string `json:"databaseUrl" toml:"database_url"`
@@ -299,12 +298,6 @@ func (m *Manager) Ensure() error {
 	}
 	if err := os.MkdirAll(m.AccountsDir, 0o700); err != nil {
 		return err
-	}
-	if strings.TrimSpace(m.SharedConfigPath) != "" {
-		if err := os.MkdirAll(filepath.Dir(m.SharedConfigPath), 0o700); err != nil {
-			return err
-		}
-		_ = m.syncSharedConfigFromCodexHome(m.LiveCodexHome, false)
 	}
 	if strings.TrimSpace(m.DatabaseURL) != "" {
 		return m.ensurePostgres()
@@ -475,6 +468,26 @@ func (m *Manager) ensurePostgres() error {
 			seven_days jsonb NOT NULL DEFAULT '{}'::jsonb,
 			all_time jsonb NOT NULL DEFAULT '{}'::jsonb,
 			models jsonb NOT NULL DEFAULT '[]'::jsonb
+		)`,
+		`CREATE TABLE IF NOT EXISTS cube_usage_events (
+			account_id text NOT NULL DEFAULT '',
+			client_id text NOT NULL DEFAULT '',
+			lease_id text NOT NULL DEFAULT '',
+			run_id text NOT NULL DEFAULT '',
+			model text NOT NULL DEFAULT '',
+			reported_at timestamptz NOT NULL DEFAULT now(),
+			latest_at text NOT NULL DEFAULT '',
+			today jsonb NOT NULL DEFAULT '{}'::jsonb,
+			seven_days jsonb NOT NULL DEFAULT '{}'::jsonb,
+			all_time jsonb NOT NULL DEFAULT '{}'::jsonb,
+			summary_status text NOT NULL DEFAULT '',
+			summary_detail text NOT NULL DEFAULT '',
+			summary_files_scanned integer NOT NULL DEFAULT 0,
+			summary_events integer NOT NULL DEFAULT 0,
+			summary_latest_at text NOT NULL DEFAULT '',
+			summary_latest_model text NOT NULL DEFAULT '',
+			schema_version integer NOT NULL DEFAULT 1,
+			PRIMARY KEY (account_id, client_id, lease_id, run_id, model)
 		)`,
 		`CREATE TABLE IF NOT EXISTS cube_quota_cache (
 			account_id text PRIMARY KEY,
@@ -668,12 +681,6 @@ func (m *Manager) savePostgresState(state State) error {
 	}
 	defer tx.Rollback()
 
-	for _, table := range []string{"cube_accounts", "cube_clients", "cube_usage", "cube_quota_cache"} {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
-			return err
-		}
-	}
-
 	state = normalizeState(state)
 	now := time.Now()
 	for _, account := range state.Accounts {
@@ -710,7 +717,25 @@ func (m *Manager) savePostgresState(state State) error {
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_accounts
 			(id, label, plan, status, codex_home, owner_mode, owner_client_id, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, auth_json, created_at, updated_at, last_error)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18)`,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18)
+			ON CONFLICT (id) DO UPDATE SET
+				label = EXCLUDED.label,
+				plan = EXCLUDED.plan,
+				status = EXCLUDED.status,
+				codex_home = EXCLUDED.codex_home,
+				owner_mode = EXCLUDED.owner_mode,
+				owner_client_id = EXCLUDED.owner_client_id,
+				generation = EXCLUDED.generation,
+				lease_id = EXCLUDED.lease_id,
+				lease_client_id = EXCLUDED.lease_client_id,
+				lease_holder = EXCLUDED.lease_holder,
+				lease_started_at = EXCLUDED.lease_started_at,
+				lease_heartbeat_at = EXCLUDED.lease_heartbeat_at,
+				lease_expires_at = EXCLUDED.lease_expires_at,
+				auth_json = EXCLUDED.auth_json,
+				updated_at = EXCLUDED.updated_at,
+				last_error = EXCLUDED.last_error
+			WHERE cube_accounts.updated_at <= EXCLUDED.updated_at`,
 			account.ID,
 			account.Label,
 			account.Plan,
@@ -748,7 +773,17 @@ func (m *Manager) savePostgresState(state State) error {
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_clients
 			(id, label, token_hash, created_at, last_seen_at, revoked_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (id) DO UPDATE SET
+				label = EXCLUDED.label,
+				token_hash = CASE WHEN EXCLUDED.token_hash <> '' THEN EXCLUDED.token_hash ELSE cube_clients.token_hash END,
+				last_seen_at = CASE
+					WHEN cube_clients.last_seen_at IS NULL THEN EXCLUDED.last_seen_at
+					WHEN EXCLUDED.last_seen_at IS NULL THEN cube_clients.last_seen_at
+					WHEN EXCLUDED.last_seen_at > cube_clients.last_seen_at THEN EXCLUDED.last_seen_at
+					ELSE cube_clients.last_seen_at
+				END,
+				revoked_at = COALESCE(EXCLUDED.revoked_at, cube_clients.revoked_at)`,
 			client.ID,
 			client.Label,
 			client.TokenHash,
@@ -785,7 +820,17 @@ func (m *Manager) savePostgresState(state State) error {
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_usage
 			(account_id, client_id, updated_at, latest_at, latest_model, today, seven_days, all_time, models)
-			VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb)`,
+			VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb)
+			ON CONFLICT (account_id) DO UPDATE SET
+				client_id = EXCLUDED.client_id,
+				updated_at = EXCLUDED.updated_at,
+				latest_at = EXCLUDED.latest_at,
+				latest_model = EXCLUDED.latest_model,
+				today = EXCLUDED.today,
+				seven_days = EXCLUDED.seven_days,
+				all_time = EXCLUDED.all_time,
+				models = EXCLUDED.models
+			WHERE cube_usage.updated_at <= EXCLUDED.updated_at`,
 			stat.AccountID,
 			stat.ClientID,
 			stat.UpdatedAt,
@@ -823,7 +868,14 @@ func (m *Manager) savePostgresState(state State) error {
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_quota_cache
 			(account_id, updated_at, result, five_hour, quota_source, reporter_client_id)
-			VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6)`,
+			VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6)
+			ON CONFLICT (account_id) DO UPDATE SET
+				updated_at = EXCLUDED.updated_at,
+				result = EXCLUDED.result,
+				five_hour = EXCLUDED.five_hour,
+				quota_source = EXCLUDED.quota_source,
+				reporter_client_id = EXCLUDED.reporter_client_id
+			WHERE cube_quota_cache.updated_at <= EXCLUDED.updated_at`,
 			cache.AccountID,
 			cache.UpdatedAt,
 			result,
@@ -980,9 +1032,16 @@ func (m *Manager) TouchClient(id string) error {
 }
 
 func (m *Manager) RecordUsage(accountID, clientID string, summary usage.Summary) error {
+	return m.RecordUsageWithContext(accountID, clientID, "", "", summary)
+}
+
+func (m *Manager) RecordUsageWithContext(accountID, clientID, leaseID, runID string, summary usage.Summary) error {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return errors.New("usage account id is required")
+	}
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		return m.recordPostgresUsage(accountID, strings.TrimSpace(clientID), strings.TrimSpace(leaseID), strings.TrimSpace(runID), summary)
 	}
 	state, err := m.Load()
 	if err != nil {
@@ -1003,6 +1062,120 @@ func (m *Manager) RecordUsage(accountID, clientID string, summary usage.Summary)
 		Models:      summary.Models,
 	}
 	return m.Save(state)
+}
+
+func (m *Manager) recordPostgresUsage(accountID, clientID, leaseID, runID string, summary usage.Summary) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	today, err := jsonText(summary.Today)
+	if err != nil {
+		return err
+	}
+	sevenDays, err := jsonText(summary.SevenDays)
+	if err != nil {
+		return err
+	}
+	allTime, err := jsonText(summary.AllTime)
+	if err != nil {
+		return err
+	}
+	models, err := jsonText(summary.Models)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO cube_usage
+		(account_id, client_id, updated_at, latest_at, latest_model, today, seven_days, all_time, models)
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb)
+		ON CONFLICT (account_id) DO UPDATE SET
+			client_id = EXCLUDED.client_id,
+			updated_at = EXCLUDED.updated_at,
+			latest_at = EXCLUDED.latest_at,
+			latest_model = EXCLUDED.latest_model,
+			today = EXCLUDED.today,
+			seven_days = EXCLUDED.seven_days,
+			all_time = EXCLUDED.all_time,
+			models = EXCLUDED.models
+		WHERE cube_usage.updated_at <= EXCLUDED.updated_at`,
+		accountID,
+		clientID,
+		now,
+		summary.LatestAt,
+		summary.LatestModel,
+		today,
+		sevenDays,
+		allTime,
+		models,
+	); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(runID) == "" {
+		runID = usageEventRunID(summary, now)
+	}
+	events := UsageEventsFromSummary(NewUsageEventContext(accountID, clientID, leaseID, runID, now), summary)
+	for _, event := range events {
+		eventToday, err := jsonText(event.Today)
+		if err != nil {
+			return err
+		}
+		eventSevenDays, err := jsonText(event.SevenDays)
+		if err != nil {
+			return err
+		}
+		eventAllTime, err := jsonText(event.AllTime)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_usage_events
+			(account_id, client_id, lease_id, run_id, model, reported_at, latest_at, today, seven_days, all_time, summary_status, summary_detail, summary_files_scanned, summary_events, summary_latest_at, summary_latest_model, schema_version)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12, $13, $14, $15, $16, $17)
+			ON CONFLICT (account_id, client_id, lease_id, run_id, model) DO UPDATE SET
+				reported_at = EXCLUDED.reported_at,
+				latest_at = EXCLUDED.latest_at,
+				today = EXCLUDED.today,
+				seven_days = EXCLUDED.seven_days,
+				all_time = EXCLUDED.all_time,
+				summary_status = EXCLUDED.summary_status,
+				summary_detail = EXCLUDED.summary_detail,
+				summary_files_scanned = EXCLUDED.summary_files_scanned,
+				summary_events = EXCLUDED.summary_events,
+				summary_latest_at = EXCLUDED.summary_latest_at,
+				summary_latest_model = EXCLUDED.summary_latest_model,
+				schema_version = EXCLUDED.schema_version`,
+			event.AccountID,
+			event.ClientID,
+			event.LeaseID,
+			event.RunID,
+			event.Model,
+			event.ReportedAt,
+			event.LatestAt,
+			eventToday,
+			eventSevenDays,
+			eventAllTime,
+			event.SummaryStatus,
+			event.SummaryDetail,
+			event.SummaryFilesScanned,
+			event.SummaryEvents,
+			event.SummaryLatestAt,
+			event.SummaryLatestModel,
+			event.SchemaVersion,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (m *Manager) UsageStats() (map[string]AccountUsage, error) {
@@ -1107,10 +1280,7 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir, sharedConfigPath st
 	if strings.TrimSpace(accountsDir) != "" {
 		settings.AccountsDir = expandPath(accountsDir, home)
 	}
-	if strings.TrimSpace(sharedConfigPath) != "" {
-		settings.SharedConfigPath = expandPath(sharedConfigPath, home)
-	}
-	if settings.LiveCodexHome == "" || settings.AccountsDir == "" || settings.SharedConfigPath == "" {
+	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
 		return Settings{}, errors.New("settings paths cannot be empty")
 	}
 
@@ -1144,7 +1314,7 @@ func (m *Manager) UpdateCloudSettings(cloudURL, cloudToken string) (Settings, er
 	if strings.TrimSpace(cloudToken) != "" {
 		settings.CloudToken = strings.TrimSpace(cloudToken)
 	}
-	if settings.LiveCodexHome == "" || settings.AccountsDir == "" || settings.SharedConfigPath == "" {
+	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
 		return Settings{}, errors.New("settings paths cannot be empty")
 	}
 	if err := writeSettings(m.SettingsPath, settings); err != nil {
@@ -1197,8 +1367,8 @@ func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	if settings.LiveCodexHome == "" || settings.AccountsDir == "" || settings.SharedConfigPath == "" {
-		return Settings{}, errors.New("settings.toml must include live_codex_home, accounts_dir, and shared_settings_path")
+	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
+		return Settings{}, errors.New("settings.toml must include live_codex_home and accounts_dir")
 	}
 
 	if err := writeSettings(m.SettingsPath, settings); err != nil {
@@ -1320,7 +1490,6 @@ func (m *Manager) ImportLiveProfile(id, label, sourceCodexHome string) (Account,
 	if err := m.Save(state); err != nil {
 		return Account{}, err
 	}
-	_ = m.syncSharedConfigFromCodexHome(sourceCodexHome, false)
 	return account, nil
 }
 
@@ -1403,6 +1572,13 @@ func (m *Manager) ExportLiveProfileSnapshot(ownerClientID string) (ProfileSnapsh
 }
 
 func (m *Manager) UpsertProfileSnapshot(snapshot ProfileSnapshot) (Account, error) {
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return Account{}, err
+	}
+	defer unlock()
+
 	account, err := m.UpsertJSONProfile(JSONProfile{
 		ID:    snapshot.ID,
 		Label: snapshot.Label,
@@ -2022,6 +2198,15 @@ func (m *Manager) DeleteAccount(id string) (Account, error) {
 	}
 
 	state.Accounts = append(state.Accounts[:index], state.Accounts[index+1:]...)
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		if err := m.deletePostgresAccount(id); err != nil {
+			return Account{}, err
+		}
+		if roundRobin, err := m.loadRoundRobinState(); err == nil && roundRobin.LastAccountID == id {
+			_ = m.ResetRoundRobin()
+		}
+		return account, nil
+	}
 	if err := m.Save(state); err != nil {
 		return Account{}, err
 	}
@@ -2029,6 +2214,32 @@ func (m *Manager) DeleteAccount(id string) (Account, error) {
 		_ = m.ResetRoundRobin()
 	}
 	return account, nil
+}
+
+func (m *Manager) deletePostgresAccount(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, statement := range []string{
+		`DELETE FROM cube_usage_events WHERE account_id = $1`,
+		`DELETE FROM cube_usage WHERE account_id = $1`,
+		`DELETE FROM cube_quota_cache WHERE account_id = $1`,
+		`DELETE FROM cube_accounts WHERE id = $1`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (m *Manager) validateManagedCodexHome(codexHome string) error {
@@ -2746,6 +2957,9 @@ func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged 
 	if strings.TrimSpace(id) == "" {
 		return nil
 	}
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		return m.recordPostgresQuotaResult(id, result, authChanged, source, strings.TrimSpace(reporterClientID))
+	}
 	state, err := m.Load()
 	if err != nil {
 		return err
@@ -2753,14 +2967,7 @@ func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged 
 	if state.QuotaCache == nil {
 		state.QuotaCache = map[string]QuotaCache{}
 	}
-	var fiveHour *quota.Window
-	for _, window := range result.Quotas {
-		if window.Key == "five_hour" || strings.EqualFold(window.Label, "5h") {
-			copy := window
-			fiveHour = &copy
-			break
-		}
-	}
+	fiveHour := quotaFiveHour(result)
 	if source == "" {
 		source = QuotaSourceCloud
 	}
@@ -2828,6 +3035,116 @@ func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged 
 	return m.Save(state)
 }
 
+func (m *Manager) recordPostgresQuotaResult(id string, result quota.Result, authChanged bool, source QuotaSource, reporterClientID string) error {
+	if source == "" {
+		source = QuotaSourceCloud
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	resultJSON, err := jsonText(result)
+	if err != nil {
+		return err
+	}
+	var fiveHourJSON sql.NullString
+	if fiveHour := quotaFiveHour(result); fiveHour != nil {
+		fiveHourJSON, err = jsonText(*fiveHour)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO cube_quota_cache
+		(account_id, updated_at, result, five_hour, quota_source, reporter_client_id)
+		VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6)
+		ON CONFLICT (account_id) DO UPDATE SET
+			updated_at = EXCLUDED.updated_at,
+			result = EXCLUDED.result,
+			five_hour = EXCLUDED.five_hour,
+			quota_source = EXCLUDED.quota_source,
+			reporter_client_id = EXCLUDED.reporter_client_id
+		WHERE cube_quota_cache.updated_at <= EXCLUDED.updated_at`,
+		id,
+		now,
+		resultJSON,
+		fiveHourJSON,
+		string(source),
+		reporterClientID,
+	); err != nil {
+		return err
+	}
+
+	if source == QuotaSourceClient {
+		if reporterClientID != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE cube_accounts
+				SET owner_mode = 'client', owner_client_id = $2, updated_at = $3
+				WHERE id = $1`, id, reporterClientID, now); err != nil {
+				return err
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx, `UPDATE cube_accounts
+				SET owner_mode = 'client', updated_at = $2
+				WHERE id = $1`, id, now); err != nil {
+				return err
+			}
+		}
+	}
+
+	switch result.Status {
+	case quota.StatusRefreshInvalid:
+		if _, err := tx.ExecContext(ctx, `UPDATE cube_accounts
+			SET status = CASE WHEN status IN ('ready', 'recovering') THEN 'drain' ELSE status END,
+				last_error = $2,
+				updated_at = $3
+			WHERE id = $1`, id, result.Detail, now); err != nil {
+			return err
+		}
+	case quota.StatusSupported:
+		generationDelta := int64(0)
+		if authChanged {
+			generationDelta = 1
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE cube_accounts
+			SET plan = CASE WHEN $2 <> '' THEN $2 ELSE plan END,
+				status = CASE WHEN status = 'recovering' THEN 'ready' ELSE status END,
+				last_error = '',
+				generation = generation + $3,
+				updated_at = $4
+			WHERE id = $1`, id, result.Plan, generationDelta, now); err != nil {
+			return err
+		}
+	default:
+		if authChanged {
+			if _, err := tx.ExecContext(ctx, `UPDATE cube_accounts
+				SET generation = generation + 1, updated_at = $2
+				WHERE id = $1`, id, now); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+func quotaFiveHour(result quota.Result) *quota.Window {
+	for _, window := range result.Quotas {
+		if window.Key == "five_hour" || strings.EqualFold(window.Label, "5h") {
+			copy := window
+			return &copy
+		}
+	}
+	return nil
+}
+
 func quotaSourceLabel(cache QuotaCache) string {
 	switch cache.Source {
 	case QuotaSourceClient:
@@ -2875,92 +3192,6 @@ func (m *Manager) FetchUsage(id string) (usage.Summary, error) {
 		return usage.Summary{}, err
 	}
 	return usage.SummarizeCodexHome(account.CodexHome, time.Now()), nil
-}
-
-func (m *Manager) SharedConfigInfo() (string, bool, time.Time) {
-	if strings.TrimSpace(m.SharedConfigPath) == "" {
-		return "", false, time.Time{}
-	}
-	info, err := os.Stat(m.SharedConfigPath)
-	if err != nil {
-		return m.SharedConfigPath, false, time.Time{}
-	}
-	return m.SharedConfigPath, true, info.ModTime()
-}
-
-func (m *Manager) ReadSharedConfigText() (string, error) {
-	if err := m.Ensure(); err != nil {
-		return "", err
-	}
-	if _, present, _ := m.SharedConfigInfo(); !present {
-		return "", nil
-	}
-	data, err := os.ReadFile(m.SharedConfigPath)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func (m *Manager) WriteSharedConfigText(raw string) error {
-	if strings.TrimSpace(m.SharedConfigPath) == "" {
-		return errors.New("shared_settings_path is empty")
-	}
-	if err := os.MkdirAll(filepath.Dir(m.SharedConfigPath), 0o700); err != nil {
-		return err
-	}
-	tmpPath := m.SharedConfigPath + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(raw), fileModeFor(configFileName)); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, m.SharedConfigPath)
-}
-
-func (m *Manager) syncSharedConfigFromCodexHome(codexHome string, overwrite bool) error {
-	if strings.TrimSpace(codexHome) == "" || strings.TrimSpace(m.SharedConfigPath) == "" {
-		return nil
-	}
-	source := filepath.Join(codexHome, configFileName)
-	if samePath(source, m.SharedConfigPath) {
-		return nil
-	}
-	if _, err := os.Stat(source); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	if !overwrite {
-		if _, err := os.Stat(m.SharedConfigPath); err == nil {
-			return nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(m.SharedConfigPath), 0o700); err != nil {
-		return err
-	}
-	return copyFile(source, m.SharedConfigPath, fileModeFor(configFileName))
-}
-
-func (m *Manager) syncSharedConfigToCodexHome(codexHome string) error {
-	if strings.TrimSpace(codexHome) == "" || strings.TrimSpace(m.SharedConfigPath) == "" {
-		return nil
-	}
-	if _, err := os.Stat(m.SharedConfigPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	target := filepath.Join(codexHome, configFileName)
-	if samePath(m.SharedConfigPath, target) {
-		return nil
-	}
-	if err := os.MkdirAll(codexHome, 0o700); err != nil {
-		return err
-	}
-	return copyFile(m.SharedConfigPath, target, fileModeFor(configFileName))
 }
 
 func (m *Manager) ensureLocalConfigLink(codexHome string) error {
@@ -3074,7 +3305,7 @@ func (m *Manager) DeployAuth(id, targetCodexHome string) (string, error) {
 
 func (m *Manager) accountView(account Account) AccountView {
 	authPath := filepath.Join(account.CodexHome, authFileName)
-	configPath, configPresent, configUpdated := m.SharedConfigInfo()
+	configPath := CodexConfigPath(m.LiveCodexHome)
 	view := AccountView{
 		Account:    account,
 		AuthPath:   authPath,
@@ -3086,8 +3317,10 @@ func (m *Manager) accountView(account Account) AccountView {
 		view.AuthPresent = true
 		view.AuthUpdated = info.ModTime()
 	}
-	view.ConfigPresent = configPresent
-	view.ConfigUpdated = configUpdated
+	if info, err := os.Stat(configPath); err == nil {
+		view.ConfigPresent = true
+		view.ConfigUpdated = info.ModTime()
+	}
 	view.Active = m.isAccountActive(account)
 	view.LeaseActive = accountLeaseActive(account, time.Now())
 	return view
@@ -3136,12 +3369,11 @@ func defaultSettings(home string) Settings {
 		liveCodexHome = expandPath(value, home)
 	}
 	return Settings{
-		LiveCodexHome:    liveCodexHome,
-		AccountsDir:      filepath.Join(home, defaultAccountsDirName),
-		SharedConfigPath: filepath.Join(home, defaultStateDirName, sharedSettingsFileName),
-		CloudURL:         strings.TrimSpace(os.Getenv("CUBE_CLOUD_URL")),
-		CloudToken:       strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")),
-		DatabaseURL:      firstNonEmpty(os.Getenv("CUBE_DATABASE_URL"), os.Getenv("DATABASE_URL")),
+		LiveCodexHome: liveCodexHome,
+		AccountsDir:   filepath.Join(home, defaultAccountsDirName),
+		CloudURL:      strings.TrimSpace(os.Getenv("CUBE_CLOUD_URL")),
+		CloudToken:    strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")),
+		DatabaseURL:   firstNonEmpty(os.Getenv("CUBE_DATABASE_URL"), os.Getenv("DATABASE_URL")),
 	}
 }
 
@@ -3184,48 +3416,15 @@ func parseSettingsData(data []byte, defaults Settings, home string) (Settings, b
 		return Settings{}, false, err
 	}
 
-	var legacy struct {
-		SharedConfigPath string `toml:"shared_config_path"`
-	}
-	_ = toml.Unmarshal(data, &legacy)
-
 	rawText := string(data)
-	hasSharedSettingsPath := strings.Contains(rawText, "shared_settings_path")
-	changed := !hasSharedSettingsPath || strings.Contains(rawText, "shared_config_path")
-	if !hasSharedSettingsPath && strings.TrimSpace(legacy.SharedConfigPath) != "" {
-		settings.SharedConfigPath = legacy.SharedConfigPath
-	}
+	changed := strings.Contains(rawText, "shared_settings_path") || strings.Contains(rawText, "shared_config_path")
 
 	settings.LiveCodexHome = expandPath(settings.LiveCodexHome, home)
 	settings.AccountsDir = expandPath(settings.AccountsDir, home)
 	settings.CloudURL = strings.TrimSpace(settings.CloudURL)
 	settings.CloudToken = strings.TrimSpace(settings.CloudToken)
 	settings.DatabaseURL = strings.TrimSpace(settings.DatabaseURL)
-	if strings.TrimSpace(settings.SharedConfigPath) == "" {
-		settings.SharedConfigPath = defaults.SharedConfigPath
-		changed = true
-	}
-	beforeMigration := settings.SharedConfigPath
-	settings.SharedConfigPath = expandPath(settings.SharedConfigPath, home)
-	settings.SharedConfigPath = migrateDefaultSharedSettingsPath(settings.SharedConfigPath, defaults.SharedConfigPath, home)
-	if settings.SharedConfigPath != beforeMigration {
-		changed = true
-	}
 	return settings, changed, nil
-}
-
-func migrateDefaultSharedSettingsPath(path, defaultPath, home string) string {
-	oldDefault := filepath.Join(home, defaultStateDirName, configFileName)
-	if !samePath(path, oldDefault) {
-		return path
-	}
-	if _, err := os.Stat(defaultPath); errors.Is(err, os.ErrNotExist) {
-		if _, oldErr := os.Stat(oldDefault); oldErr == nil {
-			_ = os.MkdirAll(filepath.Dir(defaultPath), 0o700)
-			_ = copyFile(oldDefault, defaultPath, fileModeFor(configFileName))
-		}
-	}
-	return defaultPath
 }
 
 func writeSettings(path string, settings Settings) error {
@@ -3241,6 +3440,9 @@ func writeSettings(path string, settings Settings) error {
 }
 
 func (m *Manager) acquireLock(lockPath string) (func(), error) {
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		return m.acquirePostgresLock(filepath.Base(lockPath))
+	}
 	start := time.Now()
 	for {
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -3255,6 +3457,37 @@ func (m *Manager) acquireLock(lockPath string) (func(), error) {
 		}
 		if time.Since(start) > 2*time.Second {
 			return nil, errors.New("timeout acquiring lock for round-robin selector")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (m *Manager) acquirePostgresLock(name string) (func(), error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	for {
+		var locked bool
+		err := db.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, name).Scan(&locked)
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if locked {
+			return func() {
+				unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer unlockCancel()
+				_, _ = db.ExecContext(unlockCtx, `SELECT pg_advisory_unlock(hashtext($1))`, name)
+				_ = db.Close()
+			}, nil
+		}
+		if time.Since(start) > 5*time.Second {
+			_ = db.Close()
+			return nil, fmt.Errorf("timeout acquiring postgres lock %s", name)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

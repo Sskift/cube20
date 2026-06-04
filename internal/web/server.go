@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -18,10 +19,11 @@ import (
 )
 
 type Server struct {
-	Manager    *manager.Manager
-	Host       string
-	Port       int
-	CloudToken string
+	Manager              *manager.Manager
+	Host                 string
+	Port                 int
+	CloudToken           string
+	QuotaRefreshInterval time.Duration
 }
 
 type authContextKey struct{}
@@ -39,6 +41,19 @@ func (s *Server) ListenAndServe() error {
 		s.Port = 8720
 	}
 
+	if s.QuotaRefreshInterval > 0 {
+		StartQuotaWorker(context.Background(), s.Manager, s.QuotaRefreshInterval, log.Printf)
+	}
+
+	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
+	fmt.Printf("cube dashboard: http://%s\n", addr)
+	if strings.TrimSpace(s.CloudToken) != "" {
+		fmt.Println("cube dashboard: API bearer token is required")
+	}
+	return http.ListenAndServe(addr, s.Handler())
+}
+
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	admin := func(handler http.HandlerFunc) http.HandlerFunc {
 		return s.withAdminAuth(handler)
@@ -46,6 +61,8 @@ func (s *Server) ListenAndServe() error {
 	sync := func(handler http.HandlerFunc) http.HandlerFunc {
 		return s.withSyncAuth(handler)
 	}
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/api/sync/push", sync(s.handleSyncPush))
 	mux.HandleFunc("/api/sync/pull/", sync(s.handleSyncPull))
 	mux.HandleFunc("/api/sync/claim", sync(s.handleSyncClaim))
@@ -68,20 +85,15 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/accounts/", admin(s.handleAccountAction))
 	mux.HandleFunc("/api/meta", admin(s.handleMeta))
 	mux.HandleFunc("/api/settings", admin(s.handleSettings))
-	mux.HandleFunc("/api/codex-config", admin(s.handleCodexConfig))
 
 	distSub, err := fs.Sub(webdist.DistFS, "dist")
 	if err != nil {
-		return fmt.Errorf("failed to sub dist folder: %w", err)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to sub dist folder: %v", err))
+		})
 	}
 	mux.Handle("/", staticHandler(distSub))
-
-	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
-	fmt.Printf("cube dashboard: http://%s\n", addr)
-	if strings.TrimSpace(s.CloudToken) != "" {
-		fmt.Println("cube dashboard: API bearer token is required")
-	}
-	return http.ListenAndServe(addr, mux)
+	return mux
 }
 
 func (s *Server) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -102,8 +114,12 @@ func (s *Server) withSyncAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		token := requestToken(r)
 		if client, ok := s.Manager.AuthenticateClientToken(token); ok {
-			_ = s.Manager.TouchClient(client.ID)
 			auth := requestAuth{ClientID: client.ID}
+			if message := clientPATSyncForbidden(r); message != "" {
+				writeError(w, http.StatusForbidden, message)
+				return
+			}
+			_ = s.Manager.TouchClient(client.ID)
 			next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
 			return
 		}
@@ -140,6 +156,74 @@ func requestToken(r *http.Request) string {
 func authFromRequest(r *http.Request) requestAuth {
 	auth, _ := r.Context().Value(authContextKey{}).(requestAuth)
 	return auth
+}
+
+func clientPATSyncForbidden(r *http.Request) string {
+	path := r.URL.Path
+	switch {
+	case path == "/api/me":
+		if r.Method == http.MethodGet {
+			return ""
+		}
+		return "client PATs can only read /api/me"
+	case path == "/api/sync/claim":
+		if r.Method == http.MethodGet || r.Method == http.MethodPost {
+			return ""
+		}
+		return "client PATs can only claim leases with GET or POST"
+	case path == "/api/sync/leases":
+		if r.Method == http.MethodPost {
+			return ""
+		}
+		return "client PATs can only create leases at /api/sync/leases"
+	case strings.HasPrefix(path, "/api/sync/leases/"):
+		return clientPATLeaseActionForbidden(r)
+	case path == "/api/sync/push":
+		if r.Method == http.MethodPost {
+			return ""
+		}
+		return "client PATs can only upload leased auth or client-owned reports with POST"
+	case path == "/api/sync/usage":
+		if r.Method == http.MethodPost {
+			return ""
+		}
+		return "client PATs can only upload usage reports"
+	case strings.HasPrefix(path, "/api/sync/quota/"):
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
+			return ""
+		}
+		return "client PATs can only upload quota reports; use an admin token to fetch quota"
+	case strings.HasPrefix(path, "/api/sync/pull/"):
+		return "client PATs cannot pull auth snapshots; use an admin token"
+	default:
+		return "client PAT is not allowed to call this sync route"
+	}
+}
+
+func clientPATLeaseActionForbidden(r *http.Request) string {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/sync/leases/"), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		if r.Method == http.MethodPatch || r.Method == http.MethodPost || r.Method == http.MethodDelete {
+			return ""
+		}
+		return "client PATs can only heartbeat or release their own leases"
+	}
+	if len(parts) == 2 && parts[0] != "" {
+		switch parts[1] {
+		case "heartbeat":
+			if r.Method == http.MethodPatch || r.Method == http.MethodPost {
+				return ""
+			}
+			return "client PATs can only heartbeat their own leases with PATCH or POST"
+		case "auth":
+			if r.Method == http.MethodPost || r.Method == http.MethodPut {
+				return ""
+			}
+			return "client PATs can only upload auth for their own leases with POST or PUT"
+		}
+	}
+	return "client PATs can only heartbeat, release, or upload auth for their own leases"
 }
 
 func staticHandler(dist fs.FS) http.Handler {
@@ -221,31 +305,23 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"settingsPath":       s.Manager.SettingsPath,
-			"settingsToml":       text,
-			"liveCodexHome":      s.Manager.LiveCodexHome,
-			"accountsDir":        s.Manager.AccountsDir,
-			"sharedConfigPath":   s.Manager.SharedConfigPath,
-			"sharedSettingsPath": s.Manager.SharedConfigPath,
-			"cloudUrl":           s.Manager.CloudURL,
-			"cloudTokenPresent":  strings.TrimSpace(s.Manager.CloudToken) != "",
+			"settingsPath":      s.Manager.SettingsPath,
+			"settingsToml":      text,
+			"liveCodexHome":     s.Manager.LiveCodexHome,
+			"accountsDir":       s.Manager.AccountsDir,
+			"cloudUrl":          s.Manager.CloudURL,
+			"cloudTokenPresent": strings.TrimSpace(s.Manager.CloudToken) != "",
 		})
 	case http.MethodPatch:
 		var body struct {
-			LiveCodexHome      string `json:"liveCodexHome"`
-			AccountsDir        string `json:"accountsDir"`
-			SharedConfigPath   string `json:"sharedConfigPath"`
-			SharedSettingsPath string `json:"sharedSettingsPath"`
+			LiveCodexHome string `json:"liveCodexHome"`
+			AccountsDir   string `json:"accountsDir"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-		sharedPath := body.SharedSettingsPath
-		if strings.TrimSpace(sharedPath) == "" {
-			sharedPath = body.SharedConfigPath
-		}
-		if _, err := s.Manager.UpdateSettings(body.LiveCodexHome, body.AccountsDir, sharedPath); err != nil {
+		if _, err := s.Manager.UpdateSettings(body.LiveCodexHome, body.AccountsDir, ""); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -265,14 +341,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		text, _ := s.Manager.ReadSettingsText()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"settingsPath":       s.Manager.SettingsPath,
-			"settingsToml":       text,
-			"liveCodexHome":      settings.LiveCodexHome,
-			"accountsDir":        settings.AccountsDir,
-			"sharedConfigPath":   settings.SharedConfigPath,
-			"sharedSettingsPath": settings.SharedConfigPath,
-			"cloudUrl":           settings.CloudURL,
-			"cloudTokenPresent":  strings.TrimSpace(settings.CloudToken) != "",
+			"settingsPath":      s.Manager.SettingsPath,
+			"settingsToml":      text,
+			"liveCodexHome":     settings.LiveCodexHome,
+			"accountsDir":       settings.AccountsDir,
+			"cloudUrl":          settings.CloudURL,
+			"cloudTokenPresent": strings.TrimSpace(settings.CloudToken) != "",
 		})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -281,59 +355,14 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) writeMeta(w http.ResponseWriter) {
 	live := s.Manager.LiveProfileView()
-	sharedConfigPath, sharedConfigPresent, sharedConfigUpdated := s.Manager.SharedConfigInfo()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"statePath":           s.Manager.StatePath,
-		"settingsPath":        s.Manager.SettingsPath,
-		"accountsDir":         s.Manager.AccountsDir,
-		"liveCodexHome":       s.Manager.LiveCodexHome,
-		"liveAuthPresent":     live.AuthPresent,
-		"liveConfigPresent":   live.ConfigPresent,
-		"sharedConfigPath":    sharedConfigPath,
-		"sharedSettingsPath":  sharedConfigPath,
-		"sharedConfigPresent": sharedConfigPresent,
-		"sharedConfigUpdated": sharedConfigUpdated,
+		"statePath":         s.Manager.StatePath,
+		"settingsPath":      s.Manager.SettingsPath,
+		"accountsDir":       s.Manager.AccountsDir,
+		"liveCodexHome":     s.Manager.LiveCodexHome,
+		"liveAuthPresent":   live.AuthPresent,
+		"liveConfigPresent": live.ConfigPresent,
 	})
-}
-
-func (s *Server) handleCodexConfig(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		text, err := s.Manager.ReadSharedConfigText()
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		path, present, updated := s.Manager.SharedConfigInfo()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"configPath":    path,
-			"configToml":    text,
-			"configPresent": present,
-			"configUpdated": updated,
-		})
-	case http.MethodPut:
-		var body struct {
-			ConfigToml string `json:"configToml"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid json")
-			return
-		}
-		if err := s.Manager.WriteSharedConfigText(body.ConfigToml); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		text, _ := s.Manager.ReadSharedConfigText()
-		path, present, updated := s.Manager.SharedConfigInfo()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"configPath":    path,
-			"configToml":    text,
-			"configPresent": present,
-			"configUpdated": updated,
-		})
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
 }
 
 func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
@@ -348,6 +377,24 @@ func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	auth := authFromRequest(r)
+	if !auth.Admin && strings.TrimSpace(snapshot.LeaseID) == "" {
+		if strings.TrimSpace(snapshot.ID) == "" || snapshot.OwnerMode != manager.OwnerClient {
+			writeError(w, http.StatusForbidden, "client PATs can only push leased auth or their own client-owned report")
+			return
+		}
+		if existing, err := s.Manager.GetAccount(snapshot.ID); err == nil {
+			if existing.OwnerMode != manager.OwnerClient {
+				writeError(w, http.StatusForbidden, "client PATs cannot replace cloud-owned auth")
+				return
+			}
+			if existing.OwnerClientID != "" && existing.OwnerClientID != auth.ClientID {
+				writeError(w, http.StatusForbidden, "client PATs can only update accounts owned by the same client")
+				return
+			}
+		}
+		snapshot.OwnerClientID = auth.ClientID
+		snapshot.SourceClient = auth.ClientID
+	}
 	if snapshot.OwnerMode == manager.OwnerClient && strings.TrimSpace(snapshot.OwnerClientID) == "" {
 		snapshot.OwnerClientID = auth.ClientID
 	}
@@ -545,6 +592,8 @@ func (s *Server) handleSyncUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		AccountID string        `json:"accountId"`
+		LeaseID   string        `json:"leaseId"`
+		RunID     string        `json:"runId"`
 		Usage     usage.Summary `json:"usage"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&body); err != nil {
@@ -552,7 +601,7 @@ func (s *Server) handleSyncUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	auth := authFromRequest(r)
-	if err := s.Manager.RecordUsage(body.AccountID, auth.ClientID, body.Usage); err != nil {
+	if err := s.Manager.RecordUsageWithContext(body.AccountID, auth.ClientID, body.LeaseID, body.RunID, body.Usage); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

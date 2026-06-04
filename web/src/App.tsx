@@ -1,4 +1,4 @@
-import type { ChangeEvent, FormEvent, ReactNode } from "react";
+import type { ChangeEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Avatar,
@@ -7,16 +7,13 @@ import {
   Chip,
   Input,
   ProgressBar,
-  Separator,
   Skeleton,
-  TextArea,
 } from "@heroui/react";
 import {
   CheckCircle2,
   Copy,
   Database,
   FileJson,
-  FolderCog,
   Gauge,
   Info,
   KeyRound,
@@ -66,19 +63,6 @@ interface Meta {
   liveCodexHome: string;
   liveAuthPresent: boolean;
   liveConfigPresent: boolean;
-  sharedConfigPath: string;
-  sharedSettingsPath?: string;
-  sharedConfigPresent: boolean;
-  sharedConfigUpdated?: string;
-}
-
-interface SettingsPayload {
-  settingsPath: string;
-  settingsToml: string;
-  liveCodexHome: string;
-  accountsDir: string;
-  sharedConfigPath: string;
-  sharedSettingsPath?: string;
 }
 
 interface QuotaItem {
@@ -194,7 +178,7 @@ interface PersonalPayload {
 }
 
 type AccessMode = "unknown" | "admin" | "personal";
-type DashboardView = "accounts" | "load-balancer" | "people" | "import" | "settings";
+type DashboardView = "accounts" | "load-balancer" | "people" | "import";
 
 const CLOUD_TOKEN_KEY = "cube20.cloudToken";
 let cloudTokenSynced = false;
@@ -455,9 +439,6 @@ export default function App() {
   const [label, setLabel] = useState("");
   const [status, setStatus] = useState<AccountStatus>("ready");
   const [ownerMode, setOwnerMode] = useState<AccountOwnerMode>("cloud");
-  const [liveHome, setLiveHome] = useState("");
-  const [accountsDir, setAccountsDir] = useState("");
-  const [settingsToml, setSettingsToml] = useState("");
   const [quotas, setQuotas] = useState<Record<string, QuotaResult>>({});
   const [stats, setStats] = useState<Record<string, AccountUsage>>({});
   const [clients, setClients] = useState<Client[]>([]);
@@ -503,11 +484,10 @@ export default function App() {
   async function loadAll(preferredId = selectedId) {
     setLoading(true);
     try {
-      const [metaData, accountData, lbData, settingsData, statsData, clientData, queueData] = await Promise.all([
+      const [metaData, accountData, lbData, statsData, clientData, queueData] = await Promise.all([
         apiJSON<Meta>("/api/meta"),
         apiJSON<Account[]>("/api/accounts"),
         apiJSON<LoadBalanceStatus>("/api/lb/status"),
-        apiJSON<SettingsPayload>("/api/settings"),
         apiJSON<Record<string, AccountUsage>>("/api/stats"),
         apiJSON<Client[]>("/api/clients"),
         apiJSON<RefreshQueueItem[]>("/api/refresh-queue"),
@@ -518,9 +498,6 @@ export default function App() {
       setStats(statsData);
       setClients(clientData);
       setRefreshQueue(queueData);
-      setLiveHome(settingsData.liveCodexHome);
-      setAccountsDir(settingsData.accountsDir);
-      setSettingsToml(settingsData.settingsToml);
       if (!accountData.some((account) => account.id === preferredId)) {
         setSelectedId(accountData.find((account) => account.active)?.id || accountData[0]?.id || "");
       }
@@ -586,10 +563,6 @@ export default function App() {
   function selectView(view: DashboardView) {
     setActiveView(view);
     if (compactShell) setSidebarOpen(false);
-  }
-
-  function openSettingsPanel() {
-    selectView("settings");
   }
 
   async function withBusy(action: () => Promise<void>) {
@@ -689,32 +662,6 @@ export default function App() {
     });
   }
 
-  async function savePathSettings(event: FormEvent) {
-    event.preventDefault();
-    await withBusy(async () => {
-      await apiJSON<Meta>("/api/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ liveCodexHome: liveHome, accountsDir }),
-      });
-      setMessage("Settings paths saved");
-      await loadAll(selectedId);
-    });
-  }
-
-  async function saveRawSettings() {
-    await withBusy(async () => {
-      const settings = await apiJSON<SettingsPayload>("/api/settings", {
-        method: "PUT",
-        body: JSON.stringify({ settingsToml }),
-      });
-      setLiveHome(settings.liveCodexHome);
-      setAccountsDir(settings.accountsDir);
-      setSettingsToml(settings.settingsToml);
-      setMessage("settings.toml saved");
-      await loadAll(selectedId);
-    });
-  }
-
   async function pickNext() {
     await withBusy(async () => {
       const account = await apiJSON<Account>("/api/lb/pick", { method: "POST" });
@@ -806,7 +753,6 @@ export default function App() {
           onPress={() => selectView("people")}
         />
         <NavItem icon={<FileJson size={17} />} label="Import auth" active={activeView === "import"} onPress={() => selectView("import")} />
-        <NavItem icon={<FolderCog size={17} />} label="Settings" active={activeView === "settings"} onPress={openSettingsPanel} />
       </div>
       <div className="border-t border-slate-200 p-3">
         <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
@@ -1216,12 +1162,6 @@ export default function App() {
           </section>
         )}
 
-        {activeView === "settings" && (
-          <section className="cube-view-panel">
-            <SettingsEditorCard />
-          </section>
-        )}
-
         {message && (
           <Card className="border border-teal-200 bg-teal-50 text-teal-900">
             <Card.Content className="flex flex-row items-start gap-2 p-4 text-sm">
@@ -1233,56 +1173,6 @@ export default function App() {
       </div>
     </AppLayout>
   );
-
-  function SettingsEditorCard({ subtle = false }: { subtle?: boolean } = {}) {
-    return (
-      <Card className={subtle ? "border border-slate-200 shadow-none" : "border border-slate-200 bg-white shadow-sm"}>
-        <Card.Header className="border-b border-slate-100 px-4 py-3">
-          <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-950">
-            <FolderCog size={16} />
-            settings.toml
-          </h3>
-        </Card.Header>
-        <Card.Content className="gap-4">
-          <form className="flex flex-col gap-3" onSubmit={savePathSettings}>
-            <FieldLabel text="live_codex_home">
-              <Input
-                fullWidth
-                value={liveHome}
-                variant="secondary"
-                onChange={(event) => setLiveHome(event.currentTarget.value)}
-              />
-            </FieldLabel>
-            <FieldLabel text="accounts_dir">
-              <Input
-                fullWidth
-                value={accountsDir}
-                variant="secondary"
-                onChange={(event) => setAccountsDir(event.currentTarget.value)}
-              />
-            </FieldLabel>
-            <Button isDisabled={busy} type="submit" variant="primary">
-              Save paths
-            </Button>
-          </form>
-          <Separator />
-          <TextArea
-            className="min-h-44 font-mono text-xs leading-5"
-            fullWidth
-            rows={9}
-            value={settingsToml}
-            variant="secondary"
-            onChange={(event) => setSettingsToml(event.currentTarget.value)}
-          />
-          <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={saveRawSettings}>
-            <Save size={15} />
-            Save TOML
-          </Button>
-          <div className="path-text font-mono text-xs text-slate-500">{meta?.settingsPath}</div>
-        </Card.Content>
-      </Card>
-    );
-  }
 
   function DetailsPanel() {
     const selectedStats = selected ? stats[selected.id] : undefined;
@@ -1370,8 +1260,6 @@ export default function App() {
               <EmptyState.Description>Use the account grid to inspect auth files and route status.</EmptyState.Description>
             </EmptyState>
           )}
-
-          <SettingsEditorCard subtle />
         </div>
       </div>
     );

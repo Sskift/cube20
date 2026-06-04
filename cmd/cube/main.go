@@ -321,8 +321,10 @@ func runCloud(m *manager.Manager, args []string) error {
 		return configureCloud(m, args[1:])
 	case "quota":
 		return runCloudQuota(m, args[1:])
+	case "relogin":
+		return runCloudRelogin(m, args[1:])
 	default:
-		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token>|quota <account-id>]")
+		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token>|quota <account-id>|relogin <account-id> [--status ready|drain] [--owner cloud|client]]")
 	}
 }
 
@@ -680,7 +682,7 @@ func reportLiveOnce(ctx context.Context, m *manager.Manager, opts cloudSyncOptio
 		}
 	}
 
-	if err := pushUsageFromHome(ctx, opts, account.ID, m.LiveCodexHome); err != nil {
+	if err := pushUsageFromHome(ctx, opts, account.ID, "", "", m.LiveCodexHome); err != nil {
 		return err
 	}
 	if result.Status != "" {
@@ -731,7 +733,7 @@ func runCloudRun(m *manager.Manager, args []string) error {
 	fmt.Fprintf(os.Stderr, "cube: cloud leased %s (%s); using temporary CODEX_HOME\n", snapshot.ID, leaseSnapshot.Lease.ID)
 	cmd := codexCommandForHome(codexHome, codexArgs)
 	runErr, authErr := runCommandWithLease(context.Background(), opts, leaseSnapshot, codexHome, cmd)
-	usageErr := pushUsageFromHome(context.Background(), opts, snapshot.ID, codexHome)
+	usageErr := pushUsageFromHome(context.Background(), opts, snapshot.ID, leaseSnapshot.Lease.ID, "", codexHome)
 	var releaseErr error
 	if authErr == nil {
 		releaseErr = releaseLease(context.Background(), opts, leaseSnapshot.Lease.ID, snapshot.ID)
@@ -1010,13 +1012,17 @@ func pushAuthFromHome(ctx context.Context, opts cloudSyncOptions, snapshot manag
 	return nil
 }
 
-func pushUsageFromHome(ctx context.Context, opts cloudSyncOptions, accountID, codexHome string) error {
+func pushUsageFromHome(ctx context.Context, opts cloudSyncOptions, accountID, leaseID, runID, codexHome string) error {
 	summary := usage.SummarizeCodexHome(codexHome, time.Now())
 	body := struct {
 		AccountID string        `json:"accountId"`
+		LeaseID   string        `json:"leaseId,omitempty"`
+		RunID     string        `json:"runId,omitempty"`
 		Usage     usage.Summary `json:"usage"`
 	}{
 		AccountID: accountID,
+		LeaseID:   leaseID,
+		RunID:     runID,
 		Usage:     summary,
 	}
 	return cloudJSON(ctx, http.MethodPost, opts, "/api/sync/usage", body, nil)
@@ -1156,9 +1162,17 @@ func cloudJSON(ctx context.Context, method string, opts cloudSyncOptions, path s
 func runDashboard(m *manager.Manager, args []string) error {
 	host := "127.0.0.1"
 	port := 8720
+	quotaRefreshInterval := 5 * time.Minute
 	cloudToken := strings.TrimSpace(m.CloudToken)
 	if value := strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")); value != "" {
 		cloudToken = value
+	}
+	if value := strings.TrimSpace(os.Getenv("CUBE_QUOTA_REFRESH_INTERVAL")); value != "" {
+		interval, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("invalid CUBE_QUOTA_REFRESH_INTERVAL %q", value)
+		}
+		quotaRefreshInterval = interval
 	}
 
 	for i := 0; i < len(args); i++ {
@@ -1185,16 +1199,27 @@ func runDashboard(m *manager.Manager, args []string) error {
 			}
 			cloudToken = strings.TrimSpace(args[i+1])
 			i++
+		case "--quota-refresh-interval":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --quota-refresh-interval")
+			}
+			interval, err := time.ParseDuration(args[i+1])
+			if err != nil {
+				return fmt.Errorf("invalid --quota-refresh-interval %q", args[i+1])
+			}
+			quotaRefreshInterval = interval
+			i++
 		default:
 			return fmt.Errorf("unknown dashboard flag %q", args[i])
 		}
 	}
 
 	return (&web.Server{
-		Manager:    m,
-		Host:       host,
-		Port:       port,
-		CloudToken: cloudToken,
+		Manager:              m,
+		Host:                 host,
+		Port:                 port,
+		CloudToken:           cloudToken,
+		QuotaRefreshInterval: quotaRefreshInterval,
 	}).ListenAndServe()
 }
 
@@ -1301,13 +1326,14 @@ func printHelp() {
 	fmt.Println("  cube run [--server <url>] [--token <token>] [--heartbeat 20s] [-- codex args...]")
 	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...>")
 	fmt.Println("  cube cloud quota <account-id>")
+	fmt.Println("  cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client]")
 	fmt.Println("  cube report [--daemon] [--interval 5m]")
 	fmt.Println("  cube config edit")
 	fmt.Println("  cube config path")
 	fmt.Println("  cube clients list")
 	fmt.Println("  cube clients create [label]")
 	fmt.Println("  cube clients revoke <client-id>")
-	fmt.Println("  cube dashboard [--host 127.0.0.1] [--port 8720] [--cloud-token <admin-token>]")
+	fmt.Println("  cube dashboard [--host 127.0.0.1] [--port 8720] [--cloud-token <admin-token>] [--quota-refresh-interval 5m]")
 	fmt.Println()
 	fmt.Println("Legacy/local admin tools:")
 	fmt.Println("  cube accounts list")
@@ -1324,6 +1350,7 @@ func printHelp() {
 	fmt.Println("  cube codex-auto [codex args...]")
 	fmt.Println("  cube lb [status|pick|reset]")
 	fmt.Println("  cube cloud status")
+	fmt.Println("  cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client]")
 	fmt.Println("  cube sync push <id|--all> [--server <url>] [--token <token>]")
 	fmt.Println("  cube sync pull <id> [--server <url>] [--token <token>] [--deploy]")
 	fmt.Println("  cube sync claim [--server <url>] [--token <token>] [--deploy]")

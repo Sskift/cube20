@@ -1,0 +1,22 @@
+[Unit]
+Description=cube20 cloud dashboard
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cube
+Group=cube
+WorkingDirectory=/opt/cube20
+EnvironmentFile=/etc/cube20/cube-server.env
+ExecStart=/opt/cube20/bin/cube dashboard --host 127.0.0.1 --port 8720
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/cube20 /home/cube/.cube20 /home/cube/.codex-accounts
+
+[Install]
+WantedBy=multi-user.target

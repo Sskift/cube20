@@ -32,6 +32,7 @@ The managed Postgres tables are created automatically:
 - `cube_accounts`
 - `cube_clients`
 - `cube_usage`
+- `cube_usage_events`
 - `cube_quota_cache`
 - `cube_meta`
 
@@ -55,6 +56,7 @@ cube clients list
 cube clients revoke client-macbook-a
 cube cloud config --server https://cube.example.com --token <cube_pat_...>
 cube cloud quota work-plus
+cube cloud relogin work-plus
 cube run
 cube run --heartbeat 20s -- --model gpt-5
 cube report
@@ -84,6 +86,7 @@ token:
 ```shell
 export CUBE_DATABASE_URL=postgres://cube:secret@db.example.com:5432/cube?sslmode=require
 export CUBE_CLOUD_TOKEN="$(openssl rand -hex 32)"
+export CUBE_QUOTA_REFRESH_INTERVAL=5m
 ./bin/cube dashboard --host 0.0.0.0 --port 8720
 ```
 
@@ -97,6 +100,19 @@ You can also persist the token in `~/.cube20/settings.toml` on the server:
 Open the hosted dashboard with `?token=<token>` once; the browser stores that
 token locally and sends it on future API requests. Put the service behind HTTPS
 before sending real `auth.json` data over the network.
+
+Production examples live under `deploy/`:
+
+- `deploy/cube-server.env.example`
+- `deploy/cube20.service`
+- `deploy/nginx-cube20.conf`
+
+The service exposes unauthenticated `GET /healthz` and `GET /readyz` probes.
+`/readyz` verifies local state and Postgres connectivity when
+`CUBE_DATABASE_URL` is set. In Postgres mode, lease selection uses a Postgres
+advisory lock so multiple server processes do not hand out the same account.
+Keep the service behind TLS because cloud-owned `auth.json` snapshots are stored
+server-side.
 
 ## Cloud Clients
 
@@ -112,8 +128,10 @@ cloud server:
 
 Give each local operator only their generated `cube_pat_...` token. The PAT can
 claim an exclusive account lease, heartbeat that lease, upload refreshed auth,
-upload usage, and request remote quota refreshes. It is not the dashboard admin
-token.
+upload usage, upload client quota reports, and open the personal dashboard. It
+cannot pull arbitrary auth snapshots, push arbitrary cloud-owned auth, change
+accounts, or fetch server-side cloud quota. Use the admin token only for
+dashboard administration, importing auth, and cloud relogin.
 
 ## Cloud Run
 
@@ -161,6 +179,22 @@ During recovery it verifies the last uploaded auth with a quota refresh; success
 returns the account to `ready`, while invalidated refresh tokens stay out of the
 pool until a fresh login/auth upload.
 
+## Cloud Relogin
+
+Use relogin when a cloud-owned account shows `refresh_token_invalidated` or is
+kept in `drain` after a failed refresh:
+
+```shell
+./bin/cube cloud config --server https://cube.example.com --token <admin-token>
+./bin/cube cloud relogin skift --status ready --owner cloud
+```
+
+`cube cloud relogin` creates a temporary `CODEX_HOME`, runs
+`codex login --device-auth`, uploads the resulting `auth.json` to the cloud,
+checks quota once, and deletes the temporary local auth copy. It does not modify
+the operator's `~/.codex/auth.json`. This command replaces stored cloud auth and
+therefore requires the admin token, not a client PAT.
+
 ## Local Reports
 
 Use `cube report` for accounts that should stay owned by the local Codex
@@ -180,6 +214,10 @@ refreshes quota with its own `auth.json`, uploads the refreshed auth snapshot,
 uploads usage stats, and posts the quota result to the server cache. The cloud
 dashboard shows that quota as `client report`, and the load balancer will not
 lease that account to `cube run`.
+
+Do not use bare `codex` and `cube run` to share the same cloud-owned account at
+the same time. Bare `codex` only knows the local `~/.codex/auth.json`; cloud
+leases only protect sessions started through `cube run`.
 
 For cloud-owned accounts, dashboard refresh and `cube cloud quota <id>` are
 server-side refreshes. For client-owned accounts, those same cloud reads return
@@ -217,10 +255,14 @@ The cloud endpoints are:
 - `GET /api/stats`
 - `GET /api/refresh-queue`
 - `GET|POST /api/clients`
+- `GET /healthz`
+- `GET /readyz`
 
 Admin routes require `Authorization: Bearer <admin-token>` when
 `CUBE_CLOUD_TOKEN` or `--cloud-token` is configured. Sync routes accept either
-the admin token or a client PAT.
+the admin token or a client PAT, but PATs are intentionally restricted to lease
+and report operations. PATs cannot pull auth snapshots or push unleased
+cloud-owned auth.
 
 ## Quota
 
@@ -243,3 +285,7 @@ from an API key.
 and uploads today, seven-day, all-time, and per-model token totals to the cloud.
 The dashboard shows the cleaned account view, connected clients, per-account
 usage, and the 5h quota refresh queue.
+
+Postgres deployments also keep per-run/per-model rows in `cube_usage_events`.
+The current dashboard still reads the compact `cube_usage` summary; the event
+table is the durable source for future per-session views.
