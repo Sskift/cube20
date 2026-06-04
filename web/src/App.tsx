@@ -20,9 +20,7 @@ import {
   LogOut,
   PanelRightClose,
   PanelRightOpen,
-  Play,
   RefreshCw,
-  RotateCcw,
   Route,
   Save,
   ShieldCheck,
@@ -108,6 +106,21 @@ interface AccountUsage {
   models?: ModelUsage[];
 }
 
+interface DispatchEvent {
+  id: string;
+  leaseId: string;
+  accountId: string;
+  accountLabel?: string;
+  clientId?: string;
+  clientLabel?: string;
+  holder?: string;
+  event: string;
+  generation?: number;
+  createdAt: string;
+  startedAt?: string;
+  expiresAt?: string;
+}
+
 interface Client {
   id: string;
   label: string;
@@ -134,6 +147,7 @@ interface RefreshQueueItem {
   quotaReporterClientId?: string;
   leaseActive?: boolean;
   leaseClientId?: string;
+  leaseHolder?: string;
   leaseExpiresAt?: string;
 }
 
@@ -150,6 +164,7 @@ interface LoadBalanceAccount {
   generation?: number;
   leaseActive?: boolean;
   leaseClientId?: string;
+  leaseHolder?: string;
   leaseExpiresAt?: string;
   eligible: boolean;
   reason?: string;
@@ -176,6 +191,7 @@ interface PersonalPayload {
   client?: Client;
   clients?: Client[];
   usage?: AccountUsage[] | Record<string, AccountUsage>;
+  dispatches?: DispatchEvent[];
   totals?: {
     today: UsageToken;
     sevenDays: UsageToken;
@@ -447,9 +463,9 @@ export default function App() {
   const [status, setStatus] = useState<AccountStatus>("ready");
   const [ownerMode, setOwnerMode] = useState<AccountOwnerMode>("cloud");
   const [quotas, setQuotas] = useState<Record<string, QuotaResult>>({});
-  const [stats, setStats] = useState<Record<string, AccountUsage>>({});
   const [clients, setClients] = useState<Client[]>([]);
   const [refreshQueue, setRefreshQueue] = useState<RefreshQueueItem[]>([]);
+  const [dispatches, setDispatches] = useState<DispatchEvent[]>([]);
   const [personal, setPersonal] = useState<PersonalPayload | null>(null);
   const [accessMode, setAccessMode] = useState<AccessMode>("unknown");
   const [message, setMessage] = useState("");
@@ -468,8 +484,8 @@ export default function App() {
   const excludedCount = lb?.excluded.length ?? 0;
   const lbTotalCount = eligibleCount + excludedCount;
   const lbEligiblePercent = lbTotalCount ? Math.round((eligibleCount / lbTotalCount) * 100) : 0;
+  const lbAccounts = useMemo(() => [...(lb?.eligible || []), ...(lb?.excluded || [])], [lb]);
   const activeClientCount = clients.filter((client) => client.active).length;
-  const sevenDayTokenTotal = Object.values(stats).reduce((total, item) => total + (item.sevenDays?.total || 0), 0);
   const personalUsage = useMemo(() => {
     if (!personal?.usage) return [] as AccountUsage[];
     if (Array.isArray(personal.usage)) return personal.usage;
@@ -480,6 +496,13 @@ export default function App() {
     for (const item of refreshQueue) map.set(item.accountId, item);
     return map;
   }, [refreshQueue]);
+  const latestDispatchByAccount = useMemo(() => {
+    const map = new Map<string, DispatchEvent>();
+    for (const item of dispatches) {
+      if (!map.has(item.accountId)) map.set(item.accountId, item);
+    }
+    return map;
+  }, [dispatches]);
   const [asideOpen, setAsideOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => (typeof window === "undefined" ? true : window.innerWidth >= 1180));
   const [compactShell, setCompactShell] = useState(() => (typeof window === "undefined" ? false : window.innerWidth < 1180));
@@ -494,20 +517,20 @@ export default function App() {
   async function loadAll(preferredId = selectedId) {
     setLoading(true);
     try {
-      const [metaData, accountData, lbData, statsData, clientData, queueData] = await Promise.all([
+      const [metaData, accountData, lbData, clientData, queueData] = await Promise.all([
         apiJSON<Meta>("/api/meta"),
         apiJSON<Account[]>("/api/accounts"),
         apiJSON<LoadBalanceStatus>("/api/lb/status"),
-        apiJSON<Record<string, AccountUsage>>("/api/stats"),
         apiJSON<Client[]>("/api/clients"),
         apiJSON<RefreshQueueItem[]>("/api/refresh-queue"),
       ]);
+      const dispatchData = await apiJSON<DispatchEvent[]>("/api/dispatches?limit=80");
       setMeta(metaData);
       setAccounts(accountData);
       setLB(lbData);
-      setStats(statsData);
       setClients(clientData);
       setRefreshQueue(queueData);
+      setDispatches(dispatchData);
       if (!accountData.some((account) => account.id === preferredId)) {
         setSelectedId(accountData.find((account) => account.active)?.id || accountData[0]?.id || "");
       }
@@ -647,30 +670,6 @@ export default function App() {
     }
   }
 
-  async function refreshAllQuotas() {
-    await withBusy(async () => {
-      await Promise.all(accounts.map((account) => fetchQuota(account.id, true)));
-      setMessage("All quotas refreshed");
-    });
-  }
-
-  async function pickNext() {
-    await withBusy(async () => {
-      const account = await apiJSON<Account>("/api/lb/pick", { method: "POST" });
-      setSelectedId(account.id);
-      setMessage(`Selected ${accountName(account)}`);
-      await loadAll(account.id);
-    });
-  }
-
-  async function resetLB() {
-    await withBusy(async () => {
-      const status = await apiJSON<LoadBalanceStatus>("/api/lb/reset", { method: "POST" });
-      setLB(status);
-      setMessage("Round-robin state reset");
-    });
-  }
-
   async function createClient() {
     await withBusy(async () => {
       const result = await apiJSON<{ client: Client; token: string }>("/api/clients", {
@@ -705,8 +704,8 @@ export default function App() {
     setPersonal(null);
     setAccounts([]);
     setClients([]);
-    setStats({});
     setRefreshQueue([]);
+    setDispatches([]);
     setAccessMode("unknown");
     setMessage("Token cleared");
   }
@@ -793,13 +792,9 @@ export default function App() {
           {asideOpen ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
           <span className="hidden min-[700px]:inline">Details</span>
         </button>
-        <Button aria-label="Refresh" className="gap-2" size="sm" variant="secondary" onPress={() => loadAll()}>
+        <Button aria-label="Reload data" className="gap-2" size="sm" variant="secondary" onPress={() => loadAll()}>
           <RefreshCw size={15} />
-          <span className="hidden min-[700px]:inline">Refresh</span>
-        </Button>
-        <Button aria-label="Quotas" className="gap-2" size="sm" variant="primary" onPress={refreshAllQuotas}>
-          <Gauge size={15} />
-          <span className="hidden min-[700px]:inline">Quotas</span>
+          <span className="hidden min-[700px]:inline">Reload</span>
         </Button>
       </div>
     </div>
@@ -863,10 +858,10 @@ export default function App() {
               <MetricCard icon={<Database size={18} />} label="Accounts" value={accounts.length.toString()} status="success" />
               <MetricCard icon={<CheckCircle2 size={18} />} label="Ready Pool" value={readyCount.toString()} status="success" />
               <MetricCard
-                icon={<Gauge size={18} />}
-                label="7d Tokens"
-                value={tokens(sevenDayTokenTotal)}
-                status={sevenDayTokenTotal > 0 ? "success" : "warning"}
+                icon={<Route size={18} />}
+                label="Dispatches"
+                value={dispatches.length.toString()}
+                status={dispatches.length > 0 ? "success" : "warning"}
               />
               <MetricCard
                 icon={<ShieldCheck size={18} />}
@@ -905,16 +900,6 @@ export default function App() {
                   </div>
                 </Card.Header>
                 <Card.Content className="p-0">
-                  {!loading && accounts.length > 0 && (
-                    <QuotaOverview
-                      accounts={accounts}
-                      busy={busy}
-                      quotas={quotas}
-                      selectedId={selectedId}
-                      onRefreshAll={refreshAllQuotas}
-                      onSelect={(id) => setSelectedId(id)}
-                    />
-                  )}
                   {loading ? (
                     <div className="space-y-3 p-5">
                       <Skeleton className="h-16 rounded-xl" />
@@ -931,9 +916,11 @@ export default function App() {
                             isSelected={account.id === selectedId}
                             quota={quotas[account.id]}
                             refresh={refreshByAccount.get(account.id)}
-                            usage={stats[account.id]}
-                            onFetchQuota={() => fetchQuota(account.id)}
-                            onSelect={() => setSelectedId(account.id)}
+                            dispatch={latestDispatchByAccount.get(account.id)}
+                            onSelect={() => {
+                              setSelectedId(account.id);
+                              setAsideOpen(true);
+                            }}
                           />
                         ))
                       ) : (
@@ -962,16 +949,9 @@ export default function App() {
                     <h2 className="text-base font-semibold text-slate-950">Load balancer</h2>
                     <p className="text-xs text-slate-500">Quota-aware lease assignment for cube run.</p>
                   </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button className="gap-2" variant="primary" onPress={pickNext}>
-                      <Play size={15} />
-                      Pick next
-                    </Button>
-                    <Button className="gap-2" variant="secondary" onPress={resetLB}>
-                      <RotateCcw size={15} />
-                      Reset
-                    </Button>
-                  </div>
+                  <Chip color={eligibleCount ? "success" : "danger"} variant="soft">
+                    {eligibleCount} assignable
+                  </Chip>
                 </Card.Header>
                 <Card.Content className="gap-4">
                   <div className="lb-summary-grid">
@@ -1010,6 +990,16 @@ export default function App() {
                         <div className="mt-2 text-sm font-medium text-rose-700">No assignable account</div>
                       )}
                     </div>
+                  </div>
+
+                  <div>
+                    <div className="lb-section-head">
+                      <span>Routing map</span>
+                      <Chip color={eligibleCount ? "success" : "danger"} size="sm" variant="soft">
+                        {eligibleCount}/{lbTotalCount || 0} assignable
+                      </Chip>
+                    </div>
+                    <RoutingMap accounts={lbAccounts} dispatchByAccount={latestDispatchByAccount} />
                   </div>
 
                   <div>
@@ -1057,6 +1047,18 @@ export default function App() {
                       <RefreshQueueBar key={item.accountId} item={item} index={index} />
                     ))}
                     {!refreshQueue.length && <div className="lb-empty">No quota checks yet.</div>}
+                  </Card.Content>
+                </Card>
+
+                <Card className="border border-slate-200 bg-white shadow-sm">
+                  <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+                    <h2 className="text-base font-semibold text-slate-950">Dispatch history</h2>
+                    <Chip color={dispatches.length ? "success" : "warning"} variant="soft">
+                      {dispatches.length}
+                    </Chip>
+                  </Card.Header>
+                  <Card.Content className="gap-2">
+                    <DispatchTimeline dispatches={dispatches.slice(0, 10)} />
                   </Card.Content>
                 </Card>
               </div>
@@ -1190,13 +1192,13 @@ export default function App() {
   );
 
   function DetailsPanel() {
-    const selectedStats = selected ? stats[selected.id] : undefined;
     const selectedRefresh = selected ? refreshByAccount.get(selected.id) : undefined;
+    const selectedDispatch = selected ? latestDispatchByAccount.get(selected.id) : undefined;
     return (
       <div className="flex h-full min-h-0 flex-col bg-white">
         <div className="border-b border-slate-200 px-5 py-4">
-          <div className="text-sm font-semibold text-slate-950">Selected account</div>
-          <div className="mt-1 text-xs text-slate-500">{selected ? `${selected.status} · ${selected.authPresent ? "auth ready" : "auth missing"}` : "No account selected"}</div>
+          <div className="text-sm font-semibold text-slate-950">Account detail</div>
+          <div className="mt-1 text-xs text-slate-500">{selected ? `${selected.status} · ${selected.authPresent ? "auth ready" : "auth missing"}` : "No account opened"}</div>
         </div>
         <div className="flex-1 space-y-4 overflow-auto p-5">
           {selected ? (
@@ -1252,12 +1254,19 @@ export default function App() {
                   <SignalLine label="5h quota" value={selectedRefresh?.remainingDisplay ? `${selectedRefresh.remainingDisplay} left` : selectedRefresh?.refreshOrderReason || "-"} />
                   <SignalLine label="5h reset" value={selectedRefresh?.resetsAt ? shortTime(selectedRefresh.resetsAt) : selectedRefresh?.refreshOrderReason || "-"} />
                   <SignalLine label="quota source" value={selectedRefresh?.quotaSource ? `${selectedRefresh.quotaSource}${selectedRefresh.quotaReporterClientId ? ` · ${selectedRefresh.quotaReporterClientId}` : ""}` : quotas[selected.id]?.source || "-"} />
-                  <SignalLine label="reported 7d tokens" value={selectedStats ? tokens(selectedStats.sevenDays?.total) : "No report"} />
-                  <SignalLine label="latest reported model" value={selectedStats?.latestModel || selectedStats?.models?.[0]?.model || "-"} />
-                  <SignalLine label="usage reporter" value={selectedStats ? `${selectedStats.clientId || "unknown"} · ${shortTime(selectedStats.latestAt || selectedStats.updatedAt)}` : "client reports only"} />
                   <SignalLine label="generation" value={(selected.generation || 0).toString()} />
                   <SignalLine label="owner" value={selected.ownerMode === "client" ? `client ${selected.ownerClientId || "-"}` : "cloud"} />
                   <SignalLine label="lease" value={selected.leaseActive ? `${selected.leaseClientId || selected.leaseHolder || "client"} until ${shortTime(selected.leaseExpiresAt)}` : "-"} />
+                </Card.Content>
+              </Card>
+
+              <Card className="border border-slate-200 shadow-none">
+                <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">Dispatch</Card.Header>
+                <Card.Content className="gap-3 text-xs">
+                  <SignalLine label="current lease" value={selected.leaseActive ? dispatchTarget(selected.leaseClientId, "", selected.leaseHolder) : "-"} />
+                  <SignalLine label="lease expires" value={selected.leaseActive ? shortTime(selected.leaseExpiresAt) : "-"} />
+                  <SignalLine label="last dispatch" value={selectedDispatch ? `${dispatchEventLabel(selectedDispatch.event)} · ${shortTime(selectedDispatch.createdAt)}` : "-"} />
+                  <SignalLine label="sent to" value={selectedDispatch ? dispatchTarget(selectedDispatch.clientId, selectedDispatch.clientLabel, selectedDispatch.holder) : "-"} />
                 </Card.Content>
               </Card>
             </>
@@ -1266,7 +1275,7 @@ export default function App() {
               <EmptyState.Media variant="icon">
                 <Database size={24} />
               </EmptyState.Media>
-              <EmptyState.Title>Select an account</EmptyState.Title>
+              <EmptyState.Title>Open an account</EmptyState.Title>
               <EmptyState.Description>Use the account grid to inspect auth files and route status.</EmptyState.Description>
             </EmptyState>
           )}
@@ -1345,6 +1354,7 @@ function PersonalDashboard({
 }) {
   const client = personal.client;
   const totals = personal.totals;
+  const dispatches = personal.dispatches || [];
   const browserToken = cloudToken();
   const configCommand = `cube cloud config --server ${cloudOrigin()} --token ${browserToken || "<cube_pat_...>"}`;
 
@@ -1363,9 +1373,9 @@ function PersonalDashboard({
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            <Button aria-label="Refresh" className="gap-2" isDisabled={busy} size="sm" variant="secondary" onPress={onRefresh}>
+            <Button aria-label="Reload data" className="gap-2" isDisabled={busy} size="sm" variant="secondary" onPress={onRefresh}>
               <RefreshCw size={15} />
-              <span className="hidden sm:inline">Refresh</span>
+              <span className="hidden sm:inline">Reload</span>
             </Button>
             <Button aria-label="Clear token" className="gap-2" isDisabled={busy} size="sm" variant="danger-soft" onPress={onClearToken}>
               <LogOut size={15} />
@@ -1378,8 +1388,8 @@ function PersonalDashboard({
       <div className="cube-content mx-auto flex w-full max-w-6xl flex-col gap-4 p-3 sm:p-4 lg:gap-5 lg:p-6">
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
           <MetricCard icon={<UserRound size={18} />} label="Client" value={client?.active ? "Active" : "Inactive"} status={client?.active ? "success" : "danger"} />
-          <MetricCard icon={<Gauge size={18} />} label="Reported 7d Tokens" value={tokens(totals?.sevenDays?.total)} status={(totals?.sevenDays?.total || 0) > 0 ? "success" : "warning"} />
-          <MetricCard icon={<Database size={18} />} label="Accounts Reported" value={usage.length.toString()} status={usage.length ? "success" : "warning"} />
+          <MetricCard icon={<Gauge size={18} />} label="7d Token Usage" value={tokens(totals?.sevenDays?.total)} status={(totals?.sevenDays?.total || 0) > 0 ? "success" : "warning"} />
+          <MetricCard icon={<Route size={18} />} label="Dispatches" value={dispatches.length.toString()} status={dispatches.length ? "success" : "warning"} />
         </div>
 
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
@@ -1433,8 +1443,23 @@ function PersonalDashboard({
         <Card className="border border-slate-200 bg-white shadow-sm">
           <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
             <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
+              <Route size={17} />
+              Dispatches
+            </h2>
+            <Chip color={dispatches.length ? "success" : "warning"} variant="soft">
+              {dispatches.length}
+            </Chip>
+          </Card.Header>
+          <Card.Content className="gap-2">
+            <DispatchTimeline dispatches={dispatches.slice(0, 10)} />
+          </Card.Content>
+        </Card>
+
+        <Card className="border border-slate-200 bg-white shadow-sm">
+          <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
+            <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
               <Gauge size={17} />
-              Reported usage
+              Usage by account
             </h2>
             <Chip color="accent" variant="soft">
               {tokens(totals?.allTime?.total)} all
@@ -1486,164 +1511,6 @@ function CopyLine({ label, value }: { label: string; value: string }) {
   );
 }
 
-function quotaSeverity(usedPercent: number) {
-  if (usedPercent >= 90) return "danger";
-  if (usedPercent >= 70) return "warning";
-  return "healthy";
-}
-
-function shortQuotaLabel(value: string) {
-  return value
-    .replace(" window", "")
-    .replace("Weekly", "7d")
-    .replace("All-Model", "all")
-    .replace("Code review", "Review");
-}
-
-function QuotaOverview({
-  accounts,
-  busy,
-  onRefreshAll,
-  onSelect,
-  quotas,
-  selectedId,
-}: {
-  accounts: Account[];
-  busy: boolean;
-  onRefreshAll: () => void;
-  onSelect: (id: string) => void;
-  quotas: Record<string, QuotaResult>;
-  selectedId: string;
-}) {
-  const quotaWindows = accounts.flatMap((account) =>
-    (quotas[account.id]?.quotas || []).map((quota) => ({
-      account,
-      quota,
-      remainingPercent: Math.max(0, Math.min(100, 100 - quota.usedPercent)),
-    })),
-  );
-  const tightest = quotaWindows.sort((a, b) => a.remainingPercent - b.remainingPercent)[0];
-  const checkedCount = accounts.filter((account) => quotas[account.id]).length;
-
-  return (
-    <div className="quota-menubar border-b border-slate-200 bg-slate-50/70 px-3 py-3">
-      <div className="quota-menubar-head">
-        <div className="flex min-w-0 items-center gap-2">
-          <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white text-slate-700 shadow-sm ring-1 ring-slate-200">
-            <Gauge size={15} />
-          </div>
-          <div className="min-w-0">
-            <div className="text-sm font-semibold leading-5 text-slate-950">Subscription balance</div>
-            <div className="truncate text-xs text-slate-500">
-              {tightest
-                ? `${accountName(tightest.account)} · ${tightest.quota.remainingDisplay} left`
-                : checkedCount
-                  ? "Quota checked, no subscription window returned yet"
-                  : "Checking cloud-owned accounts and client reports"}
-            </div>
-          </div>
-        </div>
-        <div className="quota-menubar-actions">
-          <div className="quota-headline-stat">
-            <span>Lowest balance</span>
-            <strong>{tightest ? `${tightest.quota.remainingDisplay} left` : "Pending"}</strong>
-          </div>
-          <Button className="gap-2" isDisabled={busy || !accounts.length} size="sm" variant="secondary" onPress={onRefreshAll}>
-            <RefreshCw size={14} />
-            Refresh
-          </Button>
-        </div>
-      </div>
-
-      <div className="quota-provider-row" aria-label="Account quota balance">
-        {accounts.map((account) => (
-          <QuotaProviderCard
-            key={account.id}
-            account={account}
-            isSelected={account.id === selectedId}
-            quota={quotas[account.id]}
-            onSelect={() => onSelect(account.id)}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function QuotaProviderCard({
-  account,
-  isSelected,
-  onSelect,
-  quota,
-}: {
-  account: Account;
-  isSelected: boolean;
-  onSelect: () => void;
-  quota?: QuotaResult;
-}) {
-  const windows = quota?.quotas || [];
-  const tightestWindow = [...windows].sort((a, b) => b.usedPercent - a.usedPercent)[0];
-  const hint = quotaHint(quota);
-  const headline =
-    quota?.status === "supported" && windows.length
-      ? `${tightestWindow.remainingDisplay} left`
-      : quota?.status === "loading"
-        ? "Checking..."
-        : quota?.status
-          ? quotaSummary(quota).label
-          : "Queued";
-  const severity =
-    quota?.status === "supported" && windows.length
-      ? quotaSeverity(Math.max(...windows.map((item) => item.usedPercent)))
-      : quota?.status === "error" || quota?.status === "refresh_token_invalidated"
-        ? "danger"
-        : quota?.status === "unsupported_api_key"
-          ? "warning"
-          : "muted";
-
-  return (
-    <button
-      aria-label={`Select ${accountName(account)} quota card`}
-      className={`quota-provider-card status-${severity}${isSelected ? " is-selected" : ""}`}
-      title={hint || quota?.detail || account.codexHome}
-      type="button"
-      onClick={onSelect}
-    >
-      <div className="quota-provider-header">
-        <span className="quota-provider-dot" />
-        <span className="quota-provider-name">{accountName(account)}</span>
-        {account.active && <span className="quota-provider-pill">active</span>}
-        <span className="quota-provider-pill">{account.ownerMode || "cloud"}</span>
-        {account.leaseActive && <span className="quota-provider-pill">leased</span>}
-      </div>
-      <div className="quota-provider-meta">
-        <span>{quota?.plan || account.plan || account.status}</span>
-        <strong>{headline}</strong>
-      </div>
-      {windows.length ? (
-        <div className="quota-meter-list">
-          {windows.slice(0, 3).map((item) => {
-            const remaining = Math.max(0, Math.min(100, 100 - item.usedPercent));
-            return (
-              <div key={item.label} className={`quota-inline-meter status-${quotaSeverity(item.usedPercent)}`}>
-                <div className="quota-inline-top">
-                  <span>{shortQuotaLabel(item.label)}</span>
-                  <strong>{item.remainingDisplay}</strong>
-                </div>
-                <div className="quota-inline-track">
-                  <span style={{ width: `${remaining}%` }} />
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      ) : (
-        <div className="quota-provider-empty">{hint || (account.authPresent ? "Waiting for quota data" : "auth.json missing")}</div>
-      )}
-    </button>
-  );
-}
-
 function clampUIPercent(value?: number) {
   if (typeof value !== "number" || Number.isNaN(value)) return 0;
   return Math.max(0, Math.min(100, value));
@@ -1656,6 +1523,43 @@ function lbAccountName(account: LoadBalanceAccount) {
 function scoreLabel(value?: number) {
   if (typeof value !== "number" || Number.isNaN(value)) return "-";
   return value.toFixed(1);
+}
+
+function quotaStatusLabel(value?: string) {
+  switch (value) {
+    case "refresh_token_invalidated":
+      return "re-login";
+    case "unsupported_api_key":
+      return "api key";
+    case "not_configured":
+      return "missing";
+    case "supported":
+      return "checked";
+    case "error":
+      return "error";
+    default:
+      return value || "-";
+  }
+}
+
+function dispatchEventLabel(event?: string) {
+  switch (event) {
+    case "claimed":
+      return "dispatched";
+    case "released":
+      return "released";
+    case "expired":
+      return "expired";
+    default:
+      return event || "-";
+  }
+}
+
+function dispatchTarget(clientId?: string, clientLabel?: string, holder?: string) {
+  const label = clientLabel?.trim() || holder?.trim() || clientId?.trim();
+  if (!label) return "-";
+  if (clientId && label !== clientId) return `${label} · ${shortID(clientId)}`;
+  return label;
 }
 
 function QuotaRing({ label, value }: { label?: string; value?: number }) {
@@ -1673,7 +1577,7 @@ function QuotaRing({ label, value }: { label?: string; value?: number }) {
 
 function LoadBalanceAccountCard({ account }: { account: LoadBalanceAccount }) {
   const remaining = clampUIPercent(account.quotaRemainingPercent);
-  const quotaLabel = account.quotaRemainingDisplay || account.quotaStatus || "-";
+  const quotaLabel = account.quotaRemainingDisplay || quotaStatusLabel(account.quotaStatus);
 
   return (
     <div className={`lb-account-card ${account.eligible ? "is-eligible" : "is-excluded"}`}>
@@ -1719,6 +1623,101 @@ function LoadBalanceAccountCard({ account }: { account: LoadBalanceAccount }) {
       </div>
 
       {account.reason && <div className="lb-reason">{account.reason}</div>}
+      {account.leaseActive && (
+        <div className="lb-reason is-active">
+          sent to {dispatchTarget(account.leaseClientId, "", account.leaseHolder)} until {shortTime(account.leaseExpiresAt)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RoutingMap({
+  accounts,
+  dispatchByAccount,
+}: {
+  accounts: LoadBalanceAccount[];
+  dispatchByAccount: Map<string, DispatchEvent>;
+}) {
+  if (!accounts.length) {
+    return <div className="lb-empty">No cloud-owned account is registered for load balancing.</div>;
+  }
+
+  return (
+    <div className="lb-route-map">
+      {accounts.map((account) => {
+        const dispatch = dispatchByAccount.get(account.id);
+        const remaining = clampUIPercent(account.quotaRemainingPercent);
+        const quotaLabel = account.quotaRemainingDisplay || quotaStatusLabel(account.quotaStatus);
+        const target = account.leaseActive
+          ? dispatchTarget(account.leaseClientId, "", account.leaseHolder)
+          : dispatch
+            ? dispatchTarget(dispatch.clientId, dispatch.clientLabel, dispatch.holder)
+            : "-";
+        const targetLabel = account.leaseActive ? "current" : dispatch ? "last" : "sent to";
+
+        return (
+          <div key={account.id} className={`lb-route-row ${account.eligible ? "is-eligible" : "is-excluded"}`}>
+            <div className="lb-route-main">
+              <div className="lb-route-state" aria-hidden="true" />
+              <div className="min-w-0">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <span className="truncate text-sm font-semibold text-slate-950">{lbAccountName(account)}</span>
+                  <Chip color={account.eligible ? "success" : "warning"} size="sm" variant="soft">
+                    {account.eligible ? "in pool" : "out"}
+                  </Chip>
+                  {account.leaseActive && (
+                    <Chip color="accent" size="sm" variant="soft">
+                      leased
+                    </Chip>
+                  )}
+                </div>
+                <div className="mt-1 truncate font-mono text-xs text-slate-500">{shortID(account.id)}</div>
+              </div>
+            </div>
+
+            <div className="lb-route-quota" aria-label={`${lbAccountName(account)} quota ${quotaLabel}`}>
+              <span style={{ width: `${remaining}%` }} />
+            </div>
+
+            <div className="lb-route-facts">
+              <SignalLine label="5h quota" value={quotaLabel} />
+              <SignalLine label="score" value={scoreLabel(account.quotaScore)} />
+              <SignalLine label="reset" value={shortTime(account.quotaResetsAt)} />
+              <SignalLine label={targetLabel} value={target} />
+            </div>
+
+            {account.reason && <div className="lb-route-reason">{account.reason}</div>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function DispatchTimeline({ dispatches }: { dispatches: DispatchEvent[] }) {
+  if (!dispatches.length) {
+    return <div className="lb-empty">No dispatches recorded yet.</div>;
+  }
+  return (
+    <div className="dispatch-list">
+      {dispatches.map((event) => (
+        <div key={event.id} className={`dispatch-row event-${event.event || "unknown"}`}>
+          <div className="dispatch-dot" />
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <span className="truncate text-sm font-semibold text-slate-950">{event.accountLabel || shortID(event.accountId)}</span>
+              <Chip color={event.event === "claimed" ? "success" : event.event === "expired" ? "danger" : "default"} size="sm" variant="soft">
+                {dispatchEventLabel(event.event)}
+              </Chip>
+            </div>
+            <div className="mt-1 truncate text-xs text-slate-500">
+              to {dispatchTarget(event.clientId, event.clientLabel, event.holder)} · {shortTime(event.createdAt)}
+            </div>
+            <div className="mt-1 font-mono text-[11px] text-slate-400">{shortID(event.leaseId)}</div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1788,24 +1787,21 @@ function NavItem({
 
 function MobileAccountCard({
   account,
+  dispatch,
   isSelected,
-  onFetchQuota,
   onSelect,
   quota,
   refresh,
-  usage,
 }: {
   account: Account;
+  dispatch?: DispatchEvent;
   isSelected: boolean;
-  onFetchQuota: () => void;
   onSelect: () => void;
   quota?: QuotaResult;
   refresh?: RefreshQueueItem;
-  usage?: AccountUsage;
 }) {
   const summary = quotaSummary(quota);
   const hint = quotaHint(quota);
-  const latestModel = usage?.latestModel || usage?.models?.[0]?.model || "-";
   const fiveHour = refresh?.remainingDisplay || summary.label;
 
   return (
@@ -1844,7 +1840,7 @@ function MobileAccountCard({
           onPress={onSelect}
         >
           {isSelected ? <CheckCircle2 size={14} /> : <PanelRightOpen size={14} />}
-          <span>{isSelected ? "Selected" : "Select"}</span>
+          <span>Details</span>
         </Button>
       </div>
 
@@ -1868,29 +1864,20 @@ function MobileAccountCard({
           <div className="mt-3 rounded-md bg-slate-50 p-3">
             <div className="mb-2 flex items-center justify-between gap-2">
               <span className="truncate text-xs font-medium text-slate-700">{summary.label}</span>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={(event) => event.stopPropagation()}
-                onPress={() => {
-                  onFetchQuota();
-                }}
-              >
-                Check
-              </Button>
+              <span className="text-xs text-slate-500">{shortTime(refresh?.updatedAt)}</span>
             </div>
             <ProgressBar aria-label="Quota remaining" color={summary.color} size="sm" value={summary.value} />
             {hint && <div className="quota-card-hint mt-2 text-xs leading-5 text-slate-500">{hint}</div>}
           </div>
 
           <div className="mt-3 flex items-center justify-between gap-2 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
-            {usage ? (
+            {dispatch ? (
               <div className="min-w-0">
-                <div className="font-semibold text-slate-900">{tokens(usage.sevenDays?.total)} reported 7d</div>
-                <div className="truncate">reported model {latestModel}</div>
+                <div className="font-semibold text-slate-900">{dispatchEventLabel(dispatch.event)} {shortTime(dispatch.createdAt)}</div>
+                <div className="truncate">to {dispatchTarget(dispatch.clientId, dispatch.clientLabel, dispatch.holder)}</div>
               </div>
             ) : (
-              <span className="font-medium text-slate-700">No usage report yet</span>
+              <span className="font-medium text-slate-700">No dispatch yet</span>
             )}
           </div>
 
@@ -1908,8 +1895,8 @@ function MobileAccountCard({
             <div className="truncate font-medium text-slate-700">{summary.label}</div>
           </div>
           <div className="min-w-0 rounded-md bg-slate-50 p-2">
-            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">Report</div>
-            <div className="truncate font-medium text-slate-700">{usage ? `${tokens(usage.sevenDays?.total)} 7d` : "No report"}</div>
+            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">Dispatch</div>
+            <div className="truncate font-medium text-slate-700">{dispatch ? dispatchTarget(dispatch.clientId, dispatch.clientLabel, dispatch.holder) : "None"}</div>
           </div>
         </div>
       )}
@@ -1952,7 +1939,7 @@ function FieldLabel({ children, text }: { children: ReactNode; text: string }) {
 
 function SignalLine({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex items-center justify-between gap-3 rounded-lg bg-slate-50 p-3">
+    <div className="signal-line flex items-center justify-between gap-3 rounded-lg bg-slate-50 p-3">
       <span className="text-slate-500">{label}</span>
       <span className="min-w-0 truncate text-right font-medium text-slate-900">{value}</span>
     </div>

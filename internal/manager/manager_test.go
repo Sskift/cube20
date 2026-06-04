@@ -156,6 +156,37 @@ func TestClaimLeaseWeightsQuotaNearReset(t *testing.T) {
 	}
 }
 
+func TestDispatchHistoryRecordsClaimAndRelease(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "available"})
+	saveTestQuota(t, m, "available", 80, time.Now().Add(time.Hour))
+	if _, _, err := m.CreateClient("liushiao-local"); err != nil {
+		t.Fatalf("CreateClient() error = %v", err)
+	}
+
+	lease, err := m.ClaimLease(context.Background(), "client-liushiao-local", "liushiao-local", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimLease() error = %v", err)
+	}
+	if err := m.ReleaseLease("available", lease.Lease.ID, "client-liushiao-local"); err != nil {
+		t.Fatalf("ReleaseLease() error = %v", err)
+	}
+
+	events, err := m.DispatchHistory(10, "")
+	if err != nil {
+		t.Fatalf("DispatchHistory() error = %v", err)
+	}
+	if got, want := len(events), 2; got != want {
+		t.Fatalf("dispatch events = %d, want %d: %+v", got, want, events)
+	}
+	if events[0].Event != "released" || events[1].Event != "claimed" {
+		t.Fatalf("dispatch order/events = %+v, want released then claimed", events)
+	}
+	if events[1].AccountID != "available" || events[1].ClientID != "client-liushiao-local" || events[1].ClientLabel != "liushiao-local" {
+		t.Fatalf("claimed event = %+v, want account/client labels", events[1])
+	}
+}
+
 func TestRecoverExpiredLeasesMovesReadyAccountToRecovering(t *testing.T) {
 	m := newTestManager(t)
 	expiredAt := time.Now().Add(-time.Minute)

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,6 +75,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/clients", admin(s.handleClients))
 	mux.HandleFunc("/api/clients/", admin(s.handleClientAction))
 	mux.HandleFunc("/api/stats", admin(s.handleStats))
+	mux.HandleFunc("/api/dispatches", admin(s.handleDispatches))
 	mux.HandleFunc("/api/refresh-queue", admin(s.handleRefreshQueue))
 	mux.HandleFunc("/api/accounts/import-json", admin(s.handleImportJSON))
 	mux.HandleFunc("/api/accounts/pick", admin(s.handleLBPick))
@@ -285,6 +287,28 @@ func (s *Server) handleLBReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleDispatches(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		limit = value
+	}
+	events, err := s.Manager.DispatchHistory(limit, "")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
 }
 
 func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
@@ -746,6 +770,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	dispatches, err := s.Manager.DispatchHistory(50, "")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	if auth.Admin {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -754,6 +783,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 			"clients":      clients,
 			"usage":        stats,
 			"refreshQueue": queue,
+			"dispatches":   dispatches,
 		})
 		return
 	}
@@ -797,6 +827,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 			clientQueue = append(clientQueue, item)
 		}
 	}
+	clientDispatches, err := s.Manager.DispatchHistory(50, auth.ClientID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"mode":         "client",
@@ -805,6 +840,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"usage":        clientUsage,
 		"totals":       totals,
 		"refreshQueue": clientQueue,
+		"dispatches":   clientDispatches,
 	})
 }
 

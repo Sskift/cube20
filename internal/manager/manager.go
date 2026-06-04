@@ -114,6 +114,7 @@ type State struct {
 	Clients    []Client                `json:"clients,omitempty"`
 	Usage      map[string]AccountUsage `json:"usage,omitempty"`
 	QuotaCache map[string]QuotaCache   `json:"quotaCache,omitempty"`
+	Dispatches []DispatchEvent         `json:"dispatches,omitempty"`
 }
 
 type Client struct {
@@ -132,6 +133,21 @@ type ClientView struct {
 	LastSeenAt time.Time  `json:"lastSeenAt,omitempty"`
 	RevokedAt  *time.Time `json:"revokedAt,omitempty"`
 	Active     bool       `json:"active"`
+}
+
+type DispatchEvent struct {
+	ID           string    `json:"id"`
+	LeaseID      string    `json:"leaseId"`
+	AccountID    string    `json:"accountId"`
+	AccountLabel string    `json:"accountLabel,omitempty"`
+	ClientID     string    `json:"clientId,omitempty"`
+	ClientLabel  string    `json:"clientLabel,omitempty"`
+	Holder       string    `json:"holder,omitempty"`
+	Event        string    `json:"event"`
+	Generation   int64     `json:"generation"`
+	CreatedAt    time.Time `json:"createdAt"`
+	StartedAt    time.Time `json:"startedAt,omitempty"`
+	ExpiresAt    time.Time `json:"expiresAt,omitempty"`
 }
 
 type AccountUsage struct {
@@ -193,6 +209,7 @@ type LoadBalanceAccount struct {
 	Generation            int64            `json:"generation"`
 	LeaseActive           bool             `json:"leaseActive"`
 	LeaseClientID         string           `json:"leaseClientId,omitempty"`
+	LeaseHolder           string           `json:"leaseHolder,omitempty"`
 	LeaseExpiresAt        time.Time        `json:"leaseExpiresAt,omitempty"`
 	Eligible              bool             `json:"eligible"`
 	Reason                string           `json:"reason,omitempty"`
@@ -362,6 +379,9 @@ func normalizeState(state State) State {
 	if state.QuotaCache == nil {
 		state.QuotaCache = map[string]QuotaCache{}
 	}
+	if state.Dispatches == nil {
+		state.Dispatches = []DispatchEvent{}
+	}
 	return state
 }
 
@@ -426,6 +446,14 @@ func (m *Manager) ensurePostgres() error {
 		return err
 	}
 	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('cube20_schema'))`); err != nil {
+		return err
+	}
 
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS cube_accounts (
@@ -496,6 +524,23 @@ func (m *Manager) ensurePostgres() error {
 			schema_version integer NOT NULL DEFAULT 1,
 			PRIMARY KEY (account_id, client_id, lease_id, run_id, model)
 		)`,
+		`CREATE TABLE IF NOT EXISTS cube_dispatch_events (
+			id text PRIMARY KEY,
+			lease_id text NOT NULL DEFAULT '',
+			account_id text NOT NULL DEFAULT '',
+			account_label text NOT NULL DEFAULT '',
+			client_id text NOT NULL DEFAULT '',
+			client_label text NOT NULL DEFAULT '',
+			holder text NOT NULL DEFAULT '',
+			event text NOT NULL DEFAULT '',
+			generation bigint NOT NULL DEFAULT 0,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			started_at timestamptz,
+			expires_at timestamptz
+		)`,
+		`CREATE INDEX IF NOT EXISTS cube_dispatch_events_created_idx ON cube_dispatch_events (created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS cube_dispatch_events_client_idx ON cube_dispatch_events (client_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS cube_dispatch_events_account_idx ON cube_dispatch_events (account_id, created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS cube_quota_cache (
 			account_id text PRIMARY KEY,
 			updated_at timestamptz NOT NULL DEFAULT now(),
@@ -513,11 +558,11 @@ func (m *Manager) ensurePostgres() error {
 		)`,
 	}
 	for _, statement := range statements {
-		if _, err := db.ExecContext(ctx, statement); err != nil {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (m *Manager) loadPostgresState() (State, error) {
@@ -797,6 +842,50 @@ func (m *Manager) savePostgresState(state State) error {
 			client.CreatedAt,
 			lastSeen,
 			revoked,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, event := range state.Dispatches {
+		if strings.TrimSpace(event.ID) == "" {
+			continue
+		}
+		if event.CreatedAt.IsZero() {
+			event.CreatedAt = now
+		}
+		var startedAt any
+		if !event.StartedAt.IsZero() {
+			startedAt = event.StartedAt
+		}
+		var expiresAt any
+		if !event.ExpiresAt.IsZero() {
+			expiresAt = event.ExpiresAt
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_dispatch_events
+			(id, lease_id, account_id, account_label, client_id, client_label, holder, event, generation, created_at, started_at, expires_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (id) DO UPDATE SET
+				account_label = EXCLUDED.account_label,
+				client_label = EXCLUDED.client_label,
+				holder = EXCLUDED.holder,
+				event = EXCLUDED.event,
+				generation = EXCLUDED.generation,
+				created_at = EXCLUDED.created_at,
+				started_at = EXCLUDED.started_at,
+				expires_at = EXCLUDED.expires_at`,
+			event.ID,
+			event.LeaseID,
+			event.AccountID,
+			event.AccountLabel,
+			event.ClientID,
+			event.ClientLabel,
+			event.Holder,
+			event.Event,
+			event.Generation,
+			event.CreatedAt,
+			startedAt,
+			expiresAt,
 		); err != nil {
 			return err
 		}
@@ -1195,6 +1284,124 @@ func (m *Manager) UsageStats() (map[string]AccountUsage, error) {
 		out[id] = stat
 	}
 	return out, nil
+}
+
+func (m *Manager) DispatchHistory(limit int, clientID string) ([]DispatchEvent, error) {
+	if err := m.Ensure(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > maxDispatchHistory {
+		limit = 50
+	}
+	clientID = strings.TrimSpace(clientID)
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		return m.postgresDispatchHistory(limit, clientID)
+	}
+	state, err := m.Load()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DispatchEvent, 0, minInt(limit, len(state.Dispatches)))
+	for _, event := range state.Dispatches {
+		if clientID != "" && event.ClientID != clientID {
+			continue
+		}
+		event = enrichDispatchEvent(state, event)
+		out = append(out, event)
+		if len(out) >= limit {
+			break
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (m *Manager) postgresDispatchHistory(limit int, clientID string) ([]DispatchEvent, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	query := `SELECT
+		d.id,
+		d.lease_id,
+		d.account_id,
+		COALESCE(NULLIF(a.label, ''), d.account_label),
+		d.client_id,
+		COALESCE(NULLIF(c.label, ''), d.client_label),
+		d.holder,
+		d.event,
+		d.generation,
+		d.created_at,
+		d.started_at,
+		d.expires_at
+	FROM cube_dispatch_events d
+	LEFT JOIN cube_accounts a ON a.id = d.account_id
+	LEFT JOIN cube_clients c ON c.id = d.client_id`
+	args := []any{}
+	if clientID != "" {
+		query += ` WHERE d.client_id = $1`
+		args = append(args, clientID)
+	}
+	query += fmt.Sprintf(` ORDER BY d.created_at DESC LIMIT $%d`, len(args)+1)
+	args = append(args, limit)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	events := []DispatchEvent{}
+	for rows.Next() {
+		var event DispatchEvent
+		var startedAt sql.NullTime
+		var expiresAt sql.NullTime
+		if err := rows.Scan(
+			&event.ID,
+			&event.LeaseID,
+			&event.AccountID,
+			&event.AccountLabel,
+			&event.ClientID,
+			&event.ClientLabel,
+			&event.Holder,
+			&event.Event,
+			&event.Generation,
+			&event.CreatedAt,
+			&startedAt,
+			&expiresAt,
+		); err != nil {
+			return nil, err
+		}
+		if startedAt.Valid {
+			event.StartedAt = startedAt.Time
+		}
+		if expiresAt.Valid {
+			event.ExpiresAt = expiresAt.Time
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+func enrichDispatchEvent(state State, event DispatchEvent) DispatchEvent {
+	if strings.TrimSpace(event.AccountLabel) == "" {
+		for _, account := range state.Accounts {
+			if account.ID == event.AccountID {
+				event.AccountLabel = account.Label
+				break
+			}
+		}
+	}
+	if strings.TrimSpace(event.ClientLabel) == "" {
+		event.ClientLabel = clientLabelFromState(state, event.ClientID)
+	}
+	return event
 }
 
 func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
@@ -2489,6 +2696,7 @@ func (m *Manager) ClaimLease(ctx context.Context, clientID, holder string, ttl t
 	account.LeaseExpiresAt = now.Add(ttl)
 	account.UpdatedAt = now
 	state.Accounts[selected.index] = account
+	state.Dispatches = appendDispatchEvent(state.Dispatches, dispatchEventFromAccount(state, account, "claimed", now))
 
 	if err := m.Save(state); err != nil {
 		return LeaseSnapshot{}, err
@@ -2629,6 +2837,7 @@ func (m *Manager) ReleaseLease(accountID, leaseID, clientID string) error {
 	if err := validateLease(account, leaseID, clientID, now); err != nil {
 		return err
 	}
+	state.Dispatches = appendDispatchEvent(state.Dispatches, dispatchEventFromAccount(state, account, "released", now))
 	clearAccountLease(&account)
 	account.UpdatedAt = now
 	state.Accounts[index] = account
@@ -2710,6 +2919,7 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 			Generation:     account.Generation,
 			LeaseActive:    account.LeaseActive,
 			LeaseClientID:  account.LeaseClientID,
+			LeaseHolder:    account.LeaseHolder,
 			LeaseExpiresAt: account.LeaseExpiresAt,
 		}
 		evaluation := loadBalanceEligibility(account, state.QuotaCache[account.ID], now)
@@ -2885,6 +3095,13 @@ func sameLoadBalanceScore(a, b float64) bool {
 	return diff >= -loadBalanceScoreEpsilon && diff <= loadBalanceScoreEpsilon
 }
 
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func clampPercent(value float64) float64 {
 	if value < 0 {
 		return 0
@@ -2915,6 +3132,64 @@ func leaseFromAccount(account Account) Lease {
 		HeartbeatAt: account.LeaseHeartbeatAt,
 		ExpiresAt:   account.LeaseExpiresAt,
 	}
+}
+
+const maxDispatchHistory = 200
+
+func dispatchEventFromAccount(state State, account Account, event string, now time.Time) DispatchEvent {
+	return DispatchEvent{
+		ID:           dispatchEventID(account, event, now),
+		LeaseID:      account.LeaseID,
+		AccountID:    account.ID,
+		AccountLabel: account.Label,
+		ClientID:     account.LeaseClientID,
+		ClientLabel:  clientLabelFromState(state, account.LeaseClientID),
+		Holder:       account.LeaseHolder,
+		Event:        event,
+		Generation:   account.Generation,
+		CreatedAt:    now,
+		StartedAt:    account.LeaseStartedAt,
+		ExpiresAt:    account.LeaseExpiresAt,
+	}
+}
+
+func dispatchEventID(account Account, event string, now time.Time) string {
+	leaseID := strings.TrimSpace(account.LeaseID)
+	if leaseID != "" {
+		return leaseID + ":" + event
+	}
+	return fmt.Sprintf("%s:%s:%d", strings.TrimSpace(account.ID), event, now.UnixNano())
+}
+
+func appendDispatchEvent(events []DispatchEvent, event DispatchEvent) []DispatchEvent {
+	if strings.TrimSpace(event.ID) == "" {
+		return events
+	}
+	next := make([]DispatchEvent, 0, minInt(len(events)+1, maxDispatchHistory))
+	next = append(next, event)
+	for _, existing := range events {
+		if existing.ID == event.ID {
+			continue
+		}
+		next = append(next, existing)
+		if len(next) >= maxDispatchHistory {
+			break
+		}
+	}
+	return next
+}
+
+func clientLabelFromState(state State, clientID string) string {
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" {
+		return ""
+	}
+	for _, client := range state.Clients {
+		if client.ID == clientID {
+			return client.Label
+		}
+	}
+	return ""
 }
 
 func clearAccountLease(account *Account) {
@@ -2948,6 +3223,7 @@ func expireAccountLeases(state State, now time.Time) (State, []string, bool) {
 			continue
 		}
 		leaseID := account.LeaseID
+		state.Dispatches = appendDispatchEvent(state.Dispatches, dispatchEventFromAccount(state, account, "expired", now))
 		clearAccountLease(&account)
 		if account.Status == StatusReady {
 			account.Status = StatusRecovering
