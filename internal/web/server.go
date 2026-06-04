@@ -76,7 +76,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/stats", admin(s.handleStats))
 	mux.HandleFunc("/api/refresh-queue", admin(s.handleRefreshQueue))
 	mux.HandleFunc("/api/accounts/import-json", admin(s.handleImportJSON))
-	mux.HandleFunc("/api/accounts/import-live", admin(s.handleImportLive))
 	mux.HandleFunc("/api/accounts/pick", admin(s.handleLBPick))
 	mux.HandleFunc("/api/lb/pick", admin(s.handleLBPick))
 	mux.HandleFunc("/api/lb/reset", admin(s.handleLBReset))
@@ -888,19 +887,6 @@ func (s *Server) handleImportJSON(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, s.ManagerAccountView(account))
 }
 
-func (s *Server) handleImportLive(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	account, err := s.Manager.ImportLiveProfile("", "", "")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusCreated, s.ManagerAccountView(account))
-}
-
 func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/accounts/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -981,20 +967,6 @@ func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"ownerMode": string(body.OwnerMode), "ownerClientId": body.OwnerClientID})
-	case "deploy", "activate":
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		written, err := s.Manager.DeployProfile(id, "")
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"target":  s.Manager.LiveCodexHome,
-			"written": written,
-		})
 	case "quota":
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")

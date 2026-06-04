@@ -49,7 +49,7 @@ open that local Codex config file.
 ## Commands
 
 ```shell
-cube
+cube help
 cube dashboard
 cube clients create macbook-a
 cube clients list
@@ -62,8 +62,6 @@ cube run --heartbeat 20s -- --model gpt-5
 cube report
 cube report --daemon --interval 5m
 cube config edit
-cube sync push work-plus
-cube sync daemon --all --pull --interval 60s
 ```
 
 ## Build
@@ -199,7 +197,9 @@ therefore requires the admin token, not a client PAT.
 
 Use `cube report` for accounts that should stay owned by the local Codex
 profile, such as a personal `~/.codex/auth.json` that must not be refreshed by
-the cloud server:
+the cloud server. If an account is moved into the cloud-owned pool, stop
+`cube report` for that local auth; the server refreshes and displays its quota
+from the cloud copy:
 
 ```shell
 # One-shot report of local auth, usage, and quota.
@@ -223,27 +223,14 @@ For cloud-owned accounts, dashboard refresh and `cube cloud quota <id>` are
 server-side refreshes. For client-owned accounts, those same cloud reads return
 the latest client-reported cache instead of refreshing the server copy.
 
-## Cloud Sync Admin Tools
+## Cloud API
 
-These commands are migration/debug tools for moving existing local auth
-snapshots into the cloud pool. Normal local usage should prefer `cube run`.
+The cloud sync API is for `cube run`, `cube report`, cloud relogin, and the
+hosted dashboard. The old local-pool `cube sync` CLI is no longer exposed.
 
-```shell
-# Send one local managed auth snapshot to the cloud.
-./bin/cube sync push work-plus
-
-# Keep every local managed auth snapshot flowing to the cloud; --pull also
-# accepts newer cloud copies of the same account.
-./bin/cube sync daemon --all --pull --interval 60s
-
-# Pull a specific cloud account into the local pool and activate it.
-./bin/cube sync pull work-plus --deploy
-```
-
-The cloud endpoints are:
+The main cloud endpoints are:
 
 - `POST /api/sync/push`
-- `GET /api/sync/pull/<id>`
 - `POST /api/sync/claim` (legacy lease claim response)
 - `POST /api/sync/leases`
 - `PATCH /api/sync/leases/<lease-id>`

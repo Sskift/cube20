@@ -596,15 +596,6 @@ export default function App() {
     });
   }
 
-  async function activateAccount() {
-    if (!selected) return;
-    await withBusy(async () => {
-      await apiJSON(`/api/accounts/${encodeURIComponent(selected.id)}/activate`, { method: "POST" });
-      setMessage(`${accountName(selected)} activated`);
-      await loadAll(selected.id);
-    });
-  }
-
   async function deleteAccount() {
     if (!selected) return;
     if (!window.confirm(`Delete ${accountName(selected)}? This removes the managed snapshot only.`)) return;
@@ -613,15 +604,6 @@ export default function App() {
       setSelectedId("");
       setMessage("Account deleted");
       await loadAll("");
-    });
-  }
-
-  async function importLive() {
-    await withBusy(async () => {
-      const account = await apiJSON<Account>("/api/accounts/import-live", { method: "POST" });
-      setSelectedId(account.id);
-      setMessage(`Imported ${accountName(account)}`);
-      await loadAll(account.id);
     });
   }
 
@@ -911,30 +893,6 @@ export default function App() {
                       </Chip>
                     </div>
                   </div>
-                  <div className="cube-account-toolbar">
-                    <Button
-                      aria-label="Switch selected account"
-                      className="cube-action-button gap-2"
-                      isDisabled={!selected || busy}
-                      size="sm"
-                      variant="primary"
-                      onPress={activateAccount}
-                    >
-                      <Play size={15} />
-                      <span className="cube-action-label">Switch</span>
-                    </Button>
-                    <Button
-                      aria-label="Import current live auth"
-                      className="cube-action-button gap-2"
-                      isDisabled={busy}
-                      size="sm"
-                      variant="secondary"
-                      onPress={importLive}
-                    >
-                      <UploadCloud size={15} />
-                      <span className="cube-action-label">Import live</span>
-                    </Button>
-                  </div>
                 </Card.Header>
                 <Card.Content className="p-0">
                   {!loading && accounts.length > 0 && (
@@ -1220,16 +1178,10 @@ export default function App() {
                       </NativeSelect.Trigger>
                     </NativeSelect>
                   </FieldLabel>
-                  <div className="grid grid-cols-2 gap-2">
-                    <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={saveAccount}>
-                      <Save size={15} />
-                      Save
-                    </Button>
-                    <Button className="gap-2" isDisabled={busy} variant="primary" onPress={activateAccount}>
-                      <Play size={15} />
-                      Switch
-                    </Button>
-                  </div>
+                  <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={saveAccount}>
+                    <Save size={15} />
+                    Save
+                  </Button>
                   <Button className="gap-2" isDisabled={busy} variant="danger-soft" onPress={deleteAccount}>
                     <Trash2 size={15} />
                     Delete account
