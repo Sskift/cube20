@@ -4,13 +4,18 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"cube20/internal/manager"
@@ -25,6 +30,8 @@ type Server struct {
 	Port                 int
 	CloudToken           string
 	QuotaRefreshInterval time.Duration
+
+	httpServer *http.Server
 }
 
 type authContextKey struct{}
@@ -42,8 +49,20 @@ func (s *Server) ListenAndServe() error {
 		s.Port = 8720
 	}
 
+	// Fix #9: refuse to silently run wide open. When no admin token is set every
+	// request is treated as admin (see adminAuthorized); binding that to a
+	// non-loopback address exposes full admin with zero auth.
+	if !isLoopbackHost(s.Host) && strings.TrimSpace(s.CloudToken) == "" {
+		return errors.New("refusing to bind " + s.Host + " without an admin token: set CUBE_CLOUD_TOKEN")
+	}
+
+	// Fix #8: cancellable context so the quota worker stops on shutdown, and a
+	// signal-aware context so we can drain in-flight requests gracefully.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	if s.QuotaRefreshInterval > 0 {
-		StartQuotaWorker(context.Background(), s.Manager, s.QuotaRefreshInterval, log.Printf)
+		StartQuotaWorker(ctx, s.Manager, s.QuotaRefreshInterval, log.Printf)
 	}
 
 	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
@@ -51,7 +70,76 @@ func (s *Server) ListenAndServe() error {
 	if strings.TrimSpace(s.CloudToken) != "" {
 		fmt.Println("cube dashboard: API bearer token is required")
 	}
-	return http.ListenAndServe(addr, s.Handler())
+
+	// Fix #5: use an explicit *http.Server with bounded timeouts instead of
+	// http.ListenAndServe (no timeouts -> slow-loris / resource exhaustion).
+	srv := s.newHTTPServer(addr)
+	s.httpServer = srv
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
+		// Server stopped on its own before any shutdown signal.
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		// Received SIGINT/SIGTERM: cancel the worker, drain requests, release DB.
+		cancel()
+		s.shutdown()
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
+}
+
+// newHTTPServer builds the dashboard HTTP server with bounded timeouts so a
+// single slow client cannot tie up server resources indefinitely (Fix #5).
+func (s *Server) newHTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
+// shutdown gracefully drains in-flight requests and releases the manager's DB
+// pool. Safe to call once on the shutdown path (Fix #8).
+func (s *Server) shutdown() {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if s.httpServer != nil {
+		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("cube dashboard: graceful shutdown failed: %v", err)
+		}
+	}
+	if s.Manager != nil {
+		if err := s.Manager.Close(); err != nil {
+			log.Printf("cube dashboard: closing manager failed: %v", err)
+		}
+	}
+}
+
+// isLoopbackHost reports whether host is a loopback bind target. An empty host
+// is treated as loopback because ListenAndServe defaults it to 127.0.0.1.
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" || host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func (s *Server) Handler() http.Handler {

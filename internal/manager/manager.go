@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -428,20 +429,35 @@ func (m *Manager) Save(state State) error {
 	return os.Rename(tmpPath, m.StatePath)
 }
 
+// postgresDB returns the process-level connection pool, opening it once on
+// first use. database/sql.DB is itself a concurrency-safe pool meant to be
+// long-lived, so every caller shares this one and must NOT call Close on it;
+// the pool is released exactly once via Manager.Close on server shutdown.
 func (m *Manager) postgresDB(ctx context.Context) (*sql.DB, error) {
 	databaseURL := strings.TrimSpace(m.DatabaseURL)
 	if databaseURL == "" {
 		return nil, errors.New("database_url is not configured")
 	}
+
+	m.dbMu.Lock()
+	defer m.dbMu.Unlock()
+	if m.db != nil {
+		return m.db, nil
+	}
 	db, err := sql.Open("postgres", databaseURL)
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetConnMaxLifetime(30 * time.Minute)
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	return db, nil
+	m.db = db
+	return m.db, nil
 }
 
 // Close releases the process-level Postgres connection pool, if one was opened.
@@ -465,7 +481,6 @@ func (m *Manager) ensurePostgres() error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -592,7 +607,6 @@ func (m *Manager) loadPostgresState() (State, error) {
 	if err != nil {
 		return State{}, err
 	}
-	defer db.Close()
 
 	state := normalizeState(State{Version: 1})
 	accountRows, err := db.QueryContext(ctx, `SELECT id, label, plan, status, codex_home, owner_mode, owner_client_id, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, created_at, updated_at, last_error, auth_json::text FROM cube_accounts ORDER BY id`)
@@ -745,7 +759,6 @@ func (m *Manager) savePostgresState(state State) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1012,10 +1025,20 @@ func (m *Manager) materializeAuth(account Account, raw []byte) error {
 	if !json.Valid(raw) {
 		return fmt.Errorf("stored auth for %s is not valid JSON", account.ID)
 	}
+	authPath := filepath.Join(account.CodexHome, authFileName)
+	desired := prettyJSON(raw)
+	// Load() runs on nearly every operation and previously rewrote every
+	// account's auth.json each time, churning credentials on disk. prettyJSON
+	// is deterministic, so skip the write when the on-disk copy already matches
+	// the stored snapshot. This keeps the digest-based generation/quota logic
+	// (which hashes auth.json) stable across reads.
+	if existing, err := os.ReadFile(authPath); err == nil && bytes.Equal(existing, desired) {
+		return nil
+	}
 	if err := os.MkdirAll(account.CodexHome, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(account.CodexHome, authFileName), prettyJSON(raw), fileModeFor(authFileName))
+	return os.WriteFile(authPath, desired, fileModeFor(authFileName))
 }
 
 func (m *Manager) readAccountAuthJSON(account Account) (sql.NullString, error) {
@@ -1187,7 +1210,6 @@ func (m *Manager) recordPostgresUsage(accountID, clientID, leaseID, runID string
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1345,7 +1367,6 @@ func (m *Manager) postgresDispatchHistory(limit int, clientID string) ([]Dispatc
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
 
 	query := `SELECT
 		d.id,
@@ -2457,7 +2478,6 @@ func (m *Manager) deletePostgresAccount(id string) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -2895,10 +2915,13 @@ func (m *Manager) RecoverExpiredLeases(ctx context.Context) error {
 		return err
 	}
 	for _, id := range expired {
-		result, err := m.FetchQuota(ctx, id)
-		if err != nil && result.Status == "" {
-			continue
-		}
+		// Re-probe each recovered account's quota. FetchQuota persists the
+		// outcome via recordQuotaResult (recovering -> ready on success, or
+		// -> drain on an invalidated refresh token), so the return values are
+		// intentionally discarded here. A per-account failure (e.g. a dead
+		// refresh token) is a normal recovery result and must not fail the
+		// whole batch, which would block ClaimLease for healthy accounts.
+		_, _ = m.FetchQuota(ctx, id)
 	}
 	return nil
 }
@@ -3301,7 +3324,6 @@ func (m *Manager) ResetRoundRobin() error {
 		if err != nil {
 			return err
 		}
-		defer db.Close()
 		_, err = db.ExecContext(ctx, `DELETE FROM cube_meta WHERE key = 'round_robin_last_account_id'`)
 		return err
 	}
@@ -3323,7 +3345,6 @@ func (m *Manager) loadRoundRobinState() (roundRobinState, error) {
 		if err != nil {
 			return roundRobinState{}, err
 		}
-		defer db.Close()
 		var value string
 		err = db.QueryRowContext(ctx, `SELECT value FROM cube_meta WHERE key = 'round_robin_last_account_id'`).Scan(&value)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -3359,7 +3380,6 @@ func (m *Manager) saveRoundRobinState(state roundRobinState) error {
 		if err != nil {
 			return err
 		}
-		defer db.Close()
 		_, err = db.ExecContext(ctx, `INSERT INTO cube_meta (key, value, updated_at)
 			VALUES ('round_robin_last_account_id', $1, now())
 			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, state.LastAccountID)
@@ -3441,6 +3461,23 @@ func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged 
 	if strings.TrimSpace(m.DatabaseURL) != "" {
 		return m.recordPostgresQuotaResult(id, result, authChanged, source, strings.TrimSpace(reporterClientID))
 	}
+	// File mode shares state.json with the lease writers (ClaimLease,
+	// TouchLease, ReleaseLease, RecoverExpiredLeases). Serialize this
+	// Load->modify->Save behind the same round-robin lock so a quota write
+	// cannot clobber a concurrent lease change and resurrect a released
+	// lease (which would let the same account be dispatched twice). No
+	// caller holds this lock when reaching recordQuotaResult, so acquiring
+	// it here does not deadlock.
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return m.writeQuotaResultLocked(id, result, authChanged, source, reporterClientID)
+}
+
+func (m *Manager) writeQuotaResultLocked(id string, result quota.Result, authChanged bool, source QuotaSource, reporterClientID string) error {
 	state, err := m.Load()
 	if err != nil {
 		return err
@@ -3526,7 +3563,6 @@ func (m *Manager) recordPostgresQuotaResult(id string, result quota.Result, auth
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -3950,24 +3986,35 @@ func (m *Manager) acquirePostgresLock(name string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	// A session-level advisory lock is bound to a single connection, so pin a
+	// dedicated connection from the shared pool and run both the lock and its
+	// matching unlock on that same conn. Returning the conn to the pool (via
+	// conn.Close) — never closing the shared *sql.DB — is what releases it;
+	// ConnMaxLifetime bounds the lock even if an unlock query ever fails on a
+	// dead connection, since Postgres drops session locks when the backing
+	// connection closes.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	for {
 		var locked bool
-		err := db.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, name).Scan(&locked)
+		err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, name).Scan(&locked)
 		if err != nil {
-			_ = db.Close()
+			_ = conn.Close()
 			return nil, err
 		}
 		if locked {
 			return func() {
 				unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 2*time.Second)
 				defer unlockCancel()
-				_, _ = db.ExecContext(unlockCtx, `SELECT pg_advisory_unlock(hashtext($1))`, name)
-				_ = db.Close()
+				_, _ = conn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock(hashtext($1))`, name)
+				_ = conn.Close()
 			}, nil
 		}
 		if time.Since(start) > 5*time.Second {
-			_ = db.Close()
+			_ = conn.Close()
 			return nil, fmt.Errorf("timeout acquiring postgres lock %s", name)
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -3985,11 +4032,12 @@ func expandPath(value, home string) string {
 	return filepath.Clean(value)
 }
 
+// secretFileMode is the permission for cube-managed files. Both auth.json
+// (OAuth/API secrets) and config.toml are owner-only local state.
+const secretFileMode os.FileMode = 0o600
+
 func fileModeFor(fileName string) os.FileMode {
-	if fileName == authFileName {
-		return 0o600
-	}
-	return 0o600
+	return secretFileMode
 }
 
 func copyFile(source, target string, mode os.FileMode) error {

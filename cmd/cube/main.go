@@ -44,6 +44,9 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Release the Postgres pool (if any) before the process exits. No-op in
+	// file mode and idempotent, so the dashboard's own shutdown Close is fine.
+	defer m.Close()
 
 	switch args[0] {
 	case "run", "cloud-run":

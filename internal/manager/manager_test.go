@@ -14,6 +14,69 @@ import (
 	"cube20/internal/quota"
 )
 
+func TestMaterializeAuthSkipsWriteWhenUnchanged(t *testing.T) {
+	m := newTestManager(t)
+	account := Account{ID: "acct", CodexHome: filepath.Join(m.AccountsDir, "acct")}
+	raw := []byte(`{"OPENAI_API_KEY":"sk-test","tokens":{"access_token":"a"}}`)
+
+	if err := m.materializeAuth(account, raw); err != nil {
+		t.Fatalf("first materializeAuth() error = %v", err)
+	}
+	authPath := filepath.Join(account.CodexHome, authFileName)
+	info1, err := os.Stat(authPath)
+	if err != nil {
+		t.Fatalf("stat after first write error = %v", err)
+	}
+
+	// Second call with identical content must NOT rewrite the file. Load()
+	// runs constantly, so re-materializing unchanged auth churns credentials
+	// on disk for no reason.
+	time.Sleep(10 * time.Millisecond)
+	if err := m.materializeAuth(account, raw); err != nil {
+		t.Fatalf("second materializeAuth() error = %v", err)
+	}
+	info2, err := os.Stat(authPath)
+	if err != nil {
+		t.Fatalf("stat after second call error = %v", err)
+	}
+	if !info1.ModTime().Equal(info2.ModTime()) {
+		t.Fatalf("auth.json was rewritten on unchanged content: mtime %v -> %v", info1.ModTime(), info2.ModTime())
+	}
+
+	// Changed content MUST be written.
+	changed := []byte(`{"OPENAI_API_KEY":"sk-test-2","tokens":{"access_token":"b"}}`)
+	if err := m.materializeAuth(account, changed); err != nil {
+		t.Fatalf("materializeAuth(changed) error = %v", err)
+	}
+	got, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("read after change error = %v", err)
+	}
+	if !bytes.Contains(got, []byte("sk-test-2")) {
+		t.Fatalf("auth.json was not updated on changed content: %s", got)
+	}
+}
+
+func TestCloseFileModeIsNoopAndIdempotent(t *testing.T) {
+	m := newTestManager(t)
+	// File-mode managers never open the pool, so Close must be a no-op and
+	// must be safe to call repeatedly (the server may call it on shutdown
+	// after handlers have also touched the manager).
+	if err := m.Close(); err != nil {
+		t.Fatalf("first Close() error = %v, want nil", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("second Close() error = %v, want nil", err)
+	}
+	if m.db != nil {
+		t.Fatal("file-mode manager opened a db pool, want nil")
+	}
+	// The manager must still be usable after Close in file mode.
+	if _, err := m.Load(); err != nil {
+		t.Fatalf("Load() after Close error = %v", err)
+	}
+}
+
 func TestLoadBalanceStatusExcludesClientOwnedAccounts(t *testing.T) {
 	m := newTestManager(t)
 	saveTestAccounts(t, m, Account{
@@ -214,6 +277,52 @@ func TestRecoverExpiredLeasesMovesReadyAccountToRecovering(t *testing.T) {
 	}
 	if !strings.Contains(account.LastError, "lease lease-expired expired") {
 		t.Fatalf("last error = %q, want expired lease detail", account.LastError)
+	}
+}
+
+func TestRecordQuotaResultFileModeSerializesWithRoundRobinLock(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:        "acct",
+		Status:    StatusReady,
+		OwnerMode: OwnerCloud,
+	})
+
+	// Hold the same lock the lease writers use. A correct file-mode
+	// recordQuotaResult must serialize its Load->modify->Save behind this
+	// lock, otherwise a concurrent quota write can clobber a lease change
+	// (lease resurrection -> double dispatch).
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("acquireLock() error = %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- m.recordQuotaResult("acct", quota.Result{
+			Status: quota.StatusSupported,
+			Plan:   "pro",
+		}, false, QuotaSourceCloud, "")
+	}()
+
+	select {
+	case <-done:
+		unlock()
+		t.Fatal("recordQuotaResult returned while the round-robin lock was held; file-mode write is unlocked and can race lease updates")
+	case <-time.After(150 * time.Millisecond):
+		// Expected: it is blocked waiting for the lock.
+	}
+
+	unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("recordQuotaResult() after unlock error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recordQuotaResult did not finish after the lock was released")
 	}
 }
 
