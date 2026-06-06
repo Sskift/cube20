@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"cube20/internal/quota"
@@ -271,6 +272,11 @@ type Manager struct {
 	CloudURL         string
 	CloudToken       string
 	DatabaseURL      string
+
+	// dbMu guards the lazily-opened, process-level Postgres connection pool.
+	// File-mode managers never open it, so db stays nil.
+	dbMu sync.Mutex
+	db   *sql.DB
 }
 
 func New() (*Manager, error) {
@@ -436,6 +442,20 @@ func (m *Manager) postgresDB(ctx context.Context) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// Close releases the process-level Postgres connection pool, if one was opened.
+// It is safe to call on a file-mode manager (no-op) and safe to call more than
+// once. The long-running dashboard server calls this on shutdown.
+func (m *Manager) Close() error {
+	m.dbMu.Lock()
+	defer m.dbMu.Unlock()
+	if m.db == nil {
+		return nil
+	}
+	err := m.db.Close()
+	m.db = nil
+	return err
 }
 
 func (m *Manager) ensurePostgres() error {
