@@ -602,6 +602,57 @@ func (s *Server) handleSyncLeases(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, leaseSnapshot)
 }
 
+// heartbeatResponse is the lease-heartbeat wire shape: the lease fields promote
+// to the top level (backward compatible with the old bare-lease response) plus
+// a shouldSwap hint telling the client to roll to a fresher account.
+type heartbeatResponse struct {
+	manager.Lease
+	ShouldSwap bool `json:"shouldSwap"`
+}
+
+// heartbeatLease is the shared handler for both lease-heartbeat routes (the
+// single-segment PATCH/POST on /api/sync/leases/{id} and the explicit
+// /api/sync/leases/{id}/heartbeat). It records any client-reported 5h quota
+// window (best-effort), refreshes the lease, and returns a swap hint.
+func (s *Server) heartbeatLease(w http.ResponseWriter, r *http.Request, leaseID string, auth requestAuth) {
+	var body struct {
+		AccountID        string        `json:"accountId"`
+		Client           string        `json:"client"`
+		Holder           string        `json:"holder"`
+		TTLSeconds       int           `json:"ttlSeconds"`
+		FiveHour         *quota.Window `json:"fiveHour"`
+		RateLimitReached bool          `json:"rateLimitReached"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	}
+	ttl := time.Duration(body.TTLSeconds) * time.Second
+	accountID := strings.TrimSpace(body.AccountID)
+
+	// Best-effort: persist the client-reported 5h window without flipping the
+	// account's owner mode. A failed report (e.g. the lease just expired) must
+	// never break the heartbeat itself, so we ignore the error and proceed.
+	if body.FiveHour != nil {
+		result := quota.Result{
+			Status: quota.StatusSupported,
+			Quotas: []quota.Window{*body.FiveHour},
+		}
+		_ = s.Manager.RecordLeasedQuota(accountID, leaseID, auth.ClientID, result, time.Now())
+	}
+
+	lease, err := s.Manager.TouchLease(leaseID, accountID, auth.ClientID, firstText(body.Holder, body.Client), ttl)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	swap, _ := s.Manager.ShouldSwapLease(accountID)
+	if body.RateLimitReached {
+		swap = true
+	}
+	writeJSON(w, http.StatusOK, heartbeatResponse{Lease: lease, ShouldSwap: swap})
+}
+
 func (s *Server) handleSyncLeaseAction(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/sync/leases/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -615,21 +666,8 @@ func (s *Server) handleSyncLeaseAction(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 1 {
 		switch r.Method {
 		case http.MethodPatch, http.MethodPost:
-			var body struct {
-				AccountID  string `json:"accountId"`
-				Client     string `json:"client"`
-				Holder     string `json:"holder"`
-				TTLSeconds int    `json:"ttlSeconds"`
-			}
-			if r.Body != nil {
-				_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
-			}
-			lease, err := s.Manager.TouchLease(leaseID, body.AccountID, auth.ClientID, firstText(body.Holder, body.Client), time.Duration(body.TTLSeconds)*time.Second)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			writeJSON(w, http.StatusOK, lease)
+			s.heartbeatLease(w, r, leaseID, auth)
+			return
 		case http.MethodDelete:
 			var body struct {
 				AccountID string `json:"accountId"`
@@ -653,21 +691,7 @@ func (s *Server) handleSyncLeaseAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		var body struct {
-			AccountID  string `json:"accountId"`
-			Client     string `json:"client"`
-			Holder     string `json:"holder"`
-			TTLSeconds int    `json:"ttlSeconds"`
-		}
-		if r.Body != nil {
-			_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
-		}
-		lease, err := s.Manager.TouchLease(leaseID, body.AccountID, auth.ClientID, firstText(body.Holder, body.Client), time.Duration(body.TTLSeconds)*time.Second)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, lease)
+		s.heartbeatLease(w, r, leaseID, auth)
 		return
 	}
 

@@ -139,6 +139,150 @@ func TestPATCanPushOwnClientReport(t *testing.T) {
 	}
 }
 
+// claimLease drives POST /api/sync/leases as a PAT client and returns the new
+// lease id plus the account id assigned by the manager.
+func claimLease(t *testing.T, server *Server, pat string) (leaseID, accountID string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/sync/leases", bytes.NewBufferString(`{"ttlSeconds":90}`))
+	req.Header.Set("Authorization", "Bearer "+pat)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("claim status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var snapshot manager.LeaseSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode lease snapshot: %v body = %s", err, rec.Body.String())
+	}
+	if snapshot.Lease.ID == "" || snapshot.Lease.AccountID == "" {
+		t.Fatalf("claim returned empty lease id/account: %+v", snapshot.Lease)
+	}
+	return snapshot.Lease.ID, snapshot.Lease.AccountID
+}
+
+// heartbeatResult mirrors the heartbeatResponse wire shape: promoted lease
+// fields plus shouldSwap.
+type heartbeatResult struct {
+	ID         string `json:"id"`
+	AccountID  string `json:"accountId"`
+	ClientID   string `json:"clientId"`
+	Generation int64  `json:"generation"`
+	ShouldSwap bool   `json:"shouldSwap"`
+}
+
+func doHeartbeat(t *testing.T, server *Server, pat, method, path, body string) heartbeatResult {
+	t.Helper()
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+pat)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var out heartbeatResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode heartbeat response: %v body = %s", err, rec.Body.String())
+	}
+	return out
+}
+
+func TestHeartbeatReturnsShouldSwapWhenLow(t *testing.T) {
+	server, _, _, pat := newTestServer(t)
+	leaseID, accountID := claimLease(t, server, pat)
+
+	body := `{"accountId":"` + accountID + `","client":"tester","ttlSeconds":80,"fiveHour":{"key":"five_hour","label":"5h","usedPercent":95,"remainingPercent":5}}`
+	out := doHeartbeat(t, server, pat, http.MethodPatch, "/api/sync/leases/"+leaseID, body)
+
+	if out.ID != leaseID {
+		t.Fatalf("lease id = %q, want %q (lease fields must be present)", out.ID, leaseID)
+	}
+	if out.AccountID != accountID {
+		t.Fatalf("account id = %q, want %q", out.AccountID, accountID)
+	}
+	if !out.ShouldSwap {
+		t.Fatalf("shouldSwap = false, want true for 5%% remaining")
+	}
+}
+
+func TestHeartbeatNoSwapWhenHealthy(t *testing.T) {
+	server, _, _, pat := newTestServer(t)
+	leaseID, accountID := claimLease(t, server, pat)
+
+	body := `{"accountId":"` + accountID + `","client":"tester","ttlSeconds":80,"fiveHour":{"key":"five_hour","label":"5h","usedPercent":20,"remainingPercent":80}}`
+	out := doHeartbeat(t, server, pat, http.MethodPatch, "/api/sync/leases/"+leaseID, body)
+
+	if out.ID != leaseID {
+		t.Fatalf("lease id = %q, want %q", out.ID, leaseID)
+	}
+	if out.ShouldSwap {
+		t.Fatalf("shouldSwap = true, want false for 80%% remaining")
+	}
+}
+
+func TestHeartbeatRateLimitReachedForcesSwap(t *testing.T) {
+	server, _, _, pat := newTestServer(t)
+	leaseID, accountID := claimLease(t, server, pat)
+
+	// Healthy 5h window would normally yield shouldSwap=false; rateLimitReached
+	// must override it to true.
+	body := `{"accountId":"` + accountID + `","client":"tester","ttlSeconds":80,"rateLimitReached":true,"fiveHour":{"key":"five_hour","label":"5h","usedPercent":20,"remainingPercent":80}}`
+	out := doHeartbeat(t, server, pat, http.MethodPatch, "/api/sync/leases/"+leaseID, body)
+
+	if !out.ShouldSwap {
+		t.Fatalf("shouldSwap = false, want true when rateLimitReached=true")
+	}
+}
+
+func TestHeartbeatLeasedQuotaKeepsCloudOwner(t *testing.T) {
+	server, m, _, pat := newTestServer(t)
+	leaseID, accountID := claimLease(t, server, pat)
+
+	body := `{"accountId":"` + accountID + `","client":"tester","ttlSeconds":80,"fiveHour":{"key":"five_hour","label":"5h","usedPercent":95,"remainingPercent":5}}`
+	_ = doHeartbeat(t, server, pat, http.MethodPatch, "/api/sync/leases/"+leaseID, body)
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	var found bool
+	for _, account := range state.Accounts {
+		if account.ID != accountID {
+			continue
+		}
+		found = true
+		if account.OwnerMode != manager.OwnerCloud {
+			t.Fatalf("ownerMode = %q, want %q (RecordLeasedQuota must not flip owner)", account.OwnerMode, manager.OwnerCloud)
+		}
+	}
+	if !found {
+		t.Fatalf("account %q not found in state", accountID)
+	}
+	cache, ok := state.QuotaCache[accountID]
+	if !ok {
+		t.Fatalf("quota cache missing for account %q", accountID)
+	}
+	if cache.Source != manager.QuotaSourceClient {
+		t.Fatalf("quota cache source = %q, want %q", cache.Source, manager.QuotaSourceClient)
+	}
+}
+
+func TestHeartbeatExplicitPathParity(t *testing.T) {
+	server, _, _, pat := newTestServer(t)
+	leaseID, accountID := claimLease(t, server, pat)
+
+	body := `{"accountId":"` + accountID + `","client":"tester","ttlSeconds":80,"fiveHour":{"key":"five_hour","label":"5h","usedPercent":95,"remainingPercent":5}}`
+	out := doHeartbeat(t, server, pat, http.MethodPost, "/api/sync/leases/"+leaseID+"/heartbeat", body)
+
+	if out.ID != leaseID {
+		t.Fatalf("lease id = %q, want %q", out.ID, leaseID)
+	}
+	if !out.ShouldSwap {
+		t.Fatalf("shouldSwap = false, want true via explicit /heartbeat path")
+	}
+}
+
 func newTestServer(t *testing.T) (*Server, *manager.Manager, string, string) {
 	t.Helper()
 	m := newWebTestManager(t)
