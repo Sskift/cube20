@@ -303,7 +303,7 @@ func TestRecordQuotaResultFileModeSerializesWithRoundRobinLock(t *testing.T) {
 		done <- m.recordQuotaResult("acct", quota.Result{
 			Status: quota.StatusSupported,
 			Plan:   "pro",
-		}, false, QuotaSourceCloud, "")
+		}, false, QuotaSourceCloud, "", false)
 	}()
 
 	select {
@@ -323,6 +323,176 @@ func TestRecordQuotaResultFileModeSerializesWithRoundRobinLock(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("recordQuotaResult did not finish after the lock was released")
+	}
+}
+
+func leasedQuotaResult(remaining float64, resetAt time.Time) quota.Result {
+	used := 100 - remaining
+	window := quota.Window{
+		Key:              "five_hour",
+		Label:            "5h",
+		UsedPercent:      used,
+		RemainingPercent: remaining,
+		UsedDisplay:      fmt.Sprintf("%.0f%%", used),
+		RemainingDisplay: fmt.Sprintf("%.0f%%", remaining),
+		ResetsAt:         resetAt.UTC().Format(time.RFC3339),
+	}
+	return quota.Result{
+		Status: quota.StatusSupported,
+		Plan:   "pro",
+		Quotas: []quota.Window{window},
+	}
+}
+
+func TestRecordLeasedQuotaKeepsCloudOwner(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:               "leased",
+		OwnerMode:        OwnerCloud,
+		Status:           StatusReady,
+		LeaseID:          "lease-active",
+		LeaseClientID:    "c1",
+		LeaseHolder:      "holder-1",
+		LeaseStartedAt:   time.Now().Add(-time.Minute),
+		LeaseHeartbeatAt: time.Now().Add(-30 * time.Second),
+		LeaseExpiresAt:   time.Now().Add(time.Hour),
+	})
+
+	result := leasedQuotaResult(40, time.Now().Add(time.Hour))
+	if err := m.RecordLeasedQuota("leased", "lease-active", "c1", result, time.Now()); err != nil {
+		t.Fatalf("RecordLeasedQuota() error = %v", err)
+	}
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	cache, ok := state.QuotaCache["leased"]
+	if !ok {
+		t.Fatal("QuotaCache missing leased entry")
+	}
+	if cache.Source != QuotaSourceClient {
+		t.Fatalf("cache source = %q, want %q", cache.Source, QuotaSourceClient)
+	}
+	if cache.ReporterClientID != "c1" {
+		t.Fatalf("cache reporter = %q, want c1", cache.ReporterClientID)
+	}
+	if cache.FiveHour == nil {
+		t.Fatal("cache FiveHour = nil, want a 5h window")
+	}
+	account := getTestAccount(t, m, "leased")
+	if account.OwnerMode != OwnerCloud {
+		t.Fatalf("owner mode = %q, want %q (client lease report must not flip ownership)", account.OwnerMode, OwnerCloud)
+	}
+	if account.OwnerClientID != "" {
+		t.Fatalf("owner client id = %q, want empty", account.OwnerClientID)
+	}
+}
+
+func TestRecordLeasedQuotaRejectsNonHolder(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:               "leased",
+		OwnerMode:        OwnerCloud,
+		Status:           StatusReady,
+		LeaseID:          "lease-active",
+		LeaseClientID:    "c1",
+		LeaseHolder:      "holder-1",
+		LeaseStartedAt:   time.Now().Add(-time.Minute),
+		LeaseHeartbeatAt: time.Now().Add(-30 * time.Second),
+		LeaseExpiresAt:   time.Now().Add(time.Hour),
+	})
+
+	result := leasedQuotaResult(40, time.Now().Add(time.Hour))
+	if err := m.RecordLeasedQuota("leased", "lease-active", "c2", result, time.Now()); err == nil {
+		t.Fatal("RecordLeasedQuota() with wrong client = nil error, want non-nil")
+	}
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if _, ok := state.QuotaCache["leased"]; ok {
+		t.Fatal("QuotaCache must be unchanged when the reporter does not hold the lease")
+	}
+
+	// A mismatched lease ID must also be rejected.
+	if err := m.RecordLeasedQuota("leased", "wrong-lease", "c1", result, time.Now()); err == nil {
+		t.Fatal("RecordLeasedQuota() with wrong lease id = nil error, want non-nil")
+	}
+}
+
+func TestShouldSwapLease(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "acct", OwnerMode: OwnerCloud, Status: StatusReady})
+
+	saveTestQuota(t, m, "acct", 5, time.Now().Add(time.Hour))
+	swap, err := m.ShouldSwapLease("acct")
+	if err != nil {
+		t.Fatalf("ShouldSwapLease() error = %v", err)
+	}
+	if !swap {
+		t.Fatalf("ShouldSwapLease() = false, want true for 5%% remaining below threshold %.0f", swapRemainingThreshold)
+	}
+
+	saveTestQuota(t, m, "acct", 50, time.Now().Add(time.Hour))
+	swap, err = m.ShouldSwapLease("acct")
+	if err != nil {
+		t.Fatalf("ShouldSwapLease() error = %v", err)
+	}
+	if swap {
+		t.Fatal("ShouldSwapLease() = true, want false for 50% remaining above threshold")
+	}
+
+	swap, err = m.ShouldSwapLease("no-cache")
+	if err != nil {
+		t.Fatalf("ShouldSwapLease() no-cache error = %v", err)
+	}
+	if swap {
+		t.Fatal("ShouldSwapLease() = true for account with no cache, want false")
+	}
+}
+
+func TestFetchQuotaSkipsNetworkWhenLeased(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:               "leased",
+		OwnerMode:        OwnerCloud,
+		Status:           StatusReady,
+		Generation:       3,
+		LeaseID:          "lease-active",
+		LeaseClientID:    "c1",
+		LeaseHolder:      "holder-1",
+		LeaseStartedAt:   time.Now().Add(-time.Minute),
+		LeaseHeartbeatAt: time.Now().Add(-30 * time.Second),
+		LeaseExpiresAt:   time.Now().Add(time.Hour),
+	})
+	saveTestQuota(t, m, "leased", 73, time.Now().Add(time.Hour))
+
+	authBefore := readTestAuth(t, m, "leased")
+
+	result, err := m.FetchQuota(context.Background(), "leased")
+	if err != nil {
+		t.Fatalf("FetchQuota() error = %v", err)
+	}
+	// The leased branch returns the cached result verbatim (status supported)
+	// with a "leased by" detail and never performs a network fetch.
+	if result.Status != quota.StatusSupported {
+		t.Fatalf("status = %q, want %q (cached value returned verbatim)", result.Status, quota.StatusSupported)
+	}
+	if !strings.Contains(result.Detail, "leased by c1") {
+		t.Fatalf("detail = %q, want a leased-by-c1 note", result.Detail)
+	}
+	if len(result.Quotas) != 1 || result.Quotas[0].RemainingPercent != 73 {
+		t.Fatalf("quotas = %+v, want the cached 73%% window", result.Quotas)
+	}
+
+	if authAfter := readTestAuth(t, m, "leased"); !bytes.Equal(authAfter, authBefore) {
+		t.Fatal("auth.json changed; FetchQuota performed a network fetch for a leased account")
+	}
+	account := getTestAccount(t, m, "leased")
+	if account.Generation != 3 {
+		t.Fatalf("generation = %d, want 3 (unchanged; no network fetch)", account.Generation)
 	}
 }
 

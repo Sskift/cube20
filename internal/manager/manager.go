@@ -62,6 +62,8 @@ const (
 	QuotaSourceClient QuotaSource = "client"
 )
 
+const swapRemainingThreshold = 10.0 // 5h remaining-% below this suggests swapping accounts
+
 type Account struct {
 	ID               string           `json:"id"`
 	Label            string           `json:"label"`
@@ -3425,20 +3427,19 @@ func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, erro
 		}, nil
 	}
 	if accountLeaseActive(account, now) {
-		state, loadErr := m.Load()
-		if loadErr == nil {
-			if cache, ok := state.QuotaCache[id]; ok && cache.Result.Status != "" {
-				result := cache.Result
-				result.Source = quotaSourceLabel(cache)
-				result.Detail = firstNonEmpty(result.Detail, fmt.Sprintf("account is leased by %s until %s; returning cached quota", account.LeaseClientID, account.LeaseExpiresAt.Format(time.RFC3339)))
-				return result, nil
-			}
-		}
-		return quota.Result{
-			Status: quota.StatusError,
-			Source: "cube lease",
-			Detail: fmt.Sprintf("account is leased by %s until %s; quota refresh is paused", account.LeaseClientID, account.LeaseExpiresAt.Format(time.RFC3339)),
-		}, nil
+		return m.leasedQuotaResponse(account), nil
+	}
+	// Close the snapshot/network race: the `account` above was loaded before
+	// any lease writer could have claimed it. Re-check lease-active state from
+	// fresh state right before the network fetch. In file mode this re-check
+	// runs under the same round-robin lock the lease writers hold, so a lease
+	// that lands concurrently is observed here instead of being clobbered by a
+	// cloud quota refresh. The lock is released before the network call and
+	// before recordQuotaResult (which acquires the same lock) to avoid a
+	// deadlock. In Postgres mode there is no file lock here (lease writers use
+	// advisory locks elsewhere); a fresh reload re-check is the intended scope.
+	if fresh, leased := m.leaseActiveFresh(id); leased {
+		return m.leasedQuotaResponse(fresh), nil
 	}
 	_ = m.syncLiveAuthToManaged(account)
 	authPath := filepath.Join(account.CodexHome, authFileName)
@@ -3446,20 +3447,174 @@ func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, erro
 	result, err := quota.FetchForCodexHome(ctx, account.CodexHome, now)
 	afterDigest := fileDigest(authPath)
 	authChanged := beforeDigest != "" && afterDigest != "" && beforeDigest != afterDigest
-	_ = m.recordQuotaResult(id, result, authChanged, QuotaSourceCloud, "")
+	_ = m.recordQuotaResult(id, result, authChanged, QuotaSourceCloud, "", false)
 	return result, err
 }
 
-func (m *Manager) RecordQuotaReport(id string, result quota.Result, clientID string) error {
-	return m.recordQuotaResult(id, result, false, QuotaSourceClient, strings.TrimSpace(clientID))
+// leaseActiveFresh reloads the account and reports whether it is currently
+// lease-active. In file mode the reload runs under the round-robin lock so a
+// concurrent lease write is observed; the lock is always released before the
+// function returns so callers may proceed to the network/recordQuotaResult
+// path (which acquires the same lock) without deadlocking. Errors and missing
+// accounts are treated as "not leased" so the caller falls through to its
+// normal path.
+func (m *Manager) leaseActiveFresh(id string) (Account, bool) {
+	if strings.TrimSpace(m.DatabaseURL) == "" {
+		lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+		unlock, err := m.acquireLock(lockPath)
+		if err != nil {
+			return Account{}, false
+		}
+		defer unlock()
+	}
+	state, err := m.Load()
+	if err != nil {
+		return Account{}, false
+	}
+	for _, account := range state.Accounts {
+		if account.ID != id {
+			continue
+		}
+		return account, accountLeaseActive(account, time.Now())
+	}
+	return Account{}, false
 }
 
-func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged bool, source QuotaSource, reporterClientID string) error {
+// leasedQuotaResponse builds the FetchQuota response for an account that is
+// currently leased: the cached quota (returned verbatim with a leased-by note)
+// when present, otherwise a paused-refresh marker. It never performs a network
+// fetch.
+func (m *Manager) leasedQuotaResponse(account Account) quota.Result {
+	if state, loadErr := m.Load(); loadErr == nil {
+		if cache, ok := state.QuotaCache[account.ID]; ok && cache.Result.Status != "" {
+			result := cache.Result
+			result.Source = quotaSourceLabel(cache)
+			result.Detail = firstNonEmpty(result.Detail, fmt.Sprintf("account is leased by %s until %s; returning cached quota", account.LeaseClientID, account.LeaseExpiresAt.Format(time.RFC3339)))
+			return result
+		}
+	}
+	return quota.Result{
+		Status: quota.StatusError,
+		Source: "cube lease",
+		Detail: fmt.Sprintf("account is leased by %s until %s; quota refresh is paused", account.LeaseClientID, account.LeaseExpiresAt.Format(time.RFC3339)),
+	}
+}
+
+// RecordLeasedQuota stores a client-reported quota for an account the client
+// currently leases. Unlike RecordQuotaReport it must NOT flip the account into
+// client ownership: a leased cloud account stays cloud-owned so it returns to
+// the load balancer when the lease ends. The caller must hold the lease
+// (matching LeaseID and LeaseClientID, lease still active); otherwise an error
+// is returned and the cache is left unchanged.
+func (m *Manager) RecordLeasedQuota(accountID, leaseID, clientID string, result quota.Result, now time.Time) error {
+	accountID = strings.TrimSpace(accountID)
+	leaseID = strings.TrimSpace(leaseID)
+	clientID = strings.TrimSpace(clientID)
+	if accountID == "" {
+		return fmt.Errorf("account id is required")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		if err := m.verifyLeaseHolder(accountID, leaseID, clientID, now); err != nil {
+			return err
+		}
+		return m.recordPostgresQuotaResult(accountID, result, false, QuotaSourceClient, clientID, false)
+	}
+	// File mode: acquire the round-robin lock exactly once, then validate the
+	// lease ownership and write the cache atomically so a concurrent release
+	// cannot slip between the check and the write.
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := m.verifyLeaseHolderLocked(accountID, leaseID, clientID, now); err != nil {
+		return err
+	}
+	return m.writeQuotaResultLocked(accountID, result, false, QuotaSourceClient, clientID, false)
+}
+
+// verifyLeaseHolderLocked checks that accountID is currently leased by clientID
+// under leaseID. The caller must already hold the round-robin lock (it reads
+// state via Load without taking the lock).
+func (m *Manager) verifyLeaseHolderLocked(accountID, leaseID, clientID string, now time.Time) error {
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	for _, account := range state.Accounts {
+		if account.ID != accountID {
+			continue
+		}
+		if !accountLeaseActive(account, now) {
+			return fmt.Errorf("account %s is not leased by client %s", accountID, clientID)
+		}
+		if strings.TrimSpace(account.LeaseID) != leaseID || strings.TrimSpace(account.LeaseClientID) != clientID {
+			return fmt.Errorf("account %s is not leased by client %s", accountID, clientID)
+		}
+		return nil
+	}
+	return fmt.Errorf("account %q not found", accountID)
+}
+
+// verifyLeaseHolder is the Postgres-mode lease ownership check; it loads the
+// account through the normal path (no file lock).
+func (m *Manager) verifyLeaseHolder(accountID, leaseID, clientID string, now time.Time) error {
+	account, err := m.GetAccount(accountID)
+	if err != nil {
+		return err
+	}
+	if !accountLeaseActive(account, now) || strings.TrimSpace(account.LeaseID) != leaseID || strings.TrimSpace(account.LeaseClientID) != clientID {
+		return fmt.Errorf("account %s is not leased by client %s", accountID, clientID)
+	}
+	return nil
+}
+
+// ShouldSwapLease reports whether the cached 5h quota window for an account has
+// dropped below swapRemainingThreshold, suggesting the holder should swap to a
+// fresher account. Missing cache, missing 5h window, or an unsupported status
+// returns false with a nil error.
+func (m *Manager) ShouldSwapLease(accountID string) (bool, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return false, nil
+	}
+	state, err := m.Load()
+	if err != nil {
+		return false, err
+	}
+	cache, ok := state.QuotaCache[accountID]
+	if !ok {
+		return false, nil
+	}
+	window := cache.FiveHour
+	if window == nil {
+		if w := quotaFiveHour(cache.Result); w != nil {
+			window = w
+		}
+	}
+	if window == nil {
+		return false, nil
+	}
+	if cache.Result.Status != "" && cache.Result.Status != quota.StatusSupported {
+		return false, nil
+	}
+	return window.RemainingPercent < swapRemainingThreshold, nil
+}
+
+func (m *Manager) RecordQuotaReport(id string, result quota.Result, clientID string) error {
+	return m.recordQuotaResult(id, result, false, QuotaSourceClient, strings.TrimSpace(clientID), true)
+}
+
+func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged bool, source QuotaSource, reporterClientID string, flipOwner bool) error {
 	if strings.TrimSpace(id) == "" {
 		return nil
 	}
 	if strings.TrimSpace(m.DatabaseURL) != "" {
-		return m.recordPostgresQuotaResult(id, result, authChanged, source, strings.TrimSpace(reporterClientID))
+		return m.recordPostgresQuotaResult(id, result, authChanged, source, strings.TrimSpace(reporterClientID), flipOwner)
 	}
 	// File mode shares state.json with the lease writers (ClaimLease,
 	// TouchLease, ReleaseLease, RecoverExpiredLeases). Serialize this
@@ -3474,10 +3629,10 @@ func (m *Manager) recordQuotaResult(id string, result quota.Result, authChanged 
 		return err
 	}
 	defer unlock()
-	return m.writeQuotaResultLocked(id, result, authChanged, source, reporterClientID)
+	return m.writeQuotaResultLocked(id, result, authChanged, source, reporterClientID, flipOwner)
 }
 
-func (m *Manager) writeQuotaResultLocked(id string, result quota.Result, authChanged bool, source QuotaSource, reporterClientID string) error {
+func (m *Manager) writeQuotaResultLocked(id string, result quota.Result, authChanged bool, source QuotaSource, reporterClientID string, flipOwner bool) error {
 	state, err := m.Load()
 	if err != nil {
 		return err
@@ -3497,7 +3652,7 @@ func (m *Manager) writeQuotaResultLocked(id string, result quota.Result, authCha
 		Source:           source,
 		ReporterClientID: strings.TrimSpace(reporterClientID),
 	}
-	if source == QuotaSourceClient {
+	if flipOwner && source == QuotaSourceClient {
 		for i := range state.Accounts {
 			if state.Accounts[i].ID != id {
 				continue
@@ -3553,7 +3708,7 @@ func (m *Manager) writeQuotaResultLocked(id string, result quota.Result, authCha
 	return m.Save(state)
 }
 
-func (m *Manager) recordPostgresQuotaResult(id string, result quota.Result, authChanged bool, source QuotaSource, reporterClientID string) error {
+func (m *Manager) recordPostgresQuotaResult(id string, result quota.Result, authChanged bool, source QuotaSource, reporterClientID string, flipOwner bool) error {
 	if source == "" {
 		source = QuotaSourceCloud
 	}
@@ -3601,7 +3756,7 @@ func (m *Manager) recordPostgresQuotaResult(id string, result quota.Result, auth
 		return err
 	}
 
-	if source == QuotaSourceClient {
+	if flipOwner && source == QuotaSourceClient {
 		if reporterClientID != "" {
 			if _, err := tx.ExecContext(ctx, `UPDATE cube_accounts
 				SET owner_mode = 'client', owner_client_id = $2, updated_at = $3
