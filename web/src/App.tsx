@@ -18,12 +18,14 @@ import {
   Info,
   KeyRound,
   LogOut,
+  Moon,
   PanelRightClose,
   PanelRightOpen,
   RefreshCw,
   Route,
   Save,
   ShieldCheck,
+  Sun,
   Trash2,
   UploadCloud,
   UserRound,
@@ -241,6 +243,47 @@ function cloudOrigin() {
   return window.location.origin;
 }
 
+type ThemeMode = "light" | "dark";
+const THEME_KEY = "cube20.theme";
+
+function preferredTheme(): ThemeMode {
+  if (typeof window === "undefined") return "dark";
+  const stored = window.localStorage.getItem(THEME_KEY);
+  if (stored === "light" || stored === "dark") return stored;
+  return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+function applyTheme(mode: ThemeMode) {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  root.classList.toggle("dark", mode === "dark");
+  root.classList.toggle("light", mode === "light");
+  root.setAttribute("data-theme", mode);
+}
+
+function useTheme(): [ThemeMode, () => void] {
+  const [mode, setMode] = useState<ThemeMode>(() => preferredTheme());
+  useEffect(() => {
+    applyTheme(mode);
+    if (typeof window !== "undefined") window.localStorage.setItem(THEME_KEY, mode);
+  }, [mode]);
+  const toggle = () => setMode((current) => (current === "dark" ? "light" : "dark"));
+  return [mode, toggle];
+}
+
+function ThemeToggle({ mode, onToggle }: { mode: ThemeMode; onToggle: () => void }) {
+  return (
+    <button
+      aria-label={mode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+      className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-slate-200 bg-surface text-slate-600 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-950"
+      type="button"
+      onClick={onToggle}
+    >
+      {mode === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+    </button>
+  );
+}
+
 function maskSecret(value: string) {
   if (!value) return "-";
   if (value.length <= 14) return `${value.slice(0, 3)}...`;
@@ -419,7 +462,7 @@ const KPI = Object.assign(
       return <div className="mb-3 flex items-center gap-2">{children}</div>;
     },
     Icon({ children, status }: { children: ReactNode; status: "success" | "warning" | "danger" }) {
-      const color = status === "success" ? "text-emerald-600 bg-emerald-50" : status === "warning" ? "text-amber-600 bg-amber-50" : "text-rose-600 bg-rose-50";
+      const color = status === "success" ? "text-success-soft-foreground bg-success-soft" : status === "warning" ? "text-warning-soft-foreground bg-warning-soft" : "text-danger-soft-foreground bg-danger-soft";
       return <div className={`grid h-8 w-8 place-items-center rounded-md ${color}`}>{children}</div>;
     },
     Title({ children }: { children: ReactNode }) {
@@ -442,7 +485,7 @@ const NativeSelect = Object.assign(
     Trigger({ children, onChange, value }: { children: ReactNode; onChange: (event: ChangeEvent<HTMLSelectElement>) => void; value: string }) {
       return (
         <select
-          className="h-10 w-full rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900 shadow-sm outline-none focus:border-slate-400"
+          className="h-10 w-full rounded-md border border-slate-200 bg-surface px-3 text-sm text-slate-900 shadow-sm outline-none focus:border-slate-400"
           value={value}
           onChange={onChange}
         >
@@ -477,6 +520,7 @@ export default function App() {
   const [clientLabel, setClientLabel] = useState("");
   const [createdClientToken, setCreatedClientToken] = useState("");
   const [tokenInput, setTokenInput] = useState(() => cloudToken());
+  const [themeMode, toggleTheme] = useTheme();
   const quotaAutoKeyRef = useRef("");
 
   const selected = useMemo(() => accounts.find((account) => account.id === selectedId), [accounts, selectedId]);
@@ -713,9 +757,9 @@ export default function App() {
   }
 
   const sidebar = (
-    <div className="flex h-full min-h-0 flex-col border-r border-slate-200 bg-white">
+    <div className="flex h-full min-h-0 flex-col border-r border-slate-200 bg-surface">
       <div className="flex items-center gap-3 border-b border-slate-200 px-4 py-4">
-        <div className="grid h-10 w-10 place-items-center rounded-xl bg-slate-950 text-white">
+        <div className="grid h-10 w-10 place-items-center rounded-xl cube-brand">
           <ShieldCheck size={20} />
         </div>
         <div className="min-w-0">
@@ -764,12 +808,12 @@ export default function App() {
   );
 
   const navbar = (
-    <div className="cube-navbar flex min-h-14 w-full items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 py-2 sm:gap-3 md:flex-nowrap md:px-4">
+    <div className="cube-navbar sticky top-0 z-20 flex min-h-14 w-full items-center justify-between gap-2 border-b border-slate-200 cube-glass px-3 py-2 sm:gap-3 md:flex-nowrap md:px-4">
       <div className="flex min-w-0 items-center gap-3">
         {!compactShell && (
           <button
             aria-label="Menu"
-            className="grid h-9 w-9 place-items-center rounded-lg border border-slate-200 bg-white text-slate-700 shadow-sm lg:hidden"
+            className="grid h-9 w-9 place-items-center rounded-lg border border-slate-200 bg-surface text-slate-700 shadow-sm lg:hidden"
             type="button"
             onClick={() => setSidebarOpen(true)}
           >
@@ -777,7 +821,7 @@ export default function App() {
           </button>
         )}
         {compactShell && (
-          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-slate-950 text-white">
+          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg cube-brand">
             <ShieldCheck size={18} />
           </div>
         )}
@@ -792,9 +836,10 @@ export default function App() {
         <Chip className="hidden min-[900px]:inline-flex" color={meta?.liveAuthPresent ? "success" : "warning"} size="sm" variant="soft">
           live auth {meta?.liveAuthPresent ? "ready" : "missing"}
         </Chip>
+        <ThemeToggle mode={themeMode} onToggle={toggleTheme} />
         <button
           aria-label={asideOpen ? "Hide details" : "Details"}
-          className="inline-flex h-8 items-center gap-2 rounded-md border border-slate-200 bg-white px-2.5 text-sm font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 min-[560px]:px-3"
+          className="inline-flex h-8 items-center gap-2 rounded-md border border-slate-200 bg-surface px-2.5 text-sm font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 min-[560px]:px-3"
           type="button"
           onClick={() => setAsideOpen((open) => !open)}
         >
@@ -815,11 +860,13 @@ export default function App() {
         busy={busy}
         message={message}
         personal={personal}
+        themeMode={themeMode}
         tokenInput={tokenInput}
         usage={personalUsage}
         onApplyToken={applyToken}
         onClearToken={clearToken}
         onRefresh={() => loadAll("")}
+        onThemeToggle={toggleTheme}
         onTokenInput={setTokenInput}
       />
     );
@@ -830,8 +877,10 @@ export default function App() {
       <TokenGate
         busy={busy}
         message={message}
+        themeMode={themeMode}
         tokenInput={tokenInput}
         onApplyToken={applyToken}
+        onThemeToggle={toggleTheme}
         onTokenInput={setTokenInput}
       />
     );
@@ -845,7 +894,7 @@ export default function App() {
       asideMinSize={24}
       asideMobile="sheet"
       asideResizable={!compactShell}
-      className="h-screen bg-slate-50"
+      className="h-screen bg-background"
       asideOpen={asideOpen}
       onAsideOpenChange={setAsideOpen}
       sidebarOpen={sidebarOpen}
@@ -881,7 +930,7 @@ export default function App() {
             </div>
 
             <section className="cube-view-panel">
-              <Card className="overflow-hidden border border-slate-200 bg-white shadow-sm">
+              <Card className="overflow-hidden cube-card">
                 <Card.Header className="cube-accounts-header border-b border-slate-200 px-4 py-3 sm:px-5 sm:py-4">
                   <div className="cube-accounts-title min-w-0">
                     <div className="flex min-w-0 items-center gap-2.5">
@@ -952,7 +1001,7 @@ export default function App() {
         {activeView === "load-balancer" && (
           <section className="cube-view-panel">
             <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(20rem,0.9fr)]">
-              <Card className="border border-slate-200 bg-white shadow-sm">
+              <Card className="cube-card">
                 <Card.Header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
                   <div className="min-w-0">
                     <h2 className="text-base font-semibold text-slate-950">Load balancer</h2>
@@ -996,7 +1045,7 @@ export default function App() {
                           </div>
                         </div>
                       ) : (
-                        <div className="mt-2 text-sm font-medium text-rose-700">No assignable account</div>
+                        <div className="mt-2 text-sm font-medium text-danger">No assignable account</div>
                       )}
                     </div>
                   </div>
@@ -1029,7 +1078,7 @@ export default function App() {
               </Card>
 
               <div className="grid min-w-0 grid-cols-1 gap-4">
-                <Card className="border border-slate-200 bg-white shadow-sm">
+                <Card className="cube-card">
                   <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
                     <h2 className="text-base font-semibold text-slate-950">Out of pool</h2>
                     <Chip color={excludedCount ? "warning" : "success"} variant="soft">
@@ -1044,7 +1093,7 @@ export default function App() {
                   </Card.Content>
                 </Card>
 
-                <Card className="border border-slate-200 bg-white shadow-sm">
+                <Card className="cube-card">
                   <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
                     <h2 className="text-base font-semibold text-slate-950">5h reset order</h2>
                     <Chip color="accent" variant="soft">
@@ -1059,7 +1108,7 @@ export default function App() {
                   </Card.Content>
                 </Card>
 
-                <Card className="border border-slate-200 bg-white shadow-sm">
+                <Card className="cube-card">
                   <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
                     <h2 className="text-base font-semibold text-slate-950">Dispatch history</h2>
                     <Chip color={dispatches.length ? "success" : "warning"} variant="soft">
@@ -1078,7 +1127,7 @@ export default function App() {
         {activeView === "people" && (
           <section className="cube-view-panel">
             <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-              <Card className="border border-slate-200 bg-white shadow-sm">
+              <Card className="cube-card">
                 <Card.Header className="border-b border-slate-200 px-5 py-4">
                   <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                     <KeyRound size={17} />
@@ -1100,9 +1149,9 @@ export default function App() {
                     Create PAT
                   </Button>
                   {createdClientToken && (
-                    <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3">
-                      <div className="mb-2 text-xs font-semibold uppercase text-emerald-700">Token</div>
-                      <div className="path-text font-mono text-xs text-emerald-950">{createdClientToken}</div>
+                    <div className="rounded-lg border border-success bg-success-soft p-3">
+                      <div className="mb-2 text-xs font-semibold uppercase text-success-soft-foreground">Token</div>
+                      <div className="path-text font-mono text-xs text-slate-950">{createdClientToken}</div>
                       <div className="mt-3 grid grid-cols-1 gap-2">
                         <CopyLine
                           label="Dashboard"
@@ -1118,7 +1167,7 @@ export default function App() {
                 </Card.Content>
               </Card>
 
-              <Card className="border border-slate-200 bg-white shadow-sm">
+              <Card className="cube-card">
                 <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
                   <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                     <Users size={17} />
@@ -1165,7 +1214,7 @@ export default function App() {
 
         {activeView === "import" && (
           <section className="cube-view-panel">
-            <Card className="border border-slate-200 bg-white shadow-sm">
+            <Card className="cube-card">
               <Card.Header className="border-b border-slate-200 px-5 py-4">
                 <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                   <UploadCloud size={17} />
@@ -1195,7 +1244,7 @@ export default function App() {
         )}
 
         {message && (
-          <Card className="border border-teal-200 bg-teal-50 text-teal-900">
+          <Card className="border border-accent bg-accent-soft text-accent-soft-foreground">
             <Card.Content className="flex flex-row items-start gap-2 p-4 text-sm">
               <Info size={16} className="mt-0.5 shrink-0" />
               <span>{message}</span>
@@ -1210,7 +1259,7 @@ export default function App() {
     const selectedRefresh = selected ? refreshByAccount.get(selected.id) : undefined;
     const selectedDispatch = selected ? latestDispatchByAccount.get(selected.id) : undefined;
     return (
-      <div className="flex h-full min-h-0 flex-col bg-white">
+      <div className="flex h-full min-h-0 flex-col bg-surface">
         <div className="border-b border-slate-200 px-5 py-4">
           <div className="text-sm font-semibold text-slate-950">Account detail</div>
           <div className="mt-1 text-xs text-slate-500">{selected ? `${selected.status} · ${selected.authPresent ? "auth ready" : "auth missing"}` : "No account opened"}</div>
@@ -1304,23 +1353,30 @@ function TokenGate({
   busy,
   message,
   onApplyToken,
+  onThemeToggle,
   onTokenInput,
+  themeMode,
   tokenInput,
 }: {
   busy: boolean;
   message: string;
   onApplyToken: () => Promise<void>;
+  onThemeToggle: () => void;
   onTokenInput: (value: string) => void;
+  themeMode: ThemeMode;
   tokenInput: string;
 }) {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-50 p-4">
-      <Card className="w-full max-w-xl border border-slate-200 bg-white shadow-sm">
-        <Card.Header className="border-b border-slate-200 px-5 py-4">
+    <div className="flex min-h-screen items-center justify-center bg-background p-4">
+      <Card className="w-full max-w-xl cube-card cube-elevated">
+        <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
           <h1 className="flex items-center gap-2 text-base font-semibold text-slate-950">
-            <ShieldCheck size={18} />
+            <span className="grid h-8 w-8 place-items-center rounded-lg cube-brand">
+              <ShieldCheck size={16} />
+            </span>
             cube20
           </h1>
+          <ThemeToggle mode={themeMode} onToggle={onThemeToggle} />
         </Card.Header>
         <Card.Content className="gap-4">
           <FieldLabel text="admin token or PAT">
@@ -1336,7 +1392,7 @@ function TokenGate({
             Continue
           </Button>
           {message && (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+            <div className="rounded-lg border border-warning bg-warning-soft p-3 text-sm text-warning-soft-foreground">
               {message}
             </div>
           )}
@@ -1352,8 +1408,10 @@ function PersonalDashboard({
   onApplyToken,
   onClearToken,
   onRefresh,
+  onThemeToggle,
   onTokenInput,
   personal,
+  themeMode,
   tokenInput,
   usage,
 }: {
@@ -1362,8 +1420,10 @@ function PersonalDashboard({
   onApplyToken: () => Promise<void>;
   onClearToken: () => Promise<void>;
   onRefresh: () => Promise<void>;
+  onThemeToggle: () => void;
   onTokenInput: (value: string) => void;
   personal: PersonalPayload;
+  themeMode: ThemeMode;
   tokenInput: string;
   usage: AccountUsage[];
 }) {
@@ -1375,11 +1435,11 @@ function PersonalDashboard({
 
   return (
     <AppLayout
-      className="h-screen bg-slate-50"
+      className="h-screen bg-background"
       navbar={
-        <div className="cube-navbar flex min-h-14 w-full items-center justify-between gap-3 border-b border-slate-200 bg-white px-4 py-2">
+        <div className="cube-navbar sticky top-0 z-20 flex min-h-14 w-full items-center justify-between gap-3 border-b border-slate-200 cube-glass px-4 py-2">
           <div className="flex min-w-0 items-center gap-3">
-            <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-slate-950 text-white">
+            <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg cube-brand">
               <UserRound size={18} />
             </div>
             <div className="min-w-0">
@@ -1388,6 +1448,7 @@ function PersonalDashboard({
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
+            <ThemeToggle mode={themeMode} onToggle={onThemeToggle} />
             <Button aria-label="Reload data" className="gap-2" isDisabled={busy} size="sm" variant="secondary" onPress={onRefresh}>
               <RefreshCw size={15} />
               <span className="hidden sm:inline">Reload</span>
@@ -1408,7 +1469,7 @@ function PersonalDashboard({
         </div>
 
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-          <Card className="border border-slate-200 bg-white shadow-sm">
+          <Card className="cube-card">
             <Card.Header className="border-b border-slate-200 px-5 py-4">
               <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                 <UserRound size={17} />
@@ -1423,7 +1484,7 @@ function PersonalDashboard({
             </Card.Content>
           </Card>
 
-          <Card className="border border-slate-200 bg-white shadow-sm">
+          <Card className="cube-card">
             <Card.Header className="border-b border-slate-200 px-5 py-4">
               <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                 <KeyRound size={17} />
@@ -1455,7 +1516,7 @@ function PersonalDashboard({
           </Card>
         </div>
 
-        <Card className="border border-slate-200 bg-white shadow-sm">
+        <Card className="cube-card">
           <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
             <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
               <Route size={17} />
@@ -1470,7 +1531,7 @@ function PersonalDashboard({
           </Card.Content>
         </Card>
 
-        <Card className="border border-slate-200 bg-white shadow-sm">
+        <Card className="cube-card">
           <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
             <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
               <Gauge size={17} />
@@ -1500,7 +1561,7 @@ function PersonalDashboard({
         </Card>
 
         {message && (
-          <Card className="border border-teal-200 bg-teal-50 text-teal-900">
+          <Card className="border border-accent bg-accent-soft text-accent-soft-foreground">
             <Card.Content className="flex flex-row items-start gap-2 p-4 text-sm">
               <Info size={16} className="mt-0.5 shrink-0" />
               <span>{message}</span>
@@ -1784,7 +1845,7 @@ function NavItem({
       aria-current={active ? "page" : undefined}
       aria-pressed={active}
       className={`cube-nav-button flex h-10 w-full items-center gap-3 rounded-xl px-3 text-left text-sm ${
-        active ? "bg-slate-950 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"
+        active ? "cube-brand shadow-sm" : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"
       }`}
       type="button"
       onClick={onPress}
@@ -1821,8 +1882,8 @@ function MobileAccountCard({
 
   return (
     <div
-      className={`cube-mobile-account rounded-lg border bg-white p-3 shadow-sm ${
-        isSelected ? "border-slate-900 ring-1 ring-slate-900" : "border-slate-200"
+      className={`cube-mobile-account rounded-lg border bg-surface p-3 shadow-sm ${
+        isSelected ? "border-accent ring-1 ring-accent" : "border-slate-200"
       }`}
     >
       <div className="flex min-w-0 items-start gap-3">
@@ -1931,7 +1992,7 @@ function MetricCard({
   value: string;
 }) {
   return (
-    <KPI className="border border-slate-200 bg-white shadow-sm">
+    <KPI className="cube-card">
       <KPI.Header>
         <KPI.Icon status={status}>{icon}</KPI.Icon>
         <KPI.Title>{label}</KPI.Title>

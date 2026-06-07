@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Card, Chip } from "@heroui/react";
 import { Activity, Clock, Gauge } from "lucide-react";
 import {
@@ -98,7 +98,7 @@ function TimelineTooltip({
   if (!active || !payload?.length) return null;
   const point = payload[0].payload;
   return (
-    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-md">
+    <div className="rounded-lg border border-slate-200 bg-surface px-3 py-2 text-xs shadow-lg">
       <div className="font-semibold text-slate-950">{point.name}</div>
       <div className="mt-1 text-slate-500">距刷新 {fmtMinutes(point.minutes)}</div>
       <div className="text-slate-400">{fmtTime(point.resetsAt)}</div>
@@ -106,8 +106,33 @@ function TimelineTooltip({
   );
 }
 
+function useChartTheme() {
+  const [theme, setTheme] = useState(0); // bump to force re-read on theme change
+  useEffect(() => {
+    const root = document.documentElement;
+    const observer = new MutationObserver(() => setTheme((n) => n + 1));
+    observer.observe(root, { attributes: true, attributeFilter: ["class", "data-theme"] });
+    return () => observer.disconnect();
+  }, []);
+  return useMemo(() => {
+    if (typeof window === "undefined") {
+      return { grid: "#e2e8f0", axis: "#64748b", bar: "#6366f1", cursor: "rgba(99,102,241,0.10)" };
+    }
+    const styles = getComputedStyle(document.documentElement);
+    const read = (name: string, fallback: string) => styles.getPropertyValue(name).trim() || fallback;
+    return {
+      grid: read("--border", "#e2e8f0"),
+      axis: read("--muted", "#64748b"),
+      bar: read("--accent", "#6366f1"),
+      cursor: "color-mix(in oklab, var(--accent) 12%, transparent)",
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [theme]);
+}
+
 export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
   const rows = useMemo(() => queue ?? [], [queue]);
+  const chart = useChartTheme();
 
   const timeline = useMemo(() => {
     const points: TimelinePoint[] = [];
@@ -130,7 +155,7 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
 
   return (
     <div className="grid grid-cols-1 gap-4">
-      <Card className="border border-slate-200 bg-white shadow-sm">
+      <Card className="cube-card overflow-hidden">
         <Card.Header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
           <div className="min-w-0">
             <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
@@ -207,7 +232,7 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
         </Card.Content>
       </Card>
 
-      <Card className="border border-slate-200 bg-white shadow-sm">
+      <Card className="cube-card overflow-hidden">
         <Card.Header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
           <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
             <Activity size={17} />
@@ -226,21 +251,21 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
                   layout="vertical"
                   margin={{ top: 8, right: 24, bottom: 8, left: 12 }}
                 >
-                  <CartesianGrid horizontal={false} stroke="#e2e8f0" strokeDasharray="3 3" />
+                  <CartesianGrid horizontal={false} stroke={chart.grid} strokeDasharray="3 3" />
                   <XAxis
                     type="number"
                     dataKey="minutes"
-                    tick={{ fontSize: 11, fill: "#64748b" }}
-                    label={{ value: "距刷新(分钟)", position: "insideBottom", offset: -2, fontSize: 11, fill: "#64748b" }}
+                    tick={{ fontSize: 11, fill: chart.axis }}
+                    label={{ value: "距刷新(分钟)", position: "insideBottom", offset: -2, fontSize: 11, fill: chart.axis }}
                   />
                   <YAxis
                     type="category"
                     dataKey="name"
                     width={140}
-                    tick={{ fontSize: 11, fill: "#475569" }}
+                    tick={{ fontSize: 11, fill: chart.axis }}
                   />
-                  <Tooltip content={<TimelineTooltip />} cursor={{ fill: "#f1f5f9" }} />
-                  <Bar dataKey="minutes" fill="#0f172a" radius={[0, 4, 4, 0]} barSize={18} />
+                  <Tooltip content={<TimelineTooltip />} cursor={{ fill: chart.cursor }} />
+                  <Bar dataKey="minutes" fill={chart.bar} radius={[0, 4, 4, 0]} barSize={18} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
