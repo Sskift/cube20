@@ -30,6 +30,8 @@ import {
   Users,
 } from "lucide-react";
 
+import { QuotaOverview } from "./views/QuotaOverview";
+
 type AccountStatus = "ready" | "recovering" | "drain" | "disabled";
 type AccountOwnerMode = "cloud" | "client";
 
@@ -201,7 +203,7 @@ interface PersonalPayload {
 }
 
 type AccessMode = "unknown" | "admin" | "personal";
-type DashboardView = "accounts" | "load-balancer" | "people" | "import";
+type DashboardView = "accounts" | "load-balancer" | "people" | "import" | "overview";
 
 const CLOUD_TOKEN_KEY = "cube20.cloudToken";
 let cloudTokenSynced = false;
@@ -737,6 +739,13 @@ export default function App() {
           onPress={() => selectView("load-balancer")}
         />
         <NavItem
+          icon={<Gauge size={17} />}
+          label="配额总览"
+          active={activeView === "overview"}
+          badge={refreshQueue.length.toString()}
+          onPress={() => selectView("overview")}
+        />
+        <NavItem
           icon={<Users size={17} />}
           label="People"
           active={activeView === "people"}
@@ -1176,6 +1185,12 @@ export default function App() {
                 </DropZone>
               </Card.Content>
             </Card>
+          </section>
+        )}
+
+        {activeView === "overview" && (
+          <section className="cube-view-panel">
+            <QuotaOverview queue={refreshQueue} />
           </section>
         )}
 
