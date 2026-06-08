@@ -33,6 +33,7 @@ import {
 } from "lucide-react";
 
 import { QuotaOverview } from "./views/QuotaOverview";
+import { useLang } from "./i18n";
 
 type AccountStatus = "ready" | "recovering" | "drain" | "disabled";
 type AccountOwnerMode = "cloud" | "client";
@@ -284,6 +285,23 @@ function ThemeToggle({ mode, onToggle }: { mode: ThemeMode; onToggle: () => void
   );
 }
 
+// LangToggle flips the UI language. It shows the language it will switch TO (so
+// in Chinese it reads "EN", in English it reads "中"), matching the ThemeToggle
+// button's size and styling.
+function LangToggle() {
+  const { lang, toggle } = useLang();
+  return (
+    <button
+      aria-label={lang === "zh" ? "Switch to English" : "切换为中文"}
+      className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-slate-200 bg-surface text-xs font-semibold text-slate-600 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-950"
+      type="button"
+      onClick={toggle}
+    >
+      {lang === "zh" ? "EN" : "中"}
+    </button>
+  );
+}
+
 function maskSecret(value: string) {
   if (!value) return "-";
   if (value.length <= 14) return `${value.slice(0, 3)}...`;
@@ -336,28 +354,30 @@ function accountName(account?: Account) {
   return account.label || shortID(account.id);
 }
 
-function quotaSummary(quota?: QuotaResult) {
-  if (!quota) return { label: "Not checked", value: 0, color: "default" as const };
-  if (quota.status === "loading") return { label: "Checking", value: 0, color: "accent" as const };
+type TranslateFn = (zh: string, en: string) => string;
+
+function quotaSummary(quota: QuotaResult | undefined, t: TranslateFn) {
+  if (!quota) return { label: t("未检查", "Not checked"), value: 0, color: "default" as const };
+  if (quota.status === "loading") return { label: t("检查中", "Checking"), value: 0, color: "accent" as const };
   if (quota.status === "supported" && quota.quotas?.length) {
     const primary = quota.quotas[0];
     return {
-      label: `${primary.remainingDisplay} left`,
+      label: `${primary.remainingDisplay} ${t("剩余", "left")}`,
       value: Math.max(0, Math.min(100, 100 - primary.usedPercent)),
       color: primary.usedPercent > 80 ? ("danger" as const) : primary.usedPercent > 55 ? ("warning" as const) : ("success" as const),
     };
   }
-  if (quota.status === "unsupported_api_key") return { label: "API key", value: 0, color: "warning" as const };
-  if (quota.status === "refresh_token_invalidated") return { label: "Re-login", value: 0, color: "danger" as const };
+  if (quota.status === "unsupported_api_key") return { label: t("API 密钥", "API key"), value: 0, color: "warning" as const };
+  if (quota.status === "refresh_token_invalidated") return { label: t("需重新登录", "Re-login"), value: 0, color: "danger" as const };
   return { label: quota.status, value: 0, color: "default" as const };
 }
 
-function quotaHint(quota?: QuotaResult) {
+function quotaHint(quota: QuotaResult | undefined, t: TranslateFn) {
   if (!quota) return "";
-  if (quota.status === "refresh_token_invalidated") return "Stored token was rotated or revoked. Re-login this account or upload a fresh auth.json.";
-  if (quota.status === "unsupported_api_key") return "API-key auth cannot expose subscription balance.";
-  if (quota.status === "not_configured") return "auth.json is missing.";
-  if (quota.status === "error") return quota.detail || "Quota check failed.";
+  if (quota.status === "refresh_token_invalidated") return t("存储的令牌已被轮换或撤销。请重新登录该账号,或上传新的 auth.json。", "Stored token was rotated or revoked. Re-login this account or upload a fresh auth.json.");
+  if (quota.status === "unsupported_api_key") return t("API 密钥鉴权无法获取订阅余额。", "API-key auth cannot expose subscription balance.");
+  if (quota.status === "not_configured") return t("缺少 auth.json。", "auth.json is missing.");
+  if (quota.status === "error") return quota.detail || t("配额检查失败。", "Quota check failed.");
   return "";
 }
 
@@ -500,6 +520,7 @@ const NativeSelect = Object.assign(
 );
 
 export default function App() {
+  const { t } = useLang();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [lb, setLB] = useState<LoadBalanceStatus | null>(null);
@@ -588,7 +609,7 @@ export default function App() {
         if (!payload.admin) setMessage("");
       } catch {
         setAccessMode("unknown");
-        setMessage(error instanceof Error ? error.message : "Load failed");
+        setMessage(error instanceof Error ? error.message : t("加载失败", "Load failed"));
       }
     } finally {
       setLoading(false);
@@ -649,7 +670,7 @@ export default function App() {
     try {
       await action();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Action failed");
+      setMessage(error instanceof Error ? error.message : t("操作失败", "Action failed"));
     } finally {
       setBusy(false);
     }
@@ -670,7 +691,7 @@ export default function App() {
         method: "PATCH",
         body: JSON.stringify({ ownerMode, ownerClientId: selected.ownerClientId || "" }),
       });
-      setMessage("Account saved");
+      setMessage(t("账号已保存", "Account saved"));
       await loadAll(selected.id);
     });
   }
@@ -681,7 +702,7 @@ export default function App() {
     await withBusy(async () => {
       await apiJSON(`/api/accounts/${encodeURIComponent(selected.id)}`, { method: "DELETE" });
       setSelectedId("");
-      setMessage("Account deleted");
+      setMessage(t("账号已删除", "Account deleted"));
       await loadAll("");
     });
   }
@@ -696,7 +717,7 @@ export default function App() {
         body: text,
       });
       setSelectedId(account.id);
-      setMessage(`Imported ${accountName(account)}`);
+      setMessage(`${t("已导入", "Imported")} ${accountName(account)}`);
       await loadAll(account.id);
     });
   }
@@ -708,9 +729,9 @@ export default function App() {
       setQuotas((current) => ({ ...current, [id]: result }));
       const queue = await apiJSON<RefreshQueueItem[]>("/api/refresh-queue");
       setRefreshQueue(queue);
-      if (!quiet) setMessage("Quota refreshed");
+      if (!quiet) setMessage(t("配额已刷新", "Quota refreshed"));
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "Quota failed";
+      const detail = error instanceof Error ? error.message : t("配额刷新失败", "Quota failed");
       setQuotas((current) => ({ ...current, [id]: { status: "error", detail } }));
       if (!quiet) setMessage(detail);
     }
@@ -724,7 +745,7 @@ export default function App() {
       });
       setCreatedClientToken(result.token);
       setClientLabel("");
-      setMessage(`Created ${result.client.id}`);
+      setMessage(`${t("已创建", "Created")} ${result.client.id}`);
       await loadAll(selectedId);
     });
   }
@@ -733,14 +754,14 @@ export default function App() {
     if (!window.confirm(`Revoke ${id}?`)) return;
     await withBusy(async () => {
       await apiJSON(`/api/clients/${encodeURIComponent(id)}`, { method: "DELETE" });
-      setMessage(`Revoked ${id}`);
+      setMessage(`${t("已吊销", "Revoked")} ${id}`);
       await loadAll(selectedId);
     });
   }
 
   async function applyToken() {
     saveCloudToken(tokenInput);
-    setMessage("Token saved");
+    setMessage(t("令牌已保存", "Token saved"));
     await loadAll(selectedId);
   }
 
@@ -753,7 +774,7 @@ export default function App() {
     setRefreshQueue([]);
     setDispatches([]);
     setAccessMode("unknown");
-    setMessage("Token cleared");
+    setMessage(t("令牌已清除", "Token cleared"));
   }
 
   const sidebar = (
@@ -764,43 +785,43 @@ export default function App() {
         </div>
         <div className="min-w-0">
           <div className="text-base font-semibold text-slate-950">cube20</div>
-          <div className="text-xs text-slate-500">Codex pool manager</div>
+          <div className="text-xs text-slate-500">{t("Codex 账号池管理", "Codex pool manager")}</div>
         </div>
       </div>
       <div className="flex flex-1 flex-col gap-1 px-3 py-4 text-sm">
         <NavItem
           icon={<Database size={17} />}
-          label="Accounts"
+          label={t("账号", "Accounts")}
           active={activeView === "accounts"}
           badge={accounts.length.toString()}
           onPress={() => selectView("accounts")}
         />
         <NavItem
           icon={<Route size={17} />}
-          label="Load Balancer"
+          label={t("负载均衡", "Load Balancer")}
           active={activeView === "load-balancer"}
           badge={eligibleCount.toString()}
           onPress={() => selectView("load-balancer")}
         />
         <NavItem
           icon={<Gauge size={17} />}
-          label="配额总览"
+          label={t("配额总览", "Quota Overview")}
           active={activeView === "overview"}
           badge={refreshQueue.length.toString()}
           onPress={() => selectView("overview")}
         />
         <NavItem
           icon={<Users size={17} />}
-          label="People"
+          label={t("成员", "People")}
           active={activeView === "people"}
           badge={activeClientCount.toString()}
           onPress={() => selectView("people")}
         />
-        <NavItem icon={<FileJson size={17} />} label="Import auth" active={activeView === "import"} onPress={() => selectView("import")} />
+        <NavItem icon={<FileJson size={17} />} label={t("导入凭据", "Import auth")} active={activeView === "import"} onPress={() => selectView("import")} />
       </div>
       <div className="border-t border-slate-200 p-3">
         <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
-          <div className="mb-1 font-medium text-slate-900">Live Codex</div>
+          <div className="mb-1 font-medium text-slate-900">{t("本地 Codex", "Live Codex")}</div>
           <div className="path-text font-mono">{meta?.liveCodexHome || "-"}</div>
         </div>
       </div>
@@ -826,17 +847,18 @@ export default function App() {
           </div>
         )}
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold text-slate-950">{compactShell ? "cube20 accounts" : "Account inventory"}</div>
+          <div className="truncate text-sm font-semibold text-slate-950">{compactShell ? t("cube20 账号", "cube20 accounts") : t("账号清单", "Account inventory")}</div>
           <div className="hidden max-w-[min(44vw,34rem)] truncate text-xs text-slate-500 min-[760px]:block">
-            {meta?.accountsDir || "Loading accounts directory"}
+            {meta?.accountsDir || t("正在加载账号目录", "Loading accounts directory")}
           </div>
         </div>
       </div>
       <div className="cube-navbar-actions flex shrink-0 items-center gap-1.5 sm:gap-2">
         <Chip className="hidden min-[900px]:inline-flex" color={meta?.liveAuthPresent ? "success" : "warning"} size="sm" variant="soft">
-          live auth {meta?.liveAuthPresent ? "ready" : "missing"}
+          {t("本地凭据", "live auth")} {meta?.liveAuthPresent ? t("就绪", "ready") : t("缺失", "missing")}
         </Chip>
         <ThemeToggle mode={themeMode} onToggle={toggleTheme} />
+        <LangToggle />
         <button
           aria-label={asideOpen ? "Hide details" : "Details"}
           className="inline-flex h-8 items-center gap-2 rounded-md border border-slate-200 bg-surface px-2.5 text-sm font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 min-[560px]:px-3"
@@ -844,11 +866,11 @@ export default function App() {
           onClick={() => setAsideOpen((open) => !open)}
         >
           {asideOpen ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
-          <span className="hidden min-[700px]:inline">Details</span>
+          <span className="hidden min-[700px]:inline">{t("详情", "Details")}</span>
         </button>
         <Button aria-label="Reload data" className="gap-2" size="sm" variant="secondary" onPress={() => loadAll()}>
           <RefreshCw size={15} />
-          <span className="hidden min-[700px]:inline">Reload</span>
+          <span className="hidden min-[700px]:inline">{t("刷新", "Reload")}</span>
         </Button>
       </div>
     </div>
@@ -913,17 +935,17 @@ export default function App() {
         {activeView === "accounts" && (
           <>
             <div className="hidden grid-cols-2 gap-2 min-[640px]:gap-3 lg:grid xl:grid-cols-4">
-              <MetricCard icon={<Database size={18} />} label="Accounts" value={accounts.length.toString()} status="success" />
-              <MetricCard icon={<CheckCircle2 size={18} />} label="Ready Pool" value={readyCount.toString()} status="success" />
+              <MetricCard icon={<Database size={18} />} label={t("账号", "Accounts")} value={accounts.length.toString()} status="success" />
+              <MetricCard icon={<CheckCircle2 size={18} />} label={t("就绪池", "Ready Pool")} value={readyCount.toString()} status="success" />
               <MetricCard
                 icon={<Route size={18} />}
-                label="Dispatches"
+                label={t("调度", "Dispatches")}
                 value={dispatches.length.toString()}
                 status={dispatches.length > 0 ? "success" : "warning"}
               />
               <MetricCard
                 icon={<ShieldCheck size={18} />}
-                label="Clients"
+                label={t("客户端", "Clients")}
                 value={`${activeClientCount}/${clients.length}`}
                 status={activeClientCount > 0 ? "success" : "warning"}
               />
@@ -938,21 +960,21 @@ export default function App() {
                         <Database size={16} />
                       </div>
                       <div className="min-w-0">
-                        <h2 className="text-base font-semibold leading-5 text-slate-950">Accounts</h2>
+                        <h2 className="text-base font-semibold leading-5 text-slate-950">{t("账号", "Accounts")}</h2>
                         <p className="path-text text-xs text-slate-500">
-                          {accounts.length} profiles · Active: {accountName(activeAccount)}
+                          {accounts.length} {t("个配置", "profiles")} · {t("活跃", "Active")}: {accountName(activeAccount)}
                         </p>
                       </div>
                     </div>
                     <div className="cube-accounts-chips">
                       <Chip color="success" size="sm" variant="soft">
-                        {readyCount} ready
+                        {readyCount} {t("就绪", "ready")}
                       </Chip>
                       <Chip color="accent" size="sm" variant="soft">
-                        {eligibleCount} lb
+                        {eligibleCount} {t("负载", "lb")}
                       </Chip>
                       <Chip color={activeClientCount > 0 ? "success" : "warning"} size="sm" variant="soft">
-                        {activeClientCount} clients
+                        {activeClientCount} {t("客户端", "clients")}
                       </Chip>
                     </div>
                   </div>
@@ -986,8 +1008,8 @@ export default function App() {
                           <EmptyState.Media variant="icon">
                             <Database size={24} />
                           </EmptyState.Media>
-                          <EmptyState.Title>No accounts yet</EmptyState.Title>
-                          <EmptyState.Description>Import your current Codex profile or upload an auth.json snapshot.</EmptyState.Description>
+                          <EmptyState.Title>{t("还没有账号", "No accounts yet")}</EmptyState.Title>
+                          <EmptyState.Description>{t("导入当前 Codex 配置,或上传一个 auth.json 快照。", "Import your current Codex profile or upload an auth.json snapshot.")}</EmptyState.Description>
                         </EmptyState>
                       )}
                     </div>
@@ -1004,11 +1026,11 @@ export default function App() {
               <Card className="cube-card">
                 <Card.Header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
                   <div className="min-w-0">
-                    <h2 className="text-base font-semibold text-slate-950">Load balancer</h2>
-                    <p className="text-xs text-slate-500">Quota-aware lease assignment for cube run.</p>
+                    <h2 className="text-base font-semibold text-slate-950">{t("负载均衡", "Load balancer")}</h2>
+                    <p className="text-xs text-slate-500">{t("面向 cube run 的配额感知租约分配。", "Quota-aware lease assignment for cube run.")}</p>
                   </div>
                   <Chip color={eligibleCount ? "success" : "danger"} variant="soft">
-                    {eligibleCount} assignable
+                    {eligibleCount} {t("可分配", "assignable")}
                   </Chip>
                 </Card.Header>
                 <Card.Content className="gap-4">
@@ -1016,45 +1038,45 @@ export default function App() {
                     <div className="lb-pool-summary">
                       <div className="flex min-w-0 items-center justify-between gap-3">
                         <div className="min-w-0">
-                          <div className="text-xs font-semibold uppercase text-slate-500">Pool readiness</div>
+                          <div className="text-xs font-semibold uppercase text-slate-500">{t("池就绪度", "Pool readiness")}</div>
                           <div className="mt-1 text-2xl font-semibold text-slate-950">{eligibleCount}/{lbTotalCount || 0}</div>
                         </div>
                         <Chip color={eligibleCount ? "success" : "danger"} variant="soft">
-                          {lbEligiblePercent}% in pool
+                          {lbEligiblePercent}% {t("在池中", "in pool")}
                         </Chip>
                       </div>
                       <div className="lb-stack" aria-label="Load balancer pool split">
                         <span className="lb-stack-ready" style={{ width: `${lbEligiblePercent}%` }} />
                       </div>
                       <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500">
-                        <span>{eligibleCount} in pool</span>
-                        <span>{excludedCount} out</span>
+                        <span>{eligibleCount} {t("在池中", "in pool")}</span>
+                        <span>{excludedCount} {t("已排除", "out")}</span>
                         <span>{lb?.policy || "quota-aware"}</span>
                       </div>
                     </div>
                     <div className="lb-next-summary">
-                      <div className="text-xs font-semibold uppercase text-slate-500">Next lease candidate</div>
+                      <div className="text-xs font-semibold uppercase text-slate-500">{t("下一个租约候选", "Next lease candidate")}</div>
                       {lb?.eligible[0] ? (
                         <div className="mt-2 flex min-w-0 items-center gap-3">
                           <QuotaRing value={lb.eligible[0].quotaRemainingPercent} label={lb.eligible[0].quotaRemainingDisplay} />
                           <div className="min-w-0">
                             <div className="truncate text-sm font-semibold text-slate-950">{lbAccountName(lb.eligible[0])}</div>
                             <div className="mt-1 truncate text-xs text-slate-500">
-                              score {scoreLabel(lb.eligible[0].quotaScore)} · reset {shortTime(lb.eligible[0].quotaResetsAt)}
+                              {t("分数", "score")} {scoreLabel(lb.eligible[0].quotaScore)} · {t("刷新", "reset")} {shortTime(lb.eligible[0].quotaResetsAt)}
                             </div>
                           </div>
                         </div>
                       ) : (
-                        <div className="mt-2 text-sm font-medium text-danger">No assignable account</div>
+                        <div className="mt-2 text-sm font-medium text-danger">{t("无可分配账号", "No assignable account")}</div>
                       )}
                     </div>
                   </div>
 
                   <div>
                     <div className="lb-section-head">
-                      <span>Routing map</span>
+                      <span>{t("路由图", "Routing map")}</span>
                       <Chip color={eligibleCount ? "success" : "danger"} size="sm" variant="soft">
-                        {eligibleCount}/{lbTotalCount || 0} assignable
+                        {eligibleCount}/{lbTotalCount || 0} {t("可分配", "assignable")}
                       </Chip>
                     </div>
                     <RoutingMap accounts={lbAccounts} dispatchByAccount={latestDispatchByAccount} />
@@ -1062,7 +1084,7 @@ export default function App() {
 
                   <div>
                     <div className="lb-section-head">
-                      <span>In pool</span>
+                      <span>{t("在池中", "In pool")}</span>
                       <Chip color={eligibleCount ? "success" : "danger"} size="sm" variant="soft">
                         {eligibleCount}
                       </Chip>
@@ -1071,7 +1093,7 @@ export default function App() {
                       {lb?.eligible.map((account) => (
                         <LoadBalanceAccountCard key={account.id} account={account} />
                       ))}
-                      {!eligibleCount && <div className="lb-empty">No account currently has ready auth, no active lease, and available 5h quota.</div>}
+                      {!eligibleCount && <div className="lb-empty">{t("当前没有账号同时具备就绪凭据、无活跃租约、且有可用 5h 配额。", "No account currently has ready auth, no active lease, and available 5h quota.")}</div>}
                     </div>
                   </div>
                 </Card.Content>
@@ -1080,7 +1102,7 @@ export default function App() {
               <div className="grid min-w-0 grid-cols-1 gap-4">
                 <Card className="cube-card">
                   <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
-                    <h2 className="text-base font-semibold text-slate-950">Out of pool</h2>
+                    <h2 className="text-base font-semibold text-slate-950">{t("池外", "Out of pool")}</h2>
                     <Chip color={excludedCount ? "warning" : "success"} variant="soft">
                       {excludedCount}
                     </Chip>
@@ -1089,13 +1111,13 @@ export default function App() {
                     {lb?.excluded.map((account) => (
                       <LoadBalanceAccountCard key={account.id} account={account} />
                     ))}
-                    {!excludedCount && <div className="lb-empty">Every cloud-owned account is currently assignable.</div>}
+                    {!excludedCount && <div className="lb-empty">{t("所有云端账号当前都可分配。", "Every cloud-owned account is currently assignable.")}</div>}
                   </Card.Content>
                 </Card>
 
                 <Card className="cube-card">
                   <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
-                    <h2 className="text-base font-semibold text-slate-950">5h reset order</h2>
+                    <h2 className="text-base font-semibold text-slate-950">{t("5h 刷新顺序", "5h reset order")}</h2>
                     <Chip color="accent" variant="soft">
                       {refreshQueue.length}
                     </Chip>
@@ -1104,13 +1126,13 @@ export default function App() {
                     {refreshQueue.slice(0, 8).map((item, index) => (
                       <RefreshQueueBar key={item.accountId} item={item} index={index} />
                     ))}
-                    {!refreshQueue.length && <div className="lb-empty">No quota checks yet.</div>}
+                    {!refreshQueue.length && <div className="lb-empty">{t("还没有配额检查。", "No quota checks yet.")}</div>}
                   </Card.Content>
                 </Card>
 
                 <Card className="cube-card">
                   <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
-                    <h2 className="text-base font-semibold text-slate-950">Dispatch history</h2>
+                    <h2 className="text-base font-semibold text-slate-950">{t("调度历史", "Dispatch history")}</h2>
                     <Chip color={dispatches.length ? "success" : "warning"} variant="soft">
                       {dispatches.length}
                     </Chip>
@@ -1131,11 +1153,11 @@ export default function App() {
                 <Card.Header className="border-b border-slate-200 px-5 py-4">
                   <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                     <KeyRound size={17} />
-                    New PAT
+                    {t("新建 PAT", "New PAT")}
                   </h2>
                 </Card.Header>
                 <Card.Content className="gap-4">
-                  <FieldLabel text="client label">
+                  <FieldLabel text={t("客户端标签", "client label")}>
                     <Input
                       fullWidth
                       placeholder="liushiao-local"
@@ -1146,19 +1168,19 @@ export default function App() {
                   </FieldLabel>
                   <Button className="gap-2" isDisabled={busy} variant="primary" onPress={createClient}>
                     <KeyRound size={15} />
-                    Create PAT
+                    {t("创建 PAT", "Create PAT")}
                   </Button>
                   {createdClientToken && (
                     <div className="rounded-lg border border-success bg-success-soft p-3">
-                      <div className="mb-2 text-xs font-semibold uppercase text-success-soft-foreground">Token</div>
+                      <div className="mb-2 text-xs font-semibold uppercase text-success-soft-foreground">{t("令牌", "Token")}</div>
                       <div className="path-text font-mono text-xs text-slate-950">{createdClientToken}</div>
                       <div className="mt-3 grid grid-cols-1 gap-2">
                         <CopyLine
-                          label="Dashboard"
+                          label={t("仪表盘", "Dashboard")}
                           value={`${cloudOrigin()}/?token=${createdClientToken}`}
                         />
                         <CopyLine
-                          label="Local config"
+                          label={t("本地配置", "Local config")}
                           value={`cube cloud config --server ${cloudOrigin()} --token ${createdClientToken}`}
                         />
                       </div>
@@ -1171,7 +1193,7 @@ export default function App() {
                 <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
                   <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                     <Users size={17} />
-                    People
+                    {t("成员", "People")}
                   </h2>
                   <Chip color={activeClientCount > 0 ? "success" : "warning"} variant="soft">
                     {activeClientCount}/{clients.length}
@@ -1185,11 +1207,11 @@ export default function App() {
                           <div className="flex min-w-0 flex-wrap items-center gap-2">
                             <span className="truncate text-sm font-semibold text-slate-950">{client.label || client.id}</span>
                             <Chip color={client.active ? "success" : "danger"} size="sm" variant="soft">
-                              {client.active ? "active" : "revoked"}
+                              {client.active ? t("活跃", "active") : t("已吊销", "revoked")}
                             </Chip>
                           </div>
                           <div className="mt-1 font-mono text-xs text-slate-500">{client.id}</div>
-                          <div className="mt-1 text-xs text-slate-500">last seen {shortTime(client.lastSeenAt)}</div>
+                          <div className="mt-1 text-xs text-slate-500">{t("最近活跃", "last seen")} {shortTime(client.lastSeenAt)}</div>
                         </div>
                         <Button
                           aria-label={`Revoke ${client.id}`}
@@ -1200,11 +1222,11 @@ export default function App() {
                           onPress={() => revokeClient(client.id)}
                         >
                           <Trash2 size={14} />
-                          Revoke
+                          {t("吊销", "Revoke")}
                         </Button>
                       </div>
                     ))}
-                    {!clients.length && <div className="px-4 py-6 text-sm text-slate-500">No clients</div>}
+                    {!clients.length && <div className="px-4 py-6 text-sm text-slate-500">{t("暂无客户端", "No clients")}</div>}
                   </div>
                 </Card.Content>
               </Card>
@@ -1218,7 +1240,7 @@ export default function App() {
               <Card.Header className="border-b border-slate-200 px-5 py-4">
                 <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                   <UploadCloud size={17} />
-                  Import auth.json
+                  {t("导入 auth.json", "Import auth.json")}
                 </h2>
               </Card.Header>
               <Card.Content>
@@ -1227,8 +1249,8 @@ export default function App() {
                     <DropZone.Icon>
                       <FileJson size={26} />
                     </DropZone.Icon>
-                    <DropZone.Label>Drop or choose auth.json</DropZone.Label>
-                    <DropZone.Description>Raw Codex auth.json or cube20 profile JSON</DropZone.Description>
+                    <DropZone.Label>{t("拖入或选择 auth.json", "Drop or choose auth.json")}</DropZone.Label>
+                    <DropZone.Description>{t("原始 Codex auth.json 或 cube20 配置 JSON", "Raw Codex auth.json or cube20 profile JSON")}</DropZone.Description>
                     <DropZone.Input accept=".json,application/json" onSelect={uploadFiles} />
                   </DropZone.Area>
                 </DropZone>
@@ -1261,15 +1283,15 @@ export default function App() {
     return (
       <div className="flex h-full min-h-0 flex-col bg-surface">
         <div className="border-b border-slate-200 px-5 py-4">
-          <div className="text-sm font-semibold text-slate-950">Account detail</div>
-          <div className="mt-1 text-xs text-slate-500">{selected ? `${selected.status} · ${selected.authPresent ? "auth ready" : "auth missing"}` : "No account opened"}</div>
+          <div className="text-sm font-semibold text-slate-950">{t("账号详情", "Account detail")}</div>
+          <div className="mt-1 text-xs text-slate-500">{selected ? `${selected.status} · ${selected.authPresent ? t("凭据就绪", "auth ready") : t("缺少凭据", "auth missing")}` : t("未打开账号", "No account opened")}</div>
         </div>
         <div className="flex-1 space-y-4 overflow-auto p-5">
           {selected ? (
             <>
               <Card className="border border-slate-200 shadow-none">
                 <Card.Content className="gap-4">
-                  <FieldLabel text="Nickname">
+                  <FieldLabel text={t("昵称", "Nickname")}>
                     <Input
                       fullWidth
                       value={label}
@@ -1277,7 +1299,7 @@ export default function App() {
                       onChange={(event) => setLabel(event.currentTarget.value)}
                     />
                   </FieldLabel>
-                  <FieldLabel text="Pool status">
+                  <FieldLabel text={t("池状态", "Pool status")}>
                     <NativeSelect fullWidth variant="secondary">
                       <NativeSelect.Trigger
                         value={status}
@@ -1290,7 +1312,7 @@ export default function App() {
                       </NativeSelect.Trigger>
                     </NativeSelect>
                   </FieldLabel>
-                  <FieldLabel text="Owner">
+                  <FieldLabel text={t("归属", "Owner")}>
                     <NativeSelect fullWidth variant="secondary">
                       <NativeSelect.Trigger
                         value={ownerMode}
@@ -1303,34 +1325,34 @@ export default function App() {
                   </FieldLabel>
                   <Button className="gap-2" isDisabled={busy} variant="secondary" onPress={saveAccount}>
                     <Save size={15} />
-                    Save
+                    {t("保存", "Save")}
                   </Button>
                   <Button className="gap-2" isDisabled={busy} variant="danger-soft" onPress={deleteAccount}>
                     <Trash2 size={15} />
-                    Delete account
+                    {t("删除账号", "Delete account")}
                   </Button>
                 </Card.Content>
               </Card>
 
               <Card className="border border-slate-200 shadow-none">
-                <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">Cloud signals</Card.Header>
+                <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">{t("云端信号", "Cloud signals")}</Card.Header>
                 <Card.Content className="gap-3 text-xs">
-                  <SignalLine label="5h quota" value={selectedRefresh?.remainingDisplay ? `${selectedRefresh.remainingDisplay} left` : selectedRefresh?.refreshOrderReason || "-"} />
-                  <SignalLine label="5h reset" value={selectedRefresh?.resetsAt ? shortTime(selectedRefresh.resetsAt) : selectedRefresh?.refreshOrderReason || "-"} />
-                  <SignalLine label="quota source" value={selectedRefresh?.quotaSource ? `${selectedRefresh.quotaSource}${selectedRefresh.quotaReporterClientId ? ` · ${selectedRefresh.quotaReporterClientId}` : ""}` : quotas[selected.id]?.source || "-"} />
-                  <SignalLine label="generation" value={(selected.generation || 0).toString()} />
-                  <SignalLine label="owner" value={selected.ownerMode === "client" ? `client ${selected.ownerClientId || "-"}` : "cloud"} />
-                  <SignalLine label="lease" value={selected.leaseActive ? `${selected.leaseClientId || selected.leaseHolder || "client"} until ${shortTime(selected.leaseExpiresAt)}` : "-"} />
+                  <SignalLine label={t("5h 配额", "5h quota")} value={selectedRefresh?.remainingDisplay ? `${selectedRefresh.remainingDisplay} ${t("剩余", "left")}` : selectedRefresh?.refreshOrderReason || "-"} />
+                  <SignalLine label={t("5h 刷新", "5h reset")} value={selectedRefresh?.resetsAt ? shortTime(selectedRefresh.resetsAt) : selectedRefresh?.refreshOrderReason || "-"} />
+                  <SignalLine label={t("配额来源", "quota source")} value={selectedRefresh?.quotaSource ? `${selectedRefresh.quotaSource}${selectedRefresh.quotaReporterClientId ? ` · ${selectedRefresh.quotaReporterClientId}` : ""}` : quotas[selected.id]?.source || "-"} />
+                  <SignalLine label={t("代次", "generation")} value={(selected.generation || 0).toString()} />
+                  <SignalLine label={t("归属", "owner")} value={selected.ownerMode === "client" ? `client ${selected.ownerClientId || "-"}` : "cloud"} />
+                  <SignalLine label={t("租约", "lease")} value={selected.leaseActive ? `${selected.leaseClientId || selected.leaseHolder || "client"} ${t("至", "until")} ${shortTime(selected.leaseExpiresAt)}` : "-"} />
                 </Card.Content>
               </Card>
 
               <Card className="border border-slate-200 shadow-none">
-                <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">Dispatch</Card.Header>
+                <Card.Header className="border-b border-slate-100 px-4 py-3 text-sm font-semibold">{t("调度", "Dispatch")}</Card.Header>
                 <Card.Content className="gap-3 text-xs">
-                  <SignalLine label="current lease" value={selected.leaseActive ? dispatchTarget(selected.leaseClientId, "", selected.leaseHolder) : "-"} />
-                  <SignalLine label="lease expires" value={selected.leaseActive ? shortTime(selected.leaseExpiresAt) : "-"} />
-                  <SignalLine label="last dispatch" value={selectedDispatch ? `${dispatchEventLabel(selectedDispatch.event)} · ${shortTime(selectedDispatch.createdAt)}` : "-"} />
-                  <SignalLine label="sent to" value={selectedDispatch ? dispatchTarget(selectedDispatch.clientId, selectedDispatch.clientLabel, selectedDispatch.holder) : "-"} />
+                  <SignalLine label={t("当前租约", "current lease")} value={selected.leaseActive ? dispatchTarget(selected.leaseClientId, "", selected.leaseHolder) : "-"} />
+                  <SignalLine label={t("租约到期", "lease expires")} value={selected.leaseActive ? shortTime(selected.leaseExpiresAt) : "-"} />
+                  <SignalLine label={t("最近调度", "last dispatch")} value={selectedDispatch ? `${dispatchEventLabel(selectedDispatch.event, t)} · ${shortTime(selectedDispatch.createdAt)}` : "-"} />
+                  <SignalLine label={t("分配给", "sent to")} value={selectedDispatch ? dispatchTarget(selectedDispatch.clientId, selectedDispatch.clientLabel, selectedDispatch.holder) : "-"} />
                 </Card.Content>
               </Card>
             </>
@@ -1339,8 +1361,8 @@ export default function App() {
               <EmptyState.Media variant="icon">
                 <Database size={24} />
               </EmptyState.Media>
-              <EmptyState.Title>Open an account</EmptyState.Title>
-              <EmptyState.Description>Use the account grid to inspect auth files and route status.</EmptyState.Description>
+              <EmptyState.Title>{t("打开一个账号", "Open an account")}</EmptyState.Title>
+              <EmptyState.Description>{t("用账号网格查看凭据文件与路由状态。", "Use the account grid to inspect auth files and route status.")}</EmptyState.Description>
             </EmptyState>
           )}
         </div>
@@ -1366,6 +1388,7 @@ function TokenGate({
   themeMode: ThemeMode;
   tokenInput: string;
 }) {
+  const { t } = useLang();
   return (
     <div className="flex min-h-screen items-center justify-center bg-background p-4">
       <Card className="w-full max-w-xl cube-card cube-elevated">
@@ -1379,7 +1402,7 @@ function TokenGate({
           <ThemeToggle mode={themeMode} onToggle={onThemeToggle} />
         </Card.Header>
         <Card.Content className="gap-4">
-          <FieldLabel text="admin token or PAT">
+          <FieldLabel text={t("管理员令牌或 PAT", "admin token or PAT")}>
             <Input
               fullWidth
               value={tokenInput}
@@ -1389,7 +1412,7 @@ function TokenGate({
           </FieldLabel>
           <Button className="gap-2" isDisabled={busy || !tokenInput.trim()} variant="primary" onPress={onApplyToken}>
             <KeyRound size={15} />
-            Continue
+            {t("继续", "Continue")}
           </Button>
           {message && (
             <div className="rounded-lg border border-warning bg-warning-soft p-3 text-sm text-warning-soft-foreground">
@@ -1432,6 +1455,7 @@ function PersonalDashboard({
   const dispatches = personal.dispatches || [];
   const browserToken = cloudToken();
   const configCommand = `cube cloud config --server ${cloudOrigin()} --token ${browserToken || "<cube_pat_...>"}`;
+  const { t } = useLang();
 
   return (
     <AppLayout
@@ -1443,19 +1467,20 @@ function PersonalDashboard({
               <UserRound size={18} />
             </div>
             <div className="min-w-0">
-              <div className="truncate text-sm font-semibold text-slate-950">My page</div>
+              <div className="truncate text-sm font-semibold text-slate-950">{t("我的页面", "My page")}</div>
               <div className="truncate text-xs text-slate-500">{client?.label || client?.id || "client"}</div>
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <ThemeToggle mode={themeMode} onToggle={onThemeToggle} />
+            <LangToggle />
             <Button aria-label="Reload data" className="gap-2" isDisabled={busy} size="sm" variant="secondary" onPress={onRefresh}>
               <RefreshCw size={15} />
-              <span className="hidden sm:inline">Reload</span>
+              <span className="hidden sm:inline">{t("刷新", "Reload")}</span>
             </Button>
             <Button aria-label="Clear token" className="gap-2" isDisabled={busy} size="sm" variant="danger-soft" onPress={onClearToken}>
               <LogOut size={15} />
-              <span className="hidden sm:inline">Token</span>
+              <span className="hidden sm:inline">{t("令牌", "Token")}</span>
             </Button>
           </div>
         </div>
@@ -1463,9 +1488,9 @@ function PersonalDashboard({
     >
       <div className="cube-content mx-auto flex w-full max-w-6xl flex-col gap-4 p-3 sm:p-4 lg:gap-5 lg:p-6">
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-          <MetricCard icon={<UserRound size={18} />} label="Client" value={client?.active ? "Active" : "Inactive"} status={client?.active ? "success" : "danger"} />
-          <MetricCard icon={<Gauge size={18} />} label="7d Token Usage" value={tokens(totals?.sevenDays?.total)} status={(totals?.sevenDays?.total || 0) > 0 ? "success" : "warning"} />
-          <MetricCard icon={<Route size={18} />} label="Dispatches" value={dispatches.length.toString()} status={dispatches.length ? "success" : "warning"} />
+          <MetricCard icon={<UserRound size={18} />} label={t("客户端", "Client")} value={client?.active ? t("活跃", "Active") : t("未活跃", "Inactive")} status={client?.active ? "success" : "danger"} />
+          <MetricCard icon={<Gauge size={18} />} label={t("7天 Token 用量", "7d Token Usage")} value={tokens(totals?.sevenDays?.total)} status={(totals?.sevenDays?.total || 0) > 0 ? "success" : "warning"} />
+          <MetricCard icon={<Route size={18} />} label={t("调度", "Dispatches")} value={dispatches.length.toString()} status={dispatches.length ? "success" : "warning"} />
         </div>
 
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
@@ -1473,14 +1498,14 @@ function PersonalDashboard({
             <Card.Header className="border-b border-slate-200 px-5 py-4">
               <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                 <UserRound size={17} />
-                Profile
+                {t("资料", "Profile")}
               </h2>
             </Card.Header>
             <Card.Content className="gap-3 text-sm">
-              <SignalLine label="client id" value={client?.id || "-"} />
-              <SignalLine label="label" value={client?.label || "-"} />
-              <SignalLine label="last seen" value={shortTime(client?.lastSeenAt)} />
-              <SignalLine label="browser token" value={maskSecret(browserToken)} />
+              <SignalLine label={t("客户端 ID", "client id")} value={client?.id || "-"} />
+              <SignalLine label={t("标签", "label")} value={client?.label || "-"} />
+              <SignalLine label={t("最近活跃", "last seen")} value={shortTime(client?.lastSeenAt)} />
+              <SignalLine label={t("浏览器令牌", "browser token")} value={maskSecret(browserToken)} />
             </Card.Content>
           </Card>
 
@@ -1488,11 +1513,11 @@ function PersonalDashboard({
             <Card.Header className="border-b border-slate-200 px-5 py-4">
               <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
                 <KeyRound size={17} />
-                Access
+                {t("访问", "Access")}
               </h2>
             </Card.Header>
             <Card.Content className="gap-4">
-              <FieldLabel text="token">
+              <FieldLabel text={t("令牌", "token")}>
                 <Input
                   fullWidth
                   value={tokenInput}
@@ -1503,15 +1528,15 @@ function PersonalDashboard({
               <div className="flex flex-wrap gap-2">
                 <Button className="gap-2" isDisabled={busy || !tokenInput.trim()} variant="primary" onPress={onApplyToken}>
                   <Save size={15} />
-                  Save token
+                  {t("保存令牌", "Save token")}
                 </Button>
                 <Button className="gap-2" variant="secondary" onPress={() => copyText(configCommand)}>
                   <Copy size={15} />
-                  Copy config
+                  {t("复制配置", "Copy config")}
                 </Button>
               </div>
-              <CopyLine label="Local config" value={configCommand} />
-              <CopyLine label="Dashboard" value={`${cloudOrigin()}/?token=${browserToken || "<cube_pat_...>"}`} />
+              <CopyLine label={t("本地配置", "Local config")} value={configCommand} />
+              <CopyLine label={t("仪表盘", "Dashboard")} value={`${cloudOrigin()}/?token=${browserToken || "<cube_pat_...>"}`} />
             </Card.Content>
           </Card>
         </div>
@@ -1520,7 +1545,7 @@ function PersonalDashboard({
           <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
             <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
               <Route size={17} />
-              Dispatches
+              {t("调度", "Dispatches")}
             </h2>
             <Chip color={dispatches.length ? "success" : "warning"} variant="soft">
               {dispatches.length}
@@ -1535,10 +1560,10 @@ function PersonalDashboard({
           <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
             <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
               <Gauge size={17} />
-              Usage by account
+              {t("按账号用量", "Usage by account")}
             </h2>
             <Chip color="accent" variant="soft">
-              {tokens(totals?.allTime?.total)} all
+              {tokens(totals?.allTime?.total)} {t("全部", "all")}
             </Chip>
           </Card.Header>
           <Card.Content className="p-0">
@@ -1547,15 +1572,15 @@ function PersonalDashboard({
                 <div key={item.accountId} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-3 text-sm">
                   <div className="min-w-0">
                     <div className="truncate font-semibold text-slate-950">{shortID(item.accountId)}</div>
-                    <div className="truncate text-xs text-slate-500">{item.latestModel || item.models?.[0]?.model || "no model"} · {shortTime(item.latestAt || item.updatedAt)}</div>
+                    <div className="truncate text-xs text-slate-500">{item.latestModel || item.models?.[0]?.model || t("无模型", "no model")} · {shortTime(item.latestAt || item.updatedAt)}</div>
                   </div>
                   <div className="text-right">
                     <div className="font-semibold text-slate-950">{tokens(item.sevenDays?.total)} 7d</div>
-                    <div className="text-xs text-slate-500">{tokens(item.today?.total)} today</div>
+                    <div className="text-xs text-slate-500">{tokens(item.today?.total)} {t("今日", "today")}</div>
                   </div>
                 </div>
               ))}
-              {!usage.length && <div className="px-4 py-6 text-sm text-slate-500">No usage yet</div>}
+              {!usage.length && <div className="px-4 py-6 text-sm text-slate-500">{t("暂无用量", "No usage yet")}</div>}
             </div>
           </Card.Content>
         </Card>
@@ -1601,31 +1626,31 @@ function scoreLabel(value?: number) {
   return value.toFixed(1);
 }
 
-function quotaStatusLabel(value?: string) {
+function quotaStatusLabel(value: string | undefined, t: TranslateFn) {
   switch (value) {
     case "refresh_token_invalidated":
-      return "re-login";
+      return t("需重新登录", "re-login");
     case "unsupported_api_key":
-      return "api key";
+      return t("API 密钥", "api key");
     case "not_configured":
-      return "missing";
+      return t("缺失", "missing");
     case "supported":
-      return "checked";
+      return t("已检查", "checked");
     case "error":
-      return "error";
+      return t("错误", "error");
     default:
       return value || "-";
   }
 }
 
-function dispatchEventLabel(event?: string) {
+function dispatchEventLabel(event: string | undefined, t: TranslateFn) {
   switch (event) {
     case "claimed":
-      return "dispatched";
+      return t("已派发", "dispatched");
     case "released":
-      return "released";
+      return t("已释放", "released");
     case "expired":
-      return "expired";
+      return t("已过期", "expired");
     default:
       return event || "-";
   }
@@ -1652,8 +1677,9 @@ function QuotaRing({ label, value }: { label?: string; value?: number }) {
 }
 
 function LoadBalanceAccountCard({ account }: { account: LoadBalanceAccount }) {
+  const { t } = useLang();
   const remaining = clampUIPercent(account.quotaRemainingPercent);
-  const quotaLabel = account.quotaRemainingDisplay || quotaStatusLabel(account.quotaStatus);
+  const quotaLabel = account.quotaRemainingDisplay || quotaStatusLabel(account.quotaStatus, t);
 
   return (
     <div className={`lb-account-card ${account.eligible ? "is-eligible" : "is-excluded"}`}>
@@ -1663,11 +1689,11 @@ function LoadBalanceAccountCard({ account }: { account: LoadBalanceAccount }) {
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <span className="truncate text-sm font-semibold text-slate-950">{lbAccountName(account)}</span>
             <Chip color={account.eligible ? "success" : "warning"} size="sm" variant="soft">
-              {account.eligible ? "in pool" : "out"}
+              {account.eligible ? t("在池中", "in pool") : t("池外", "out")}
             </Chip>
             {account.leaseActive && (
               <Chip color="accent" size="sm" variant="soft">
-                leased
+                {t("租用中", "leased")}
               </Chip>
             )}
           </div>
@@ -1676,7 +1702,7 @@ function LoadBalanceAccountCard({ account }: { account: LoadBalanceAccount }) {
       </div>
 
       <div className="lb-quota-line">
-        <span>5h remaining</span>
+        <span>{t("5h 剩余", "5h remaining")}</span>
         <strong>{quotaLabel}</strong>
       </div>
       <div className="lb-quota-track">
@@ -1685,15 +1711,15 @@ function LoadBalanceAccountCard({ account }: { account: LoadBalanceAccount }) {
 
       <div className="lb-account-metrics">
         <div>
-          <span>score</span>
+          <span>{t("分数", "score")}</span>
           <strong>{scoreLabel(account.quotaScore)}</strong>
         </div>
         <div>
-          <span>reset</span>
+          <span>{t("刷新", "reset")}</span>
           <strong>{shortTime(account.quotaResetsAt)}</strong>
         </div>
         <div>
-          <span>gen</span>
+          <span>{t("代次", "gen")}</span>
           <strong>{account.generation || 0}</strong>
         </div>
       </div>
@@ -1701,7 +1727,7 @@ function LoadBalanceAccountCard({ account }: { account: LoadBalanceAccount }) {
       {account.reason && <div className="lb-reason">{account.reason}</div>}
       {account.leaseActive && (
         <div className="lb-reason is-active">
-          sent to {dispatchTarget(account.leaseClientId, "", account.leaseHolder)} until {shortTime(account.leaseExpiresAt)}
+          {t("分配给", "sent to")} {dispatchTarget(account.leaseClientId, "", account.leaseHolder)} {t("至", "until")} {shortTime(account.leaseExpiresAt)}
         </div>
       )}
     </div>
@@ -1715,8 +1741,9 @@ function RoutingMap({
   accounts: LoadBalanceAccount[];
   dispatchByAccount: Map<string, DispatchEvent>;
 }) {
+  const { t } = useLang();
   if (!accounts.length) {
-    return <div className="lb-empty">No cloud-owned account is registered for load balancing.</div>;
+    return <div className="lb-empty">{t("没有云端账号登记参与负载均衡。", "No cloud-owned account is registered for load balancing.")}</div>;
   }
 
   return (
@@ -1724,13 +1751,13 @@ function RoutingMap({
       {accounts.map((account) => {
         const dispatch = dispatchByAccount.get(account.id);
         const remaining = clampUIPercent(account.quotaRemainingPercent);
-        const quotaLabel = account.quotaRemainingDisplay || quotaStatusLabel(account.quotaStatus);
+        const quotaLabel = account.quotaRemainingDisplay || quotaStatusLabel(account.quotaStatus, t);
         const target = account.leaseActive
           ? dispatchTarget(account.leaseClientId, "", account.leaseHolder)
           : dispatch
             ? dispatchTarget(dispatch.clientId, dispatch.clientLabel, dispatch.holder)
             : "-";
-        const targetLabel = account.leaseActive ? "current" : dispatch ? "last" : "sent to";
+        const targetLabel = account.leaseActive ? t("当前", "current") : dispatch ? t("最近", "last") : t("分配给", "sent to");
 
         return (
           <div key={account.id} className={`lb-route-row ${account.eligible ? "is-eligible" : "is-excluded"}`}>
@@ -1740,11 +1767,11 @@ function RoutingMap({
                 <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                   <span className="truncate text-sm font-semibold text-slate-950">{lbAccountName(account)}</span>
                   <Chip color={account.eligible ? "success" : "warning"} size="sm" variant="soft">
-                    {account.eligible ? "in pool" : "out"}
+                    {account.eligible ? t("在池中", "in pool") : t("池外", "out")}
                   </Chip>
                   {account.leaseActive && (
                     <Chip color="accent" size="sm" variant="soft">
-                      leased
+                      {t("租用中", "leased")}
                     </Chip>
                   )}
                 </div>
@@ -1757,9 +1784,9 @@ function RoutingMap({
             </div>
 
             <div className="lb-route-facts">
-              <SignalLine label="5h quota" value={quotaLabel} />
-              <SignalLine label="score" value={scoreLabel(account.quotaScore)} />
-              <SignalLine label="reset" value={shortTime(account.quotaResetsAt)} />
+              <SignalLine label={t("5h 配额", "5h quota")} value={quotaLabel} />
+              <SignalLine label={t("分数", "score")} value={scoreLabel(account.quotaScore)} />
+              <SignalLine label={t("刷新", "reset")} value={shortTime(account.quotaResetsAt)} />
               <SignalLine label={targetLabel} value={target} />
             </div>
 
@@ -1772,8 +1799,9 @@ function RoutingMap({
 }
 
 function DispatchTimeline({ dispatches }: { dispatches: DispatchEvent[] }) {
+  const { t } = useLang();
   if (!dispatches.length) {
-    return <div className="lb-empty">No dispatches recorded yet.</div>;
+    return <div className="lb-empty">{t("还没有调度记录。", "No dispatches recorded yet.")}</div>;
   }
   return (
     <div className="dispatch-list">
@@ -1784,11 +1812,11 @@ function DispatchTimeline({ dispatches }: { dispatches: DispatchEvent[] }) {
             <div className="flex min-w-0 items-center justify-between gap-2">
               <span className="truncate text-sm font-semibold text-slate-950">{event.accountLabel || shortID(event.accountId)}</span>
               <Chip color={event.event === "claimed" ? "success" : event.event === "expired" ? "danger" : "default"} size="sm" variant="soft">
-                {dispatchEventLabel(event.event)}
+                {dispatchEventLabel(event.event, t)}
               </Chip>
             </div>
             <div className="mt-1 truncate text-xs text-slate-500">
-              to {dispatchTarget(event.clientId, event.clientLabel, event.holder)} · {shortTime(event.createdAt)}
+              {t("发往", "to")} {dispatchTarget(event.clientId, event.clientLabel, event.holder)} · {shortTime(event.createdAt)}
             </div>
             <div className="mt-1 font-mono text-[11px] text-slate-400">{shortID(event.leaseId)}</div>
           </div>
@@ -1798,15 +1826,16 @@ function DispatchTimeline({ dispatches }: { dispatches: DispatchEvent[] }) {
   );
 }
 
-function refreshQueueReason(item: RefreshQueueItem) {
+function refreshQueueReason(item: RefreshQueueItem, t: TranslateFn) {
   if (item.ownerMode === "client") {
-    return `${item.refreshOrderReason || "client reported"}${item.quotaReporterClientId ? ` · ${item.quotaReporterClientId}` : ""}`;
+    return `${item.refreshOrderReason || t("客户端上报", "client reported")}${item.quotaReporterClientId ? ` · ${item.quotaReporterClientId}` : ""}`;
   }
-  if (item.leaseActive) return `leased by ${item.leaseClientId || "client"}`;
+  if (item.leaseActive) return `${t("租用方", "leased by")} ${item.leaseClientId || "client"}`;
   return item.refreshOrderReason || item.quotaStatus || item.status;
 }
 
 function RefreshQueueBar({ index, item }: { index: number; item: RefreshQueueItem }) {
+  const { t } = useLang();
   const remaining = clampUIPercent(item.remainingPercent);
   return (
     <div className="lb-queue-row">
@@ -1817,7 +1846,7 @@ function RefreshQueueBar({ index, item }: { index: number; item: RefreshQueueIte
           <span className="shrink-0 text-xs font-semibold text-slate-700">{item.remainingDisplay || "-"}</span>
         </div>
         <div className="mt-1 truncate text-xs text-slate-500">
-          {refreshQueueReason(item)} · {shortTime(item.leaseActive ? item.leaseExpiresAt : item.resetsAt)}
+          {refreshQueueReason(item, t)} · {shortTime(item.leaseActive ? item.leaseExpiresAt : item.resetsAt)}
         </div>
         <div className="lb-queue-track">
           <span style={{ width: `${remaining}%` }} />
@@ -1876,8 +1905,9 @@ function MobileAccountCard({
   quota?: QuotaResult;
   refresh?: RefreshQueueItem;
 }) {
-  const summary = quotaSummary(quota);
-  const hint = quotaHint(quota);
+  const { t } = useLang();
+  const summary = quotaSummary(quota, t);
+  const hint = quotaHint(quota, t);
   const fiveHour = refresh?.remainingDisplay || summary.label;
 
   return (
@@ -1895,7 +1925,7 @@ function MobileAccountCard({
             <span className="truncate text-sm font-semibold text-slate-950">{accountName(account)}</span>
             {account.active && (
               <Chip color="accent" size="sm" variant="soft">
-                active
+                {t("活跃", "active")}
               </Chip>
             )}
             <Chip color={account.status === "ready" ? "success" : account.status === "recovering" || account.status === "drain" ? "warning" : "danger"} size="sm" variant="soft">
@@ -1903,7 +1933,7 @@ function MobileAccountCard({
             </Chip>
             {account.leaseActive && (
               <Chip color="accent" size="sm" variant="soft">
-                leased
+                {t("租用中", "leased")}
               </Chip>
             )}
           </div>
@@ -1916,13 +1946,13 @@ function MobileAccountCard({
           onPress={onSelect}
         >
           {isSelected ? <CheckCircle2 size={14} /> : <PanelRightOpen size={14} />}
-          <span>Details</span>
+          <span>{t("详情", "Details")}</span>
         </Button>
       </div>
 
       <div className="mt-3 flex flex-wrap gap-1.5">
         <Chip color={account.authPresent ? "success" : "danger"} size="sm" variant="soft">
-          auth
+          {t("凭据", "auth")}
         </Chip>
         <Chip color={account.ownerMode === "client" ? "accent" : "default"} size="sm" variant="soft">
           {account.ownerMode || "cloud"}
@@ -1931,7 +1961,7 @@ function MobileAccountCard({
           5h {fiveHour}
         </Chip>
         <Chip color={account.leaseActive ? "accent" : "default"} size="sm" variant="soft">
-          gen {account.generation || 0}
+          {t("代次", "gen")} {account.generation || 0}
         </Chip>
       </div>
 
@@ -1949,30 +1979,30 @@ function MobileAccountCard({
           <div className="mt-3 flex items-center justify-between gap-2 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
             {dispatch ? (
               <div className="min-w-0">
-                <div className="font-semibold text-slate-900">{dispatchEventLabel(dispatch.event)} {shortTime(dispatch.createdAt)}</div>
-                <div className="truncate">to {dispatchTarget(dispatch.clientId, dispatch.clientLabel, dispatch.holder)}</div>
+                <div className="font-semibold text-slate-900">{dispatchEventLabel(dispatch.event, t)} {shortTime(dispatch.createdAt)}</div>
+                <div className="truncate">{t("发往", "to")} {dispatchTarget(dispatch.clientId, dispatch.clientLabel, dispatch.holder)}</div>
               </div>
             ) : (
-              <span className="font-medium text-slate-700">No dispatch yet</span>
+              <span className="font-medium text-slate-700">{t("暂无调度", "No dispatch yet")}</span>
             )}
           </div>
 
           <div className="mt-3 rounded-md bg-slate-50 p-2">
-            <div className="mb-1 text-[11px] font-semibold uppercase leading-4 text-slate-400">5h refresh</div>
+            <div className="mb-1 text-[11px] font-semibold uppercase leading-4 text-slate-400">{t("5h 刷新", "5h refresh")}</div>
             <div className="text-xs leading-5 text-slate-600">
-              {refresh?.resetsAt ? `${shortTime(refresh.resetsAt)} · ${refresh.refreshOrderReason || "queued"}` : refresh?.refreshOrderReason || "quota not checked"}
+              {refresh?.resetsAt ? `${shortTime(refresh.resetsAt)} · ${refresh.refreshOrderReason || t("排队中", "queued")}` : refresh?.refreshOrderReason || t("配额未检查", "quota not checked")}
             </div>
           </div>
         </>
       ) : (
         <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
           <div className="min-w-0 rounded-md bg-slate-50 p-2">
-            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">Quota</div>
+            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">{t("配额", "Quota")}</div>
             <div className="truncate font-medium text-slate-700">{summary.label}</div>
           </div>
           <div className="min-w-0 rounded-md bg-slate-50 p-2">
-            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">Dispatch</div>
-            <div className="truncate font-medium text-slate-700">{dispatch ? dispatchTarget(dispatch.clientId, dispatch.clientLabel, dispatch.holder) : "None"}</div>
+            <div className="text-[11px] font-semibold uppercase leading-4 text-slate-400">{t("调度", "Dispatch")}</div>
+            <div className="truncate font-medium text-slate-700">{dispatch ? dispatchTarget(dispatch.clientId, dispatch.clientLabel, dispatch.holder) : t("无", "None")}</div>
           </div>
         </div>
       )}

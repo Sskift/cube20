@@ -10,6 +10,9 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { useLang } from "../i18n";
+
+type TranslateFn = (zh: string, en: string) => string;
 
 interface QuotaRow {
   accountId: string;
@@ -69,38 +72,42 @@ function usageColor(used?: number): "success" | "warning" | "danger" | "default"
   return "success";
 }
 
-function sourceLabel(value?: string) {
+function sourceLabel(value: string | undefined, t: TranslateFn) {
   switch (value) {
     case "client":
-      return "客户端上报";
+      return t("客户端上报", "client-reported");
     case "cloud":
-      return "云端读取";
+      return t("云端读取", "cloud-read");
     default:
       return "—";
   }
 }
 
-function fmtMinutes(value: number) {
-  if (value < 1) return "现在";
-  if (value < 60) return `${Math.round(value)} 分钟`;
+function fmtMinutes(value: number, t: TranslateFn) {
+  if (value < 1) return t("现在", "now");
+  if (value < 60) return `${Math.round(value)} ${t("分钟", "min")}`;
   const hours = Math.floor(value / 60);
   const mins = Math.round(value % 60);
-  return mins ? `${hours} 小时 ${mins} 分` : `${hours} 小时`;
+  return mins
+    ? `${hours} ${t("小时", "h")} ${mins} ${t("分", "min")}`
+    : `${hours} ${t("小时", "h")}`;
 }
 
 function TimelineTooltip({
   active,
   payload,
+  t,
 }: {
   active?: boolean;
   payload?: Array<{ payload: TimelinePoint }>;
+  t: TranslateFn;
 }) {
   if (!active || !payload?.length) return null;
   const point = payload[0].payload;
   return (
     <div className="rounded-lg border border-slate-200 bg-surface px-3 py-2 text-xs shadow-lg">
       <div className="font-semibold text-slate-950">{point.name}</div>
-      <div className="mt-1 text-slate-500">距刷新 {fmtMinutes(point.minutes)}</div>
+      <div className="mt-1 text-slate-500">{t("距刷新", "until reset")} {fmtMinutes(point.minutes, t)}</div>
       <div className="text-slate-400">{fmtTime(point.resetsAt)}</div>
     </div>
   );
@@ -133,6 +140,7 @@ function useChartTheme() {
 export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
   const rows = useMemo(() => queue ?? [], [queue]);
   const chart = useChartTheme();
+  const { t } = useLang();
 
   const timeline = useMemo(() => {
     const points: TimelinePoint[] = [];
@@ -160,16 +168,16 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
           <div className="min-w-0">
             <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
               <Gauge size={17} />
-              配额总览
+              {t("配额总览", "Quota Overview")}
             </h2>
-            <p className="text-xs text-slate-500">所有账号 5h 配额用量与租用状态。</p>
+            <p className="text-xs text-slate-500">{t("所有账号 5h 配额用量与租用状态。", "5h quota usage and lease status across all accounts.")}</p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <Chip color="accent" variant="soft">
-              {rows.length} 账号
+              {rows.length} {t("账号", "accounts")}
             </Chip>
             <Chip color={leasedCount ? "accent" : "default"} variant="soft">
-              {leasedCount} 租用中
+              {leasedCount} {t("租用中", "leased")}
             </Chip>
           </div>
         </Card.Header>
@@ -179,13 +187,13 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
               <table className="w-full min-w-[720px] border-collapse text-sm">
                 <thead>
                   <tr className="border-b border-slate-200 text-left text-xs font-semibold uppercase text-slate-500">
-                    <th className="px-4 py-3 font-semibold">账号</th>
-                    <th className="px-4 py-3 font-semibold">5h 用量%</th>
-                    <th className="px-4 py-3 font-semibold">5h 剩余%</th>
-                    <th className="px-4 py-3 font-semibold">刷新时间</th>
-                    <th className="px-4 py-3 font-semibold">租用者</th>
-                    <th className="px-4 py-3 font-semibold">状态</th>
-                    <th className="px-4 py-3 font-semibold">来源</th>
+                    <th className="px-4 py-3 font-semibold">{t("账号", "Account")}</th>
+                    <th className="px-4 py-3 font-semibold">{t("5h 用量%", "5h used %")}</th>
+                    <th className="px-4 py-3 font-semibold">{t("5h 剩余%", "5h left %")}</th>
+                    <th className="px-4 py-3 font-semibold">{t("刷新时间", "Reset time")}</th>
+                    <th className="px-4 py-3 font-semibold">{t("租用者", "Lessee")}</th>
+                    <th className="px-4 py-3 font-semibold">{t("状态", "Status")}</th>
+                    <th className="px-4 py-3 font-semibold">{t("来源", "Source")}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -214,7 +222,7 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
                           {row.status || "—"}
                         </Chip>
                       </td>
-                      <td className="px-4 py-3 text-slate-600">{sourceLabel(row.quotaSource)}</td>
+                      <td className="px-4 py-3 text-slate-600">{sourceLabel(row.quotaSource, t)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -225,8 +233,8 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
               <div className="mb-3 grid h-12 w-12 place-items-center rounded-lg bg-slate-100 text-slate-500">
                 <Gauge size={24} />
               </div>
-              <div className="text-sm font-semibold text-slate-950">暂无配额数据</div>
-              <div className="mt-1 max-w-sm text-xs text-slate-500">导入账号并完成配额检查后，这里会显示 5h 用量总览。</div>
+              <div className="text-sm font-semibold text-slate-950">{t("暂无配额数据", "No quota data yet")}</div>
+              <div className="mt-1 max-w-sm text-xs text-slate-500">{t("导入账号并完成配额检查后，这里会显示 5h 用量总览。", "Once accounts are imported and quota checks complete, the 5h usage overview will appear here.")}</div>
             </div>
           )}
         </Card.Content>
@@ -236,10 +244,10 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
         <Card.Header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
           <h2 className="flex items-center gap-2 text-base font-semibold text-slate-950">
             <Activity size={17} />
-            刷新时间轴
+            {t("刷新时间轴", "Reset timeline")}
           </h2>
           <Chip color="accent" variant="soft">
-            {timeline.length} 待刷新
+            {timeline.length} {t("待刷新", "pending")}
           </Chip>
         </Card.Header>
         <Card.Content>
@@ -256,7 +264,7 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
                     type="number"
                     dataKey="minutes"
                     tick={{ fontSize: 11, fill: chart.axis }}
-                    label={{ value: "距刷新(分钟)", position: "insideBottom", offset: -2, fontSize: 11, fill: chart.axis }}
+                    label={{ value: t("距刷新(分钟)", "until reset (min)"), position: "insideBottom", offset: -2, fontSize: 11, fill: chart.axis }}
                   />
                   <YAxis
                     type="category"
@@ -264,7 +272,7 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
                     width={140}
                     tick={{ fontSize: 11, fill: chart.axis }}
                   />
-                  <Tooltip content={<TimelineTooltip />} cursor={{ fill: chart.cursor }} />
+                  <Tooltip content={<TimelineTooltip t={t} />} cursor={{ fill: chart.cursor }} />
                   <Bar dataKey="minutes" fill={chart.bar} radius={[0, 4, 4, 0]} barSize={18} />
                 </BarChart>
               </ResponsiveContainer>
@@ -272,7 +280,7 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
           ) : (
             <div className="flex items-center gap-2 rounded-lg bg-slate-50 px-4 py-6 text-sm text-slate-500">
               <Clock size={16} className="shrink-0" />
-              暂无可计算的刷新时间（缺少 5h 重置时间）。
+              {t("暂无可计算的刷新时间（缺少 5h 重置时间）。", "No computable reset times (missing 5h reset timestamps).")}
             </div>
           )}
         </Card.Content>
