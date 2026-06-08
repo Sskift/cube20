@@ -1,7 +1,6 @@
 package usage
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -95,32 +94,21 @@ func collectFiles(codexHome string) []string {
 }
 
 func parseFile(filePath string, startToday, startSevenDays time.Time, result *Summary) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
 	state := fileState{currentModel: "unknown"}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	prefilter := func(line string) bool {
 		if !strings.Contains(line, "\"event_msg\"") &&
 			!strings.Contains(line, "\"turn_context\"") &&
 			!strings.Contains(line, "\"session_meta\"") {
-			continue
+			return false
 		}
 		if strings.Contains(line, "\"event_msg\"") && !strings.Contains(line, "\"token_count\"") {
-			continue
+			return false
 		}
+		return true
+	}
 
-		var value map[string]any
-		if err := json.Unmarshal([]byte(line), &value); err != nil {
-			continue
-		}
-
+	err := scanJSONL(filePath, prefilter, func(value map[string]any) {
 		eventType, _ := value["type"].(string)
 		switch eventType {
 		case "turn_context":
@@ -136,6 +124,12 @@ func parseFile(filePath string, startToday, startSevenDays time.Time, result *Su
 		case "event_msg":
 			parseTokenEvent(value, &state, startToday, startSevenDays, result)
 		}
+	})
+	if err != nil {
+		// A truncated scan (e.g. bufio.ErrTooLong) means later records in this
+		// file were dropped; flag it so the summary is not silently incomplete.
+		result.Status = "partial"
+		result.Detail = "incomplete scan of " + filepath.Base(filePath) + ": " + err.Error()
 	}
 }
 
@@ -298,16 +292,73 @@ func numberAt(value map[string]any, key string) int64 {
 	return 0
 }
 
+// floatNumberAt is the float64-returning sibling of numberAt: it tolerates
+// float64 / int64 / int / json.Number so callers (e.g. rate-limit percentages)
+// parse uniformly regardless of how the number was decoded. ok is false when the
+// key is missing or of an unhandled type, letting callers distinguish "absent"
+// from a genuine 0.
+func floatNumberAt(value map[string]any, key string) (float64, bool) {
+	switch raw := value[key].(type) {
+	case float64:
+		return raw, true
+	case int64:
+		return float64(raw), true
+	case int:
+		return float64(raw), true
+	case json.Number:
+		if f, err := raw.Float64(); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+// parseTime accepts either an RFC3339[Nano] string or a numeric unix-seconds
+// timestamp (float64 / int64 / int / json.Number, matching how reset times are
+// encoded elsewhere). It returns the zero time only when the value is genuinely
+// unparseable, so a numeric top-level timestamp no longer silently buckets as
+// zero-time / breaks newest-record selection.
 func parseTime(value any) time.Time {
-	text, ok := value.(string)
-	if !ok || strings.TrimSpace(text) == "" {
-		return time.Time{}
+	switch raw := value.(type) {
+	case string:
+		text := strings.TrimSpace(raw)
+		if text == "" {
+			return time.Time{}
+		}
+		t, err := time.Parse(time.RFC3339Nano, text)
+		if err != nil {
+			return time.Time{}
+		}
+		return t
+	case float64:
+		if raw > 0 {
+			return unixSeconds(raw)
+		}
+	case int64:
+		if raw > 0 {
+			return time.Unix(raw, 0)
+		}
+	case int:
+		if raw > 0 {
+			return time.Unix(int64(raw), 0)
+		}
+	case json.Number:
+		if n, err := raw.Int64(); err == nil && n > 0 {
+			return time.Unix(n, 0)
+		}
+		if f, err := raw.Float64(); err == nil && f > 0 {
+			return unixSeconds(f)
+		}
 	}
-	t, err := time.Parse(time.RFC3339Nano, text)
-	if err != nil {
-		return time.Time{}
-	}
-	return t
+	return time.Time{}
+}
+
+// unixSeconds converts a (possibly fractional) unix-seconds value into a Time,
+// preserving sub-second precision.
+func unixSeconds(sec float64) time.Time {
+	whole := int64(sec)
+	nanos := int64((sec - float64(whole)) * 1e9)
+	return time.Unix(whole, nanos)
 }
 
 func normalizeModel(raw string) string {

@@ -1,9 +1,6 @@
 package usage
 
 import (
-	"bufio"
-	"encoding/json"
-	"os"
 	"strings"
 	"time"
 )
@@ -22,6 +19,11 @@ type RateLimits struct {
 
 // LatestRateLimits scans all rollout *.jsonl under codexHome and returns the
 // most-recent (by event timestamp) rate_limits snapshot. Found=false if none.
+//
+// The exported signature is intentionally errorless (callers in cmd/cube depend
+// on it); a truncated scan of one file (bufio.ErrTooLong) is tolerated by
+// continuing on to the remaining files and relying on newest-timestamp
+// selection, rather than silently trusting a single truncated file.
 func LatestRateLimits(codexHome string) RateLimits {
 	var result RateLimits
 	for _, filePath := range collectFiles(codexHome) {
@@ -31,37 +33,24 @@ func LatestRateLimits(codexHome string) RateLimits {
 }
 
 func scanRateLimitsFile(filePath string, result *RateLimits) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.Contains(line, "rate_limits") {
-			continue
-		}
-
-		var value map[string]any
-		if err := json.Unmarshal([]byte(line), &value); err != nil {
-			continue
-		}
-
-		record, ok := parseRateLimitsRecord(value)
-		if !ok {
-			continue
-		}
-
-		// Keep the record with the greatest CapturedAt. A zero-time best is
-		// replaced by any parsed record so we never lose a found snapshot.
-		if !result.Found || result.CapturedAt.IsZero() || record.CapturedAt.After(result.CapturedAt) {
-			*result = record
-		}
-	}
+	// If scanJSONL returns an error the scan of this file was truncated
+	// (e.g. an oversized line). We can't surface it through LatestRateLimits'
+	// errorless signature, so we keep whatever records were parsed before the
+	// truncation and let the other files / newest-timestamp selection win.
+	_ = scanJSONL(filePath,
+		func(line string) bool { return strings.Contains(line, "rate_limits") },
+		func(value map[string]any) {
+			record, ok := parseRateLimitsRecord(value)
+			if !ok {
+				return
+			}
+			// Keep the record with the greatest CapturedAt. A zero-time best is
+			// replaced by any parsed record so we never lose a found snapshot.
+			if !result.Found || result.CapturedAt.IsZero() || record.CapturedAt.After(result.CapturedAt) {
+				*result = record
+			}
+		},
+	)
 }
 
 func parseRateLimitsRecord(value map[string]any) (RateLimits, bool) {
@@ -78,33 +67,36 @@ func parseRateLimitsRecord(value map[string]any) (RateLimits, bool) {
 	}
 
 	record := RateLimits{
-		Found:      true,
 		CapturedAt: parseTime(value["timestamp"]),
 	}
-	if reached, ok := rateLimits["rate_limit_reached_type"].(string); ok {
+	if reached, ok := rateLimits["rate_limit_reached_type"].(string); ok && reached != "" {
 		record.ReachedType = reached
+		record.Found = true
 	}
 	if primary, ok := rateLimits["primary"].(map[string]any); ok {
-		record.FiveHourUsedPercent = floatAt(primary, "used_percent")
+		if pct, ok := floatNumberAt(primary, "used_percent"); ok {
+			record.FiveHourUsedPercent = pct
+			record.Found = true
+		}
 		record.FiveHourResetsAt = unixSecondsAt(primary, "resets_at")
 	}
 	if secondary, ok := rateLimits["secondary"].(map[string]any); ok {
-		record.SevenDayUsedPercent = floatAt(secondary, "used_percent")
+		if pct, ok := floatNumberAt(secondary, "used_percent"); ok {
+			record.SevenDayUsedPercent = pct
+			record.Found = true
+		}
 		record.SevenDayResetsAt = unixSecondsAt(secondary, "resets_at")
 	}
-	return record, true
+	// Found only when at least one real signal parsed (a percentage or a
+	// reached type); an empty rate_limits:{} must not masquerade as a snapshot.
+	return record, record.Found
 }
 
-func floatAt(value map[string]any, key string) float64 {
-	if f, ok := value[key].(float64); ok {
-		return f
-	}
-	return 0
-}
-
+// unixSecondsAt reads a unix-seconds value (tolerating float64/int64/json.Number
+// via numberAt) and returns the corresponding Time, or zero when absent.
 func unixSecondsAt(value map[string]any, key string) time.Time {
-	if f, ok := value[key].(float64); ok && f > 0 {
-		return time.Unix(int64(f), 0)
+	if n := numberAt(value, key); n > 0 {
+		return time.Unix(n, 0)
 	}
 	return time.Time{}
 }

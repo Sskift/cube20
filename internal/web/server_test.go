@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -342,4 +343,89 @@ func newWebTestManager(t *testing.T) *manager.Manager {
 		t.Fatalf("Ensure() error = %v", err)
 	}
 	return m
+}
+
+// TestManagerAccountViewReturnsView confirms ManagerAccountView returns the
+// per-account view (with the cached quota the test seeds), matching what the
+// old ListAccounts-based implementation produced.
+func TestManagerAccountViewReturnsView(t *testing.T) {
+	server, m, _, _ := newTestServer(t)
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	var work manager.Account
+	for _, a := range state.Accounts {
+		if a.ID == "work" {
+			work = a
+		}
+	}
+	if work.ID == "" {
+		t.Fatalf("seed account %q not found", "work")
+	}
+
+	view := server.ManagerAccountView(work)
+	if view.ID != "work" {
+		t.Fatalf("ManagerAccountView().ID = %q, want %q", view.ID, "work")
+	}
+	if view.Label != "Work" {
+		t.Fatalf("ManagerAccountView().Label = %q, want %q", view.Label, "Work")
+	}
+}
+
+// TestManagerAccountViewUnknownFallsBack confirms a view for an account that is
+// not in state falls back to the bare account rather than erroring.
+func TestManagerAccountViewUnknownFallsBack(t *testing.T) {
+	server, _, _, _ := newTestServer(t)
+	ghost := manager.Account{ID: "ghost", Label: "Ghost"}
+	view := server.ManagerAccountView(ghost)
+	if view.ID != "ghost" || view.Label != "Ghost" {
+		t.Fatalf("ManagerAccountView(ghost) = %+v, want bare account fallback", view)
+	}
+}
+
+// TestManagerAccountViewDoesNotRewriteState is the regression test for the fix:
+// answering a single-account view must NOT rewrite the whole state file. The old
+// implementation called ListAccounts -> syncManagedAccounts -> Save on every
+// call. We assert state.json's bytes AND mtime are unchanged across the call.
+func TestManagerAccountViewDoesNotRewriteState(t *testing.T) {
+	server, m, _, _ := newTestServer(t)
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	var work manager.Account
+	for _, a := range state.Accounts {
+		if a.ID == "work" {
+			work = a
+		}
+	}
+
+	before, err := os.ReadFile(m.StatePath)
+	if err != nil {
+		t.Fatalf("read state before: %v", err)
+	}
+	infoBefore, err := os.Stat(m.StatePath)
+	if err != nil {
+		t.Fatalf("stat state before: %v", err)
+	}
+
+	// Sleep a hair so a rewrite would produce a distinguishable mtime.
+	time.Sleep(10 * time.Millisecond)
+	_ = server.ManagerAccountView(work)
+
+	after, err := os.ReadFile(m.StatePath)
+	if err != nil {
+		t.Fatalf("read state after: %v", err)
+	}
+	infoAfter, err := os.Stat(m.StatePath)
+	if err != nil {
+		t.Fatalf("stat state after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("ManagerAccountView rewrote state.json content (should be a pure read)")
+	}
+	if !infoBefore.ModTime().Equal(infoAfter.ModTime()) {
+		t.Fatal("ManagerAccountView rewrote state.json (mtime changed; should be a pure read)")
+	}
 }

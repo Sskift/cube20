@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -323,6 +325,145 @@ func TestRecordQuotaResultFileModeSerializesWithRoundRobinLock(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("recordQuotaResult did not finish after the lock was released")
+	}
+}
+
+func TestAcquireLockSurvivesStaleLockFile(t *testing.T) {
+	m := newTestManager(t)
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+
+	// Simulate a crash that left the lock file on disk while NOBODY holds the
+	// lock (SIGKILL/panic while held). With the old O_EXCL sentinel scheme the
+	// mere existence of this file wedges every future acquire until a manual rm.
+	// A flock-based lock must ignore the residual file and acquire immediately,
+	// because flock coordinates via the fd, not the file's existence.
+	if err := os.WriteFile(lockPath, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("seed stale lock file error = %v", err)
+	}
+
+	start := time.Now()
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("acquireLock() over a stale lock file error = %v (stale file must not block)", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("acquireLock() over a stale lock file took %v; a residual file must not cause a 2s timeout poll", elapsed)
+	}
+	unlock()
+}
+
+func TestAcquireLockReacquireAfterRelease(t *testing.T) {
+	m := newTestManager(t)
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+
+	// Repeated acquire/release must always succeed: releasing the lock must make
+	// it immediately available again, and the lock must never become permanently
+	// blocked.
+	for i := 0; i < 3; i++ {
+		unlock, err := m.acquireLock(lockPath)
+		if err != nil {
+			t.Fatalf("acquireLock() iteration %d error = %v", i, err)
+		}
+		unlock()
+	}
+}
+
+func TestAcquireLockBlocksSecondHolderUntilRelease(t *testing.T) {
+	m := newTestManager(t)
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+
+	unlock1, err := m.acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("first acquireLock() error = %v", err)
+	}
+
+	// While the lock is held, a second acquisition must block (it cannot succeed
+	// until the first holder releases). With the 2s ceiling it will time out if
+	// we wait long enough, so just confirm it does not return immediately.
+	done := make(chan error, 1)
+	go func() {
+		u, err := m.acquireLock(lockPath)
+		if err == nil {
+			u()
+		}
+		done <- err
+	}()
+
+	select {
+	case <-done:
+		unlock1()
+		t.Fatal("second acquireLock() returned while the lock was held; mutual exclusion is broken")
+	case <-time.After(150 * time.Millisecond):
+		// Expected: blocked waiting for the first holder.
+	}
+
+	unlock1()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("second acquireLock() after release error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second acquireLock() did not complete after the first holder released")
+	}
+}
+
+func TestConcurrentMutatorsDoNotLoseUpdates(t *testing.T) {
+	m := newTestManager(t)
+
+	const n = 12
+	accounts := make([]Account, 0, n)
+	for i := 0; i < n; i++ {
+		accounts = append(accounts, Account{
+			ID:        fmt.Sprintf("acct-%02d", i),
+			Status:    StatusReady,
+			OwnerMode: OwnerCloud,
+		})
+	}
+	saveTestAccounts(t, m, accounts...)
+
+	// Fire N concurrent mutators, each touching a DIFFERENT account: half flip
+	// status to drain, half set a distinctive label. Without an intra-process
+	// lock these Load->mutate->Save calls clobber each other (whole-file
+	// rewrite), so some updates are lost. Run with -race to also surface the
+	// concurrent state access.
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*n)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("acct-%02d", i)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			errs <- m.SetStatus(id, StatusDrain)
+		}(id)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			errs <- m.SetLabel(id, "label-"+id)
+		}(id)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent mutator error = %v", err)
+		}
+	}
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(state.Accounts) != n {
+		t.Fatalf("accounts = %d, want %d (lost-update dropped an account)", len(state.Accounts), n)
+	}
+	for _, account := range state.Accounts {
+		if account.Status != StatusDrain {
+			t.Fatalf("account %s status = %s, want %s (status update lost)", account.ID, account.Status, StatusDrain)
+		}
+		if account.Label != "label-"+account.ID {
+			t.Fatalf("account %s label = %q, want %q (label update lost)", account.ID, account.Label, "label-"+account.ID)
+		}
 	}
 }
 
@@ -698,4 +839,81 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestReleaseLeaseUnknownReturnsNotFound(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "available"})
+	saveTestQuota(t, m, "available", 80, time.Now().Add(time.Hour))
+
+	// Releasing a lease that was never claimed must surface ErrLeaseNotFound,
+	// not a silent nil success.
+	err := m.ReleaseLease("available", "bogus-lease-id", "client-x")
+	if err == nil {
+		t.Fatal("ReleaseLease(unknown) = nil, want ErrLeaseNotFound")
+	}
+	if !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("ReleaseLease(unknown) error = %v, want errors.Is ErrLeaseNotFound", err)
+	}
+
+	// A wrong accountID must likewise fail rather than report success.
+	if err := m.ReleaseLease("does-not-exist", "bogus", "client-x"); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("ReleaseLease(missing account) error = %v, want ErrLeaseNotFound", err)
+	}
+}
+
+func TestAccountViewByID(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m,
+		Account{ID: "alpha", Label: "Alpha"},
+		Account{ID: "beta", Label: "Beta"},
+	)
+
+	view, err := m.AccountViewByID("beta")
+	if err != nil {
+		t.Fatalf("AccountViewByID(beta) error = %v", err)
+	}
+	if view.ID != "beta" || view.Label != "Beta" {
+		t.Fatalf("AccountViewByID(beta) = %+v, want id=beta label=Beta", view)
+	}
+	if !view.AuthPresent {
+		t.Fatalf("AccountViewByID(beta).AuthPresent = false, want true (test auth was written)")
+	}
+
+	if _, err := m.AccountViewByID("ghost"); !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("AccountViewByID(ghost) error = %v, want ErrAccountNotFound", err)
+	}
+}
+
+func TestAccountViewByIDDoesNotModifyState(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "alpha"})
+
+	before, err := os.ReadFile(m.StatePath)
+	if err != nil {
+		t.Fatalf("ReadFile(state) error = %v", err)
+	}
+	infoBefore, err := os.Stat(m.StatePath)
+	if err != nil {
+		t.Fatalf("Stat(state) error = %v", err)
+	}
+
+	if _, err := m.AccountViewByID("alpha"); err != nil {
+		t.Fatalf("AccountViewByID(alpha) error = %v", err)
+	}
+
+	after, err := os.ReadFile(m.StatePath)
+	if err != nil {
+		t.Fatalf("ReadFile(state) after error = %v", err)
+	}
+	infoAfter, err := os.Stat(m.StatePath)
+	if err != nil {
+		t.Fatalf("Stat(state) after error = %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("AccountViewByID mutated state.json content (should be a pure read)")
+	}
+	if !infoBefore.ModTime().Equal(infoAfter.ModTime()) {
+		t.Fatal("AccountViewByID rewrote state.json (mtime changed; should be a pure read)")
+	}
 }

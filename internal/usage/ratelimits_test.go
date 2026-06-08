@@ -161,3 +161,94 @@ func TestLatestRateLimitsReachedNullStaysEmpty(t *testing.T) {
 		t.Errorf("ReachedType = %q, want empty", got.ReachedType)
 	}
 }
+
+// FIX 5: an empty rate_limits object must NOT be reported as Found. A phantom
+// zero-percent snapshot would otherwise mislead swapDecision.
+func TestLatestRateLimitsEmptyRateLimitsNotFound(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "sessions", "2026", "06", "07", "rollout-empty.jsonl")
+
+	// token_count line that contains the rate_limits key but nothing parseable.
+	line := map[string]any{
+		"timestamp": "2026-06-07T08:00:00.000Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type":        "token_count",
+			"rate_limits": map[string]any{},
+		},
+	}
+	writeJSONL(t, path, []map[string]any{line})
+
+	got := LatestRateLimits(tmp)
+	if got.Found {
+		t.Errorf("expected Found=false for empty rate_limits, got %+v", got)
+	}
+}
+
+// FIX 5: rate_limit_reached_type alone (a real signal) counts as Found even when
+// no primary/secondary block is present.
+func TestLatestRateLimitsReachedOnlyIsFound(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "sessions", "2026", "06", "07", "rollout-reached.jsonl")
+
+	line := map[string]any{
+		"timestamp": "2026-06-07T08:00:00.000Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type": "token_count",
+			"rate_limits": map[string]any{
+				"rate_limit_reached_type": "primary",
+			},
+		},
+	}
+	writeJSONL(t, path, []map[string]any{line})
+
+	got := LatestRateLimits(tmp)
+	if !got.Found {
+		t.Fatalf("expected Found=true when reached type is set")
+	}
+	if got.ReachedType != "primary" {
+		t.Errorf("ReachedType = %q, want primary", got.ReachedType)
+	}
+}
+
+// FIX 4: rate_limits numbers encoded as json.Number / int (not just float64)
+// must still parse, matching codex.go's tolerant numberAt behavior. We build the
+// record map directly because encoding/json yields float64 from text; the
+// json.Number / int64 paths only arise from programmatically-built maps (and
+// guard against float64-only helpers regressing).
+func TestParseRateLimitsRecordParsesNonFloatNumbers(t *testing.T) {
+	value := map[string]any{
+		"timestamp": "2026-06-07T08:00:00.000Z",
+		"payload": map[string]any{
+			"type": "token_count",
+			"rate_limits": map[string]any{
+				"primary": map[string]any{
+					"used_percent": json.Number("42"),
+					"resets_at":    json.Number("1780003600"),
+				},
+				"secondary": map[string]any{
+					"used_percent": int64(7),
+					"resets_at":    int64(1781000000),
+				},
+			},
+		},
+	}
+
+	got, ok := parseRateLimitsRecord(value)
+	if !ok || !got.Found {
+		t.Fatalf("expected parsed record, ok=%v found=%v", ok, got.Found)
+	}
+	if got.FiveHourUsedPercent != 42 {
+		t.Errorf("FiveHourUsedPercent = %v, want 42", got.FiveHourUsedPercent)
+	}
+	if got.SevenDayUsedPercent != 7 {
+		t.Errorf("SevenDayUsedPercent = %v, want 7", got.SevenDayUsedPercent)
+	}
+	if !got.FiveHourResetsAt.Equal(time.Unix(1780003600, 0)) {
+		t.Errorf("FiveHourResetsAt = %v, want %v", got.FiveHourResetsAt, time.Unix(1780003600, 0))
+	}
+	if !got.SevenDayResetsAt.Equal(time.Unix(1781000000, 0)) {
+		t.Errorf("SevenDayResetsAt = %v, want %v", got.SevenDayResetsAt, time.Unix(1781000000, 0))
+	}
+}

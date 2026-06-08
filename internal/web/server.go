@@ -550,7 +550,7 @@ func (s *Server) handleSyncPull(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing account id")
 		return
 	}
-	s.refreshBeforeExport(id)
+	s.refreshBeforeExport(r.Context(), id)
 	snapshot, err := s.Manager.ExportProfileSnapshot(id)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -977,8 +977,8 @@ func (s *Server) handleRefreshQueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, queue)
 }
 
-func (s *Server) refreshBeforeExport(id string) {
-	_, _ = s.Manager.FetchQuota(context.Background(), id)
+func (s *Server) refreshBeforeExport(ctx context.Context, id string) {
+	_, _ = s.Manager.FetchQuota(ctx, id)
 }
 
 func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
@@ -1146,17 +1146,19 @@ func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ManagerAccountView builds the view for a single account. It uses
+// AccountViewByID, a plain read, instead of ListAccounts: the latter runs
+// syncManagedAccounts and may rewrite the entire state file on every call, so
+// using it to answer a single-account response turned each create/import/status
+// response into an O(N) load-and-save of all accounts. On any read error (or a
+// race where the account is gone) it falls back to the bare account so the
+// caller still gets a usable view.
 func (s *Server) ManagerAccountView(account manager.Account) manager.AccountView {
-	views, err := s.Manager.ListAccounts()
+	view, err := s.Manager.AccountViewByID(account.ID)
 	if err != nil {
 		return manager.AccountView{Account: account}
 	}
-	for _, view := range views {
-		if view.ID == account.ID {
-			return view
-		}
-	}
-	return manager.AccountView{Account: account}
+	return view
 }
 
 func parseProfileUpload(raw []byte) (manager.JSONProfile, error) {
