@@ -38,7 +38,7 @@ export default function App() {
   const { t } = useLang();
   const [themeMode, toggleTheme] = useTheme();
   const data = useDashboardData(t);
-  const [activeView, setActiveView] = useState<DashboardView>("accounts");
+  const [activeView, setActiveView] = useState<DashboardView>("load-balancer");
   const [tokenInput, setTokenInput] = useState(() => cloudToken());
   const [asideOpen, setAsideOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => (typeof window === "undefined" ? true : window.innerWidth >= 1180));
@@ -104,8 +104,8 @@ export default function App() {
   // One source of truth for navigation, shared by the desktop rail and the
   // compact tab strip so the two can never drift apart.
   const navItems: { view: DashboardView; icon: ReactNode; label: string; badge?: string }[] = [
-    { view: "accounts", icon: <Database size={17} />, label: t("账号", "Accounts"), badge: data.accounts.length.toString() },
     { view: "load-balancer", icon: <Route size={17} />, label: t("负载均衡", "Load Balancer"), badge: data.eligibleCount.toString() },
+    { view: "accounts", icon: <Database size={17} />, label: t("账号", "Accounts"), badge: data.accounts.length.toString() },
     { view: "overview", icon: <Gauge size={17} />, label: t("配额总览", "Quota Overview"), badge: data.refreshQueue.length.toString() },
     { view: "people", icon: <Users size={17} />, label: t("成员", "People"), badge: data.activeClientCount.toString() },
     { view: "import", icon: <FileJson size={17} />, label: t("导入凭据", "Import auth") },

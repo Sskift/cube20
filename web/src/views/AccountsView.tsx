@@ -1,124 +1,50 @@
 import { Card, Chip } from "@heroui/react";
-import { Database } from "lucide-react";
+import { Database, KeyRound, Users } from "lucide-react";
 
 import { useLang } from "../i18n";
-import { useNow } from "../hooks/useNow";
-import { AccountTable } from "../components/AccountTable";
-import { AlertsPanel, NextAccountCard, OverviewBar } from "../components/Overview";
-import { QuotaRing } from "../components/primitives";
-import { accountName, lbAccountName, scoreLabel, shortTime } from "../lib/format";
-import {
-  buildAccountRows,
-  buildAlerts,
-  buildLbRows,
-  quotaPressure,
-  type OverviewItem,
-} from "../lib/rows";
+import { InventoryTable } from "../components/InventoryTable";
+import { accountName } from "../lib/format";
 import type { DashboardData } from "../hooks/useDashboardData";
 
-// The accounts inventory + first screen. Per the redesign the first screen shows
-// only the key info — status overview, next account, alerts, quota pressure —
-// followed by the single scannable account table. Per-account editing lives in
-// the right-hand details panel (App shell) when a row is selected.
+// The accounts page is the INVENTORY view: what accounts exist and how they are
+// configured (plan / status / auth+config files / ownership). It deliberately
+// carries no dispatch info — "who runs next / alerts / quota pressure" lives on
+// the load-balancer page so the two pages never look alike. Per-account editing
+// happens in the right-hand details panel when a row is selected.
 export function AccountsView({ data }: { data: DashboardData }) {
   const { t } = useLang();
-  const now = useNow();
-  const {
-    accounts,
-    quotas,
-    lb,
-    refreshByAccount,
-    latestDispatchByAccount,
-    readyCount,
-    eligibleCount,
-    lbTotalCount,
-    activeAccount,
-    selectedId,
-    setSelectedId,
-  } = data;
+  const { accounts, readyCount, activeAccount, activeClientCount, selectedId, setSelectedId } = data;
 
-  const rows = buildAccountRows(accounts, quotas, refreshByAccount, latestDispatchByAccount, t);
-  // Alerts/next/pressure use the LB view of the world (it carries eligibility +
-  // score + reason), falling back gracefully when the LB status is still loading.
-  const lbRows = buildLbRows(lb, latestDispatchByAccount, t);
-  const alerts = buildAlerts(lbRows.length ? lbRows : rows, t);
-  const pressured = quotaPressure(lbRows.length ? lbRows : rows, now);
-  const next = lb?.eligible[0];
+  const authReady = accounts.filter((a) => a.authPresent).length;
+  const clientOwned = accounts.filter((a) => a.ownerMode === "client").length;
 
-  const items: OverviewItem[] = [
-    {
-      key: "ready",
-      label: t("就绪池", "Ready pool"),
-      value: `${readyCount}/${accounts.length}`,
-      sub: `${eligibleCount}/${lbTotalCount || 0} ${t("可分配", "assignable")}`,
-      tone: readyCount > 0 ? "success" : "danger",
-    },
-    {
-      key: "next",
-      label: t("下一账号", "Next account"),
-      value: next ? lbAccountName(next) : t("无", "none"),
-      sub: next ? `${t("分数", "score")} ${scoreLabel(next.quotaScore)}` : t("无可分配", "none assignable"),
-      tone: next ? "accent" : "danger",
-    },
-    {
-      key: "alerts",
-      label: t("告警", "Alerts"),
-      value: String(alerts.length),
-      sub: alerts.length ? t("查看下方", "see below") : t("全部正常", "all clear"),
-      tone: alerts.length ? "warning" : "success",
-    },
-    {
-      key: "pressure",
-      label: t("配额压力", "Quota pressure"),
-      value: String(pressured.length),
-      sub: pressured.length ? t("低余量/将重置", "low / near reset") : t("无压力", "none"),
-      tone: pressured.length ? "warning" : "success",
-    },
-  ];
+  const stats = [
+    { key: "total", icon: <Database size={15} />, label: t("账号总数", "Total"), value: `${accounts.length}` },
+    { key: "ready", icon: <Database size={15} />, label: t("就绪", "Ready"), value: `${readyCount}`, tone: readyCount ? "success" : "danger" },
+    { key: "auth", icon: <KeyRound size={15} />, label: t("有凭据", "With auth"), value: `${authReady}/${accounts.length}`, tone: authReady === accounts.length ? "success" : "warning" },
+    { key: "owner", icon: <Users size={15} />, label: t("客户端归属", "Client-owned"), value: `${clientOwned}` },
+  ] as const;
 
   return (
     <section className="cube-view-panel flex flex-col gap-4">
-      <OverviewBar items={items} />
-
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
-        <Card className="cube-card">
-          <Card.Header className="border-b border-slate-200 px-5 py-4">
-            <h2 className="text-base font-semibold text-slate-950">{t("下一个分配账号", "Next account up")}</h2>
-          </Card.Header>
-          <Card.Content>
-            <NextAccountCard
-              empty={!next}
-              emptyHint={t("当前没有可分配账号。", "No assignable account right now.")}
-              name={next ? lbAccountName(next) : ""}
-              detail={next ? next.id : undefined}
-              score={next ? scoreLabel(next.quotaScore) : undefined}
-              reset={next ? shortTime(next.quotaResetsAt) : undefined}
-              scoreLabel={t("分数", "score")}
-              resetLabel={t("重置", "reset")}
-              ring={next ? <QuotaRing value={next.quotaRemainingPercent} label={next.quotaRemainingDisplay} /> : undefined}
-            />
-          </Card.Content>
-        </Card>
-
-        <Card className="cube-card">
-          <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
-            <h2 className="text-base font-semibold text-slate-950">{t("告警", "Alerts")}</h2>
-            <Chip color={alerts.length ? "warning" : "success"} variant="soft">
-              {alerts.length}
-            </Chip>
-          </Card.Header>
-          <Card.Content>
-            <AlertsPanel alerts={alerts} emptyLabel={t("所有账号状态正常。", "All accounts healthy.")} />
-          </Card.Content>
-        </Card>
+      <div className="cube-inv-stats">
+        {stats.map((s) => (
+          <div key={s.key} className="cube-inv-stat">
+            <span className="cube-inv-stat-icon">{s.icon}</span>
+            <span className="min-w-0">
+              <span className="cube-inv-stat-label">{s.label}</span>
+              <span className={`cube-inv-stat-value ${"tone" in s && s.tone ? `tone-${s.tone}` : ""}`}>{s.value}</span>
+            </span>
+          </div>
+        ))}
       </div>
 
       <Card className="cube-card">
         <Card.Header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
           <div className="min-w-0">
-            <h2 className="text-base font-semibold text-slate-950">{t("账号", "Accounts")}</h2>
+            <h2 className="text-base font-semibold text-slate-950">{t("账号清单", "Account inventory")}</h2>
             <p className="path-text text-xs text-slate-500">
-              {accounts.length} {t("个配置", "profiles")} · {t("活跃", "Active")}: {accountName(activeAccount)}
+              {t("活跃", "Active")}: {accountName(activeAccount)} · {activeClientCount} {t("个在线客户端", "clients online")}
             </p>
           </div>
           <Chip color="success" size="sm" variant="soft">
@@ -127,11 +53,7 @@ export function AccountsView({ data }: { data: DashboardData }) {
         </Card.Header>
         <Card.Content className="p-3 sm:p-4">
           {accounts.length ? (
-            <AccountTable
-              rows={rows}
-              selectedId={selectedId}
-              onSelect={(id) => setSelectedId(id)}
-            />
+            <InventoryTable accounts={accounts} selectedId={selectedId} onSelect={(id) => setSelectedId(id)} />
           ) : (
             <div className="cube-table-empty">
               <div className="mb-2 flex justify-center text-slate-400">
