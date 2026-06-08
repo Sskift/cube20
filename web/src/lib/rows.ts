@@ -1,19 +1,15 @@
-// Row normalization + overview computation. The redesign renders ONE scannable
-// account table on both the accounts page and the load-balancer page, so both
-// data shapes (Account+quota enrichments and LoadBalanceAccount) are mapped into
-// a single AccountRow. All view-level "key info" (next pick, alerts, pressure)
-// is derived here as pure functions so the components stay dumb.
+// Row normalization for the load-balancer pool table, plus the derived overview
+// items / alerts / quota-pressure helpers. The accounts page renders its own
+// inventory table from Account[] directly; this module is dispatch-focused and
+// maps LoadBalanceAccount into the scannable AccountRow shape.
 
 import {
   accountStatusColor,
   clampUIPercent,
   lbAccountName,
   quotaStatusLabel,
-  quotaSummary,
-  shortID,
 } from "./format";
 import type {
-  Account,
   AccountStatus,
   ChipColor,
   DispatchEvent,
@@ -100,48 +96,6 @@ function lbRow(account: LoadBalanceAccount, dispatch: DispatchEvent | undefined,
     reason: account.reason,
     dispatch,
   };
-}
-
-// Build rows for the accounts inventory view from Account[] plus quota/queue
-// enrichments fetched separately.
-export function buildAccountRows(
-  accounts: Account[],
-  quotas: Record<string, QuotaResult>,
-  refreshByAccount: Map<string, RefreshQueueItem>,
-  dispatchByAccount: Map<string, DispatchEvent>,
-  t: TranslateFn,
-): AccountRow[] {
-  return accounts.map((account) => {
-    const quota = quotas[account.id];
-    const refresh = refreshByAccount.get(account.id);
-    const summary = quotaSummary(quota, t);
-    const supported = quota?.status === "supported";
-    const percent = supported ? summary.value : clampUIPercent(refresh?.remainingPercent);
-    const quotaLabel = refresh?.remainingDisplay || summary.label;
-    return {
-      id: account.id,
-      name: account.label || shortID(account.id),
-      status: account.status,
-      statusColor: accountStatusColor(account.status),
-      authPresent: account.authPresent,
-      ownerMode: account.ownerMode || "cloud",
-      generation: account.generation || 0,
-      active: account.active,
-      quotaLabel,
-      quotaPercent: percent,
-      quotaColor: supported ? summary.color : remainingColor(refresh?.remainingPercent, !!refresh?.remainingDisplay),
-      resetsAt: refresh?.resetsAt,
-      leaseActive: !!account.leaseActive,
-      leaseClientId: account.leaseClientId,
-      leaseHolder: account.leaseHolder,
-      leaseExpiresAt: account.leaseExpiresAt,
-      reason: refresh && refresh.quotaStatus && refresh.quotaStatus !== "supported" ? quotaStatusLabel(refresh.quotaStatus, t) : undefined,
-      quotaSource: refresh?.quotaSource || quota?.source,
-      dispatch: dispatchByAccount.get(account.id),
-      refresh,
-      quota,
-    };
-  });
 }
 
 // ---- Overview-bar items + alerts ----------------------------------------

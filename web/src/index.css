@@ -1193,6 +1193,70 @@ textarea {
   --cube-cols: minmax(0, 1.6fr) minmax(0, 1.4fr) minmax(0, 0.7fr) minmax(0, 0.8fr) minmax(0, 0.6fr) 1.5rem;
 }
 
+/* Inventory table (accounts page): account / plan / status / files / owner. */
+.cube-table.inventory {
+  --cube-cols: minmax(0, 1.8fr) minmax(0, 0.6fr) minmax(0, 0.7fr) minmax(0, 1.2fr) minmax(0, 1fr) 1.5rem;
+}
+
+.cube-inv-value {
+  color: var(--foreground);
+  font-size: 0.8125rem;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.cube-file-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+/* Inventory stat strip — lightweight counts, visually distinct from the
+   load-balancer OverviewBar so the two pages don't read as the same screen. */
+.cube-inv-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.cube-inv-stat {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1 1 8rem;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 0.625rem;
+  background: var(--surface);
+  padding: 0.5rem 0.75rem;
+}
+
+.cube-inv-stat-icon {
+  display: grid;
+  place-items: center;
+  height: 1.75rem;
+  width: 1.75rem;
+  flex: 0 0 auto;
+  border-radius: 0.5rem;
+  background: var(--surface-secondary);
+  color: var(--muted);
+}
+
+.cube-inv-stat-label {
+  display: block;
+  color: var(--muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+}
+
+.cube-inv-stat-value {
+  display: block;
+  color: var(--foreground);
+  font-size: 1.0625rem;
+  font-weight: 750;
+  line-height: 1.2;
+}
+
 .cube-table-head {
   display: grid;
   grid-template-columns: var(--cube-cols);
@@ -1436,6 +1500,10 @@ textarea {
   }
 
   .cube-cell-quota {
+    grid-column: 1 / -1;
+  }
+
+  .cube-cell-files {
     grid-column: 1 / -1;
   }
 
