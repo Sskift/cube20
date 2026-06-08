@@ -8,8 +8,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"cube20/internal/manager"
@@ -33,6 +35,15 @@ func runCloudRelogin(m *manager.Manager, args []string) error {
 		return fmt.Errorf("missing cloud server; run cube cloud config --server <url> --token <token>, or set CUBE_CLOUD_URL")
 	}
 
+	// SIGINT/SIGTERM cancels ctx instead of killing the process (NotifyContext
+	// removes the default handler), so the deferred os.RemoveAll below still runs
+	// and the temporary credential directory is removed on Ctrl-C rather than
+	// lingering on disk. The interactive `codex login` child shares our process
+	// group and receives the same terminal SIGINT, so it exits and
+	// runDeviceLogin returns, letting this function unwind through its defers.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	codexHome, err := os.MkdirTemp("", "cube20-relogin-*")
 	if err != nil {
 		return err
@@ -41,6 +52,11 @@ func runCloudRelogin(m *manager.Manager, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "cube: logging in %s with temporary CODEX_HOME\n", relogin.AccountID)
 	if err := runDeviceLogin(codexHome); err != nil {
+		if ctx.Err() != nil {
+			// User interrupted the login; exit cleanly (temp dir already cleaned
+			// up by the deferred RemoveAll).
+			return ctx.Err()
+		}
 		return fmt.Errorf("codex login failed: %w", err)
 	}
 
@@ -59,7 +75,7 @@ func runCloudRelogin(m *manager.Manager, args []string) error {
 	}
 
 	var account manager.AccountView
-	if err := cloudJSON(context.Background(), http.MethodPost, opts, "/api/sync/push", snapshot, &account); err != nil {
+	if err := cloudJSON(ctx, http.MethodPost, opts, "/api/sync/push", snapshot, &account); err != nil {
 		if strings.Contains(err.Error(), "403") || strings.Contains(strings.ToLower(err.Error()), "forbidden") {
 			return fmt.Errorf("upload failed: %w; cloud relogin replaces stored auth and requires an admin token", err)
 		}
@@ -68,7 +84,7 @@ func runCloudRelogin(m *manager.Manager, args []string) error {
 	fmt.Printf("uploaded %s owner=%s status=%s\n", account.ID, account.OwnerMode, account.Status)
 
 	var result quota.Result
-	if err := cloudJSON(context.Background(), http.MethodGet, opts, "/api/sync/quota/"+url.PathEscape(relogin.AccountID), nil, &result); err != nil {
+	if err := cloudJSON(ctx, http.MethodGet, opts, "/api/sync/quota/"+url.PathEscape(relogin.AccountID), nil, &result); err != nil {
 		return fmt.Errorf("quota check failed after upload: %w; next: run cube cloud quota %s", err, relogin.AccountID)
 	}
 	printQuotaResult(result)

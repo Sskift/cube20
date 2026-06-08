@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,9 +14,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"cube20/internal/manager"
@@ -22,6 +28,14 @@ import (
 	"cube20/internal/usage"
 	"cube20/internal/web"
 )
+
+// swapRemainingThresholdClient mirrors the cloud's swapRemainingThreshold: when
+// the local 5h window has less than this percent remaining, proactively swap.
+const swapRemainingThresholdClient = 10.0
+
+// rolloutSessionIDRe extracts the trailing session UUID from a codex rollout
+// filename: rollout-<ISO8601-with-dashes>-<uuid>.jsonl.
+var rolloutSessionIDRe = regexp.MustCompile(`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$`)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -44,6 +58,9 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Release the Postgres pool (if any) before the process exits. No-op in
+	// file mode and idempotent, so the dashboard's own shutdown Close is fine.
+	defer m.Close()
 
 	switch args[0] {
 	case "run", "cloud-run":
@@ -397,24 +414,80 @@ func runCloudRun(m *manager.Manager, args []string) error {
 	if err != nil {
 		return err
 	}
-	leaseSnapshot, err := claimLeaseSnapshot(context.Background(), opts)
+	// Derive a cancellable context from SIGINT/SIGTERM. signal.NotifyContext
+	// REMOVES Go's default signal handler, so a Ctrl-C cancels ctx instead of
+	// killing the process — the function then returns normally through its
+	// defers (scrubAuth below) and the post-loop cleanupRun, so the lease is
+	// released and the credential scrubbed before exit rather than leaking until
+	// TTL. The codex child shares our process group and the terminal delivers
+	// the same SIGINT to it, so it stops on its own and cmd.Run() returns.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	leaseSnapshot, err := claimLeaseSnapshot(ctx, opts)
 	if err != nil {
 		return err
 	}
-	snapshot := leaseSnapshot.Snapshot
-	codexHome, err := writeSnapshotToTempHome(m, snapshot)
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(codexHome)
 
-	fmt.Fprintf(os.Stderr, "cube: cloud leased %s (%s); using temporary CODEX_HOME\n", snapshot.ID, leaseSnapshot.Lease.ID)
-	cmd := codexCommandForHome(codexHome, codexArgs)
-	runErr, authErr := runCommandWithLease(context.Background(), opts, leaseSnapshot, codexHome, cmd)
-	usageErr := pushUsageFromHome(context.Background(), opts, snapshot.ID, leaseSnapshot.Lease.ID, "", codexHome)
-	var releaseErr error
-	if authErr == nil {
-		releaseErr = releaseLease(context.Background(), opts, leaseSnapshot.Lease.ID, snapshot.ID)
+	pruneOldRuns(filepath.Join(m.StateDir, "runs"))
+	codexHome, err := stableRunHome(m.StateDir)
+	if err != nil {
+		return err
+	}
+	defer scrubAuth(codexHome)
+
+	lease := leaseSnapshot
+	if err := writeSnapshotToStableHome(m, lease.Snapshot, codexHome); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "cube: cloud leased %s (%s); using CODEX_HOME %s\n", lease.Snapshot.ID, lease.Lease.ID, codexHome)
+
+	var runErr, authErr error
+	args2 := codexArgs
+	for {
+		cmd := codexCommandForHome(codexHome, args2)
+		var swap bool
+		swap, runErr, authErr = runCommandWithLease(ctx, opts, lease, codexHome, cmd)
+		if !swap {
+			// User exited or codex finished without a swap request.
+			break
+		}
+
+		sid, sidErr := newestSessionID(codexHome)
+		if sidErr != nil {
+			fmt.Fprintf(os.Stderr, "cube: cannot resume after swap: %v\n", sidErr)
+			break
+		}
+		newLease, claimErr := claimLeaseSnapshot(ctx, opts)
+		if claimErr != nil {
+			fmt.Fprintf(os.Stderr, "cube: swap claim failed: %v\n", claimErr)
+			break
+		}
+		// Release the OLD lease only after the NEW one is claimed so the cloud
+		// never re-selects the same (rate-limited) account.
+		if relErr := releaseLease(ctx, opts, lease.Lease.ID, lease.Snapshot.ID); relErr != nil {
+			fmt.Fprintf(os.Stderr, "cube: releasing prior lease failed: %v\n", relErr)
+		}
+		lease = newLease
+		if err := writeSnapshotToStableHome(m, lease.Snapshot, codexHome); err != nil {
+			runErr = err
+			break
+		}
+		fmt.Fprintf(os.Stderr, "cube: swapped to %s (%s); resuming session %s\n", lease.Snapshot.ID, lease.Lease.ID, sid)
+		args2 = []string{"resume", sid}
+	}
+
+	// On a signal-driven cancel the final auth upload inside runCommandWithLease
+	// fails with "context canceled" and codex exits non-zero from the SIGINT;
+	// neither is a real failure. We still RELEASE the lease (the user is stopping
+	// cleanly and the account must be freed now, not at TTL), and we suppress the
+	// cancel-artifact errors so Ctrl-C exits cleanly. A genuine releaseErr is
+	// still surfaced.
+	canceled := ctx.Err() != nil
+	usageErr, releaseErr := cleanupRun(ctx, opts, lease, codexHome, authErr == nil || canceled)
+
+	if canceled {
+		return releaseErr
 	}
 
 	if runErr != nil {
@@ -430,6 +503,33 @@ func runCloudRun(m *manager.Manager, args []string) error {
 		return usageErr
 	}
 	return releaseErr
+}
+
+// cleanupRun performs end-of-run teardown that MUST happen on every exit path,
+// including a user Ctrl-C: it pushes the final usage summary and (when release
+// is true) releases the lease back to the cloud so the account is not held until
+// its TTL. It is deliberately context-tolerant — a cancelled ctx (signal) still
+// runs these calls so the lease is freed promptly. Returns the usage-push and
+// lease-release errors separately so the caller can fold them into its error.
+//
+// release should be false only when the lease must NOT be released here (e.g. a
+// mid-run auth upload already failed and ownership is uncertain); the swap loop
+// itself already releases the OLD lease before claiming the next one.
+func cleanupRun(ctx context.Context, opts cloudSyncOptions, lease manager.LeaseSnapshot, codexHome string, release bool) (usageErr, releaseErr error) {
+	// If the run context was cancelled by a signal, derive a fresh short-lived
+	// context so the teardown HTTP calls are not instantly aborted; the whole
+	// point is to release the lease as the process winds down.
+	cleanupCtx := ctx
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		cleanupCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+	}
+	usageErr = pushUsageFromHome(cleanupCtx, opts, lease.Snapshot.ID, lease.Lease.ID, "", codexHome)
+	if release {
+		releaseErr = releaseLease(cleanupCtx, opts, lease.Lease.ID, lease.Snapshot.ID)
+	}
+	return usageErr, releaseErr
 }
 
 func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, []string, error) {
@@ -509,13 +609,25 @@ func claimLeaseSnapshot(ctx context.Context, opts cloudSyncOptions) (manager.Lea
 	return leaseSnapshot, nil
 }
 
-func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapshot manager.LeaseSnapshot, codexHome string, cmd *exec.Cmd) (error, error) {
+func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapshot manager.LeaseSnapshot, codexHome string, cmd *exec.Cmd) (bool, error, error) {
 	authPath := filepath.Join(codexHome, "auth.json")
 	lastDigest := localFileDigest(authPath)
 	snapshot := leaseSnapshot.Snapshot
 	snapshot.LeaseID = leaseSnapshot.Lease.ID
 	if snapshot.Generation == 0 {
 		snapshot.Generation = leaseSnapshot.Lease.Generation
+	}
+
+	var swapOnce sync.Once
+	var swapRequested bool
+	requestSwap := func(reason string) {
+		swapOnce.Do(func() {
+			swapRequested = true
+			fmt.Fprintf(os.Stderr, "cube: account swap requested (%s); signaling codex to stop\n", reason)
+			if cmd.Process != nil {
+				_ = cmd.Process.Signal(syscall.SIGTERM)
+			}
+		})
 	}
 
 	stop := make(chan struct{})
@@ -529,7 +641,7 @@ func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapsh
 			case <-stop:
 				return
 			case <-ticker.C:
-				lease, err := heartbeatLease(ctx, opts, leaseSnapshot.Lease.ID, snapshot.ID)
+				lease, shouldSwap, err := heartbeatLease(ctx, opts, leaseSnapshot.Lease.ID, snapshot.ID, codexHome)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "cube: lease heartbeat failed: %v\n", err)
 				} else if lease.Generation > 0 {
@@ -537,13 +649,17 @@ func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapsh
 				}
 				nextDigest := localFileDigest(authPath)
 				if nextDigest != "" && nextDigest != lastDigest {
-					account, err := pushLeasedAuthFromHome(ctx, opts, snapshot, codexHome)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "cube: lease auth upload failed: %v\n", err)
-						continue
+					account, pushErr := pushLeasedAuthFromHome(ctx, opts, snapshot, codexHome)
+					if pushErr != nil {
+						fmt.Fprintf(os.Stderr, "cube: lease auth upload failed: %v\n", pushErr)
+					} else {
+						snapshot.Generation = account.Generation
+						lastDigest = nextDigest
 					}
-					snapshot.Generation = account.Generation
-					lastDigest = nextDigest
+				}
+				if swap, reason := swapDecision(usage.LatestRateLimits(codexHome), shouldSwap); swap {
+					requestSwap(reason)
+					return
 				}
 			}
 		}
@@ -553,27 +669,43 @@ func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapsh
 	close(stop)
 	<-stopped
 
+	// If we intentionally signaled codex to stop for a swap, treat the run as a
+	// swap (not a user exit) and suppress the SIGTERM exit error.
+	swap := swapRequested
+	if swap {
+		runErr = nil
+	}
+
 	account, authErr := pushLeasedAuthFromHome(ctx, opts, snapshot, codexHome)
 	if authErr != nil {
-		return runErr, authErr
+		return swap, runErr, authErr
 	}
 	snapshot.Generation = account.Generation
-	return runErr, nil
+	return swap, runErr, nil
 }
 
-func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, accountID string) (manager.Lease, error) {
+func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, accountID, codexHome string) (manager.Lease, bool, error) {
 	body := struct {
-		AccountID  string `json:"accountId"`
-		Client     string `json:"client"`
-		TTLSeconds int    `json:"ttlSeconds"`
+		AccountID        string        `json:"accountId"`
+		Client           string        `json:"client"`
+		TTLSeconds       int           `json:"ttlSeconds"`
+		FiveHour         *quota.Window `json:"fiveHour,omitempty"`
+		RateLimitReached bool          `json:"rateLimitReached,omitempty"`
 	}{
 		AccountID:  accountID,
 		Client:     opts.Client,
 		TTLSeconds: leaseTTLSeconds(opts),
 	}
-	var lease manager.Lease
-	err := cloudJSON(ctx, http.MethodPatch, opts, "/api/sync/leases/"+url.PathEscape(leaseID), body, &lease)
-	return lease, err
+	rl := usage.LatestRateLimits(codexHome)
+	body.FiveHour = rateLimitsToWindow(rl)
+	body.RateLimitReached = rl.ReachedType != ""
+
+	var resp struct {
+		manager.Lease
+		ShouldSwap bool `json:"shouldSwap"`
+	}
+	err := cloudJSON(ctx, http.MethodPatch, opts, "/api/sync/leases/"+url.PathEscape(leaseID), body, &resp)
+	return resp.Lease, resp.ShouldSwap, err
 }
 
 func pushLeasedAuthFromHome(ctx context.Context, opts cloudSyncOptions, snapshot manager.ProfileSnapshot, codexHome string) (manager.AccountView, error) {
@@ -623,6 +755,156 @@ func localFileDigest(path string) string {
 	return fmt.Sprintf("%x", sum)
 }
 
+// newestSessionID walks <codexHome>/sessions recursively, picks the
+// lexicographically-greatest rollout-*.jsonl filename (rollout names start with
+// an ISO timestamp, so lexicographic order is chronological), and returns the
+// embedded session UUID. Returns an error if no rollout file is found.
+func newestSessionID(codexHome string) (string, error) {
+	sessionsDir := filepath.Join(codexHome, "sessions")
+	var newestName, newestPath string
+	_ = filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, ".jsonl") {
+			return nil
+		}
+		if newestName == "" || name > newestName {
+			newestName = name
+			newestPath = path
+		}
+		return nil
+	})
+	if newestName == "" {
+		return "", fmt.Errorf("no rollout session found under %s", sessionsDir)
+	}
+	match := rolloutSessionIDRe.FindStringSubmatch(newestName)
+	if match == nil {
+		return "", fmt.Errorf("could not extract session id from %s", newestPath)
+	}
+	return match[1], nil
+}
+
+// swapDecision is the pure account-swap policy. It prefers the reactive hard
+// limit, then the cloud's proactive hint, then a local proactive threshold.
+func swapDecision(rl usage.RateLimits, cloudShouldSwap bool) (bool, string) {
+	if rl.ReachedType != "" {
+		return true, "hard limit reached: " + rl.ReachedType
+	}
+	if cloudShouldSwap {
+		return true, "cloud advised swap"
+	}
+	if rl.Found && (100-rl.FiveHourUsedPercent) < swapRemainingThresholdClient {
+		return true, "5h remaining low"
+	}
+	return false, ""
+}
+
+// rateLimitsToWindow maps a local RateLimits snapshot onto the quota.Window the
+// cloud heartbeat expects. Returns nil when no rate_limits were parsed.
+func rateLimitsToWindow(rl usage.RateLimits) *quota.Window {
+	if !rl.Found {
+		return nil
+	}
+	resetsAt := ""
+	if !rl.FiveHourResetsAt.IsZero() {
+		resetsAt = rl.FiveHourResetsAt.Format(time.RFC3339)
+	}
+	return &quota.Window{
+		Key:              "five_hour",
+		Label:            "5h",
+		UsedPercent:      rl.FiveHourUsedPercent,
+		RemainingPercent: 100 - rl.FiveHourUsedPercent,
+		ResetsAt:         resetsAt,
+	}
+}
+
+// scrubAuth removes the leased credentials (auth.json and the config.toml
+// symlink) from codexHome while preserving the sessions/ subtree needed to
+// resume after a swap. Missing files are not an error.
+func scrubAuth(codexHome string) error {
+	for _, name := range []string{"auth.json", "config.toml"} {
+		if err := os.Remove(filepath.Join(codexHome, name)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// stableRunHome creates <baseDir>/runs/<runID>/ where runID is 32 hex chars from
+// crypto/rand, and returns the created directory. Unlike a temp dir it persists
+// across account swaps so codex sessions survive for resume.
+func stableRunHome(baseDir string) (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	dir := filepath.Join(baseDir, "runs", hex.EncodeToString(raw[:]))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// pruneOldRuns best-effort reclaims stale run directories under runsDir. It has
+// two jobs:
+//
+//  1. Scrub leaked credentials: if a run dir's auth.json has an mtime older than
+//     staleAuthCutoff (1h), the owning run is almost certainly crashed/abandoned
+//     — a live run rewrites auth.json on every heartbeat/swap, so a fresh mtime
+//     means a process is still using it, while an hour-stale mtime does not. We
+//     remove (scrub) that auth.json so a SIGKILLed run (where the deferred
+//     scrubAuth never ran) does not leave the credential on disk indefinitely.
+//     We deliberately key on mtime age, NOT on presence, so we never scrub a
+//     currently-running sibling run's auth.json.
+//  2. Reclaim space: if the dir itself is older than retentionCutoff (7d) it is
+//     removed wholesale (sessions and all). Dirs newer than that keep sessions/
+//     so a recent run can still be resumed within the retention window.
+//
+// All errors are ignored (best-effort).
+func pruneOldRuns(runsDir string) {
+	entries, err := os.ReadDir(runsDir)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	staleAuthCutoff := now.Add(-1 * time.Hour)
+	retentionCutoff := now.Add(-7 * 24 * time.Hour)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(runsDir, entry.Name())
+
+		// Capture the dir's mtime BEFORE any scrub: removing a file inside it
+		// bumps the parent dir's mtime, which would otherwise mask an aged dir
+		// and defeat the retention check below.
+		var dirMod time.Time
+		if info, err := entry.Info(); err == nil {
+			dirMod = info.ModTime()
+		}
+
+		// (1) Scrub an abandoned credential based on its own mtime age, leaving
+		// sessions/ intact for resume within the retention window.
+		authPath := filepath.Join(dir, "auth.json")
+		if info, err := os.Stat(authPath); err == nil && info.ModTime().Before(staleAuthCutoff) {
+			_ = os.Remove(authPath)
+			// config.toml is only a symlink to the live config; drop it too so the
+			// scrubbed run mirrors a clean scrubAuth.
+			_ = os.Remove(filepath.Join(dir, "config.toml"))
+		}
+
+		// (2) Reclaim the whole dir once it is older than the retention window.
+		if !dirMod.IsZero() && dirMod.Before(retentionCutoff) {
+			_ = os.RemoveAll(dir)
+		}
+	}
+}
+
 func writeSnapshotToTempHome(m *manager.Manager, snapshot manager.ProfileSnapshot) (string, error) {
 	codexHome, err := os.MkdirTemp("", "cube20-run-*")
 	if err != nil {
@@ -634,20 +916,79 @@ func writeSnapshotToTempHome(m *manager.Manager, snapshot manager.ProfileSnapsho
 			_ = os.RemoveAll(codexHome)
 		}
 	}()
-	authPath := filepath.Join(codexHome, "auth.json")
-	if err := os.WriteFile(authPath, snapshot.Auth, 0o600); err != nil {
-		return "", err
-	}
-	localConfig := manager.CodexConfigPath(m.LiveCodexHome)
-	if _, err := os.Stat(localConfig); err == nil {
-		if err := os.Symlink(localConfig, filepath.Join(codexHome, "config.toml")); err != nil {
-			return "", err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	if err := writeSnapshotToStableHome(m, snapshot, codexHome); err != nil {
 		return "", err
 	}
 	cleanup = false
 	return codexHome, nil
+}
+
+// writeSnapshotToStableHome writes the leased auth.json (0600) and symlinks the
+// live config.toml into an already-existing codexHome directory. Both the
+// credential file and the config symlink are installed atomically via
+// write-to-temp + os.Rename so a concurrent `codex resume` reading the same
+// directory across a swap never observes a partial auth.json or a missing config
+// symlink. The existing auth.json/config.toml are replaced so it can be called
+// again across swaps. sessions/ is never touched.
+func writeSnapshotToStableHome(m *manager.Manager, snapshot manager.ProfileSnapshot, codexHome string) error {
+	authPath := filepath.Join(codexHome, "auth.json")
+	if err := writeFileAtomic(authPath, snapshot.Auth, 0o600); err != nil {
+		return err
+	}
+	configLink := filepath.Join(codexHome, "config.toml")
+	localConfig := manager.CodexConfigPath(m.LiveCodexHome)
+	if _, err := os.Stat(localConfig); err == nil {
+		if err := symlinkAtomic(localConfig, configLink); err != nil {
+			return err
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		// No live config: ensure any stale link/file from a prior run is gone so
+		// codex does not read an outdated config.
+		if err := os.Remove(configLink); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	} else {
+		return err
+	}
+	return nil
+}
+
+// writeFileAtomic writes data to a sibling temp file then renames it over path.
+// os.Rename is atomic on the same filesystem, so a reader sees either the old or
+// the new contents — never a truncated/partial file. The temp file inherits the
+// target's basename so it lands in the same directory (and thus filesystem).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	// Clean up a leftover temp from a prior crash before writing.
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// symlinkAtomic creates a symlink at linkPath -> target atomically by creating
+// it at a temp name and renaming over linkPath, eliminating the
+// remove-then-symlink window during which no config symlink exists.
+func symlinkAtomic(target, linkPath string) error {
+	tmp := linkPath + ".tmp"
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Symlink(target, tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, linkPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func codexCommandForHome(codexHome string, args []string) *exec.Cmd {
@@ -723,6 +1064,12 @@ func cloudJSON(ctx context.Context, method string, opts cloudSyncOptions, path s
 	return nil
 }
 
+// runDashboard parses flags and starts the web server. Graceful shutdown on
+// SIGINT/SIGTERM (signal.NotifyContext, stopping the quota worker, draining
+// in-flight requests via http.Server.Shutdown, and closing the manager's DB
+// pool) is implemented inside web.Server.ListenAndServe; run()'s deferred
+// m.Close is the idempotent backstop. We deliberately do NOT install a second
+// signal.NotifyContext here, which would race the server's own handler.
 func runDashboard(m *manager.Manager, args []string) error {
 	host := "127.0.0.1"
 	port := 8720

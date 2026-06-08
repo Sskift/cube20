@@ -4,12 +4,80 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"cube20/internal/quota"
 )
+
+func TestMaterializeAuthSkipsWriteWhenUnchanged(t *testing.T) {
+	m := newTestManager(t)
+	account := Account{ID: "acct", CodexHome: filepath.Join(m.AccountsDir, "acct")}
+	raw := []byte(`{"OPENAI_API_KEY":"sk-test","tokens":{"access_token":"a"}}`)
+
+	if err := m.materializeAuth(account, raw); err != nil {
+		t.Fatalf("first materializeAuth() error = %v", err)
+	}
+	authPath := filepath.Join(account.CodexHome, authFileName)
+	info1, err := os.Stat(authPath)
+	if err != nil {
+		t.Fatalf("stat after first write error = %v", err)
+	}
+
+	// Second call with identical content must NOT rewrite the file. Load()
+	// runs constantly, so re-materializing unchanged auth churns credentials
+	// on disk for no reason.
+	time.Sleep(10 * time.Millisecond)
+	if err := m.materializeAuth(account, raw); err != nil {
+		t.Fatalf("second materializeAuth() error = %v", err)
+	}
+	info2, err := os.Stat(authPath)
+	if err != nil {
+		t.Fatalf("stat after second call error = %v", err)
+	}
+	if !info1.ModTime().Equal(info2.ModTime()) {
+		t.Fatalf("auth.json was rewritten on unchanged content: mtime %v -> %v", info1.ModTime(), info2.ModTime())
+	}
+
+	// Changed content MUST be written.
+	changed := []byte(`{"OPENAI_API_KEY":"sk-test-2","tokens":{"access_token":"b"}}`)
+	if err := m.materializeAuth(account, changed); err != nil {
+		t.Fatalf("materializeAuth(changed) error = %v", err)
+	}
+	got, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("read after change error = %v", err)
+	}
+	if !bytes.Contains(got, []byte("sk-test-2")) {
+		t.Fatalf("auth.json was not updated on changed content: %s", got)
+	}
+}
+
+func TestCloseFileModeIsNoopAndIdempotent(t *testing.T) {
+	m := newTestManager(t)
+	// File-mode managers never open the pool, so Close must be a no-op and
+	// must be safe to call repeatedly (the server may call it on shutdown
+	// after handlers have also touched the manager).
+	if err := m.Close(); err != nil {
+		t.Fatalf("first Close() error = %v, want nil", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("second Close() error = %v, want nil", err)
+	}
+	if m.db != nil {
+		t.Fatal("file-mode manager opened a db pool, want nil")
+	}
+	// The manager must still be usable after Close in file mode.
+	if _, err := m.Load(); err != nil {
+		t.Fatalf("Load() after Close error = %v", err)
+	}
+}
 
 func TestLoadBalanceStatusExcludesClientOwnedAccounts(t *testing.T) {
 	m := newTestManager(t)
@@ -72,6 +140,7 @@ func TestLoadBalanceStatusIncludesCloudOwnedReadyAccount(t *testing.T) {
 		OwnerMode: OwnerCloud,
 		Status:    StatusReady,
 	})
+	saveTestQuota(t, m, "cloud-ready", 95, time.Now().Add(time.Hour))
 
 	status, err := m.LoadBalanceStatus()
 	if err != nil {
@@ -87,6 +156,99 @@ func TestLoadBalanceStatusIncludesCloudOwnedReadyAccount(t *testing.T) {
 	account := status.Eligible[0]
 	if !account.AuthPresent || account.OwnerMode != OwnerCloud || account.Status != StatusReady {
 		t.Fatalf("eligible account = %+v, want cloud-owned ready account with auth", account)
+	}
+}
+
+func TestLoadBalanceStatusExcludesExhaustedQuota(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:        "exhausted",
+		OwnerMode: OwnerCloud,
+		Status:    StatusReady,
+	})
+	saveTestQuota(t, m, "exhausted", 0, time.Now().Add(time.Hour))
+
+	status, err := m.LoadBalanceStatus()
+	if err != nil {
+		t.Fatalf("LoadBalanceStatus() error = %v", err)
+	}
+	if len(status.Eligible) != 0 {
+		t.Fatalf("eligible accounts = %v, want none", loadBalanceIDs(status.Eligible))
+	}
+
+	account := findLoadBalanceAccount(t, status.Excluded, "exhausted")
+	if !strings.HasPrefix(account.Reason, "5h quota exhausted until ") {
+		t.Fatalf("excluded reason = %q, want quota exhausted reason", account.Reason)
+	}
+	if account.QuotaRemainingPercent != 0 || account.QuotaStatus != quota.StatusSupported {
+		t.Fatalf("quota fields = %+v, want supported 0%% remaining", account)
+	}
+}
+
+func TestClaimLeaseSkipsExhaustedQuota(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m,
+		Account{ID: "exhausted"},
+		Account{ID: "available"},
+	)
+	saveTestQuota(t, m, "exhausted", 0, time.Now().Add(time.Hour))
+	saveTestQuota(t, m, "available", 80, time.Now().Add(3*time.Hour))
+
+	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimLease() error = %v", err)
+	}
+	if lease.Lease.AccountID != "available" {
+		t.Fatalf("leased account = %q, want available", lease.Lease.AccountID)
+	}
+}
+
+func TestClaimLeaseWeightsQuotaNearReset(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m,
+		Account{ID: "far-reset"},
+		Account{ID: "near-reset"},
+	)
+	saveTestQuota(t, m, "far-reset", 80, time.Now().Add(4*time.Hour))
+	saveTestQuota(t, m, "near-reset", 70, time.Now().Add(30*time.Minute))
+
+	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimLease() error = %v", err)
+	}
+	if lease.Lease.AccountID != "near-reset" {
+		t.Fatalf("leased account = %q, want near-reset", lease.Lease.AccountID)
+	}
+}
+
+func TestDispatchHistoryRecordsClaimAndRelease(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "available"})
+	saveTestQuota(t, m, "available", 80, time.Now().Add(time.Hour))
+	if _, _, err := m.CreateClient("liushiao-local"); err != nil {
+		t.Fatalf("CreateClient() error = %v", err)
+	}
+
+	lease, err := m.ClaimLease(context.Background(), "client-liushiao-local", "liushiao-local", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimLease() error = %v", err)
+	}
+	if err := m.ReleaseLease("available", lease.Lease.ID, "client-liushiao-local"); err != nil {
+		t.Fatalf("ReleaseLease() error = %v", err)
+	}
+
+	events, err := m.DispatchHistory(10, "")
+	if err != nil {
+		t.Fatalf("DispatchHistory() error = %v", err)
+	}
+	if got, want := len(events), 2; got != want {
+		t.Fatalf("dispatch events = %d, want %d: %+v", got, want, events)
+	}
+	if events[0].Event != "released" || events[1].Event != "claimed" {
+		t.Fatalf("dispatch order/events = %+v, want released then claimed", events)
+	}
+	if events[1].AccountID != "available" || events[1].ClientID != "client-liushiao-local" || events[1].ClientLabel != "liushiao-local" {
+		t.Fatalf("claimed event = %+v, want account/client labels", events[1])
 	}
 }
 
@@ -117,6 +279,361 @@ func TestRecoverExpiredLeasesMovesReadyAccountToRecovering(t *testing.T) {
 	}
 	if !strings.Contains(account.LastError, "lease lease-expired expired") {
 		t.Fatalf("last error = %q, want expired lease detail", account.LastError)
+	}
+}
+
+func TestRecordQuotaResultFileModeSerializesWithRoundRobinLock(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:        "acct",
+		Status:    StatusReady,
+		OwnerMode: OwnerCloud,
+	})
+
+	// Hold the same lock the lease writers use. A correct file-mode
+	// recordQuotaResult must serialize its Load->modify->Save behind this
+	// lock, otherwise a concurrent quota write can clobber a lease change
+	// (lease resurrection -> double dispatch).
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("acquireLock() error = %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- m.recordQuotaResult("acct", quota.Result{
+			Status: quota.StatusSupported,
+			Plan:   "pro",
+		}, false, QuotaSourceCloud, "", false)
+	}()
+
+	select {
+	case <-done:
+		unlock()
+		t.Fatal("recordQuotaResult returned while the round-robin lock was held; file-mode write is unlocked and can race lease updates")
+	case <-time.After(150 * time.Millisecond):
+		// Expected: it is blocked waiting for the lock.
+	}
+
+	unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("recordQuotaResult() after unlock error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recordQuotaResult did not finish after the lock was released")
+	}
+}
+
+func TestAcquireLockSurvivesStaleLockFile(t *testing.T) {
+	m := newTestManager(t)
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+
+	// Simulate a crash that left the lock file on disk while NOBODY holds the
+	// lock (SIGKILL/panic while held). With the old O_EXCL sentinel scheme the
+	// mere existence of this file wedges every future acquire until a manual rm.
+	// A flock-based lock must ignore the residual file and acquire immediately,
+	// because flock coordinates via the fd, not the file's existence.
+	if err := os.WriteFile(lockPath, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("seed stale lock file error = %v", err)
+	}
+
+	start := time.Now()
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("acquireLock() over a stale lock file error = %v (stale file must not block)", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("acquireLock() over a stale lock file took %v; a residual file must not cause a 2s timeout poll", elapsed)
+	}
+	unlock()
+}
+
+func TestAcquireLockReacquireAfterRelease(t *testing.T) {
+	m := newTestManager(t)
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+
+	// Repeated acquire/release must always succeed: releasing the lock must make
+	// it immediately available again, and the lock must never become permanently
+	// blocked.
+	for i := 0; i < 3; i++ {
+		unlock, err := m.acquireLock(lockPath)
+		if err != nil {
+			t.Fatalf("acquireLock() iteration %d error = %v", i, err)
+		}
+		unlock()
+	}
+}
+
+func TestAcquireLockBlocksSecondHolderUntilRelease(t *testing.T) {
+	m := newTestManager(t)
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+
+	unlock1, err := m.acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("first acquireLock() error = %v", err)
+	}
+
+	// While the lock is held, a second acquisition must block (it cannot succeed
+	// until the first holder releases). With the 2s ceiling it will time out if
+	// we wait long enough, so just confirm it does not return immediately.
+	done := make(chan error, 1)
+	go func() {
+		u, err := m.acquireLock(lockPath)
+		if err == nil {
+			u()
+		}
+		done <- err
+	}()
+
+	select {
+	case <-done:
+		unlock1()
+		t.Fatal("second acquireLock() returned while the lock was held; mutual exclusion is broken")
+	case <-time.After(150 * time.Millisecond):
+		// Expected: blocked waiting for the first holder.
+	}
+
+	unlock1()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("second acquireLock() after release error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second acquireLock() did not complete after the first holder released")
+	}
+}
+
+func TestConcurrentMutatorsDoNotLoseUpdates(t *testing.T) {
+	m := newTestManager(t)
+
+	const n = 12
+	accounts := make([]Account, 0, n)
+	for i := 0; i < n; i++ {
+		accounts = append(accounts, Account{
+			ID:        fmt.Sprintf("acct-%02d", i),
+			Status:    StatusReady,
+			OwnerMode: OwnerCloud,
+		})
+	}
+	saveTestAccounts(t, m, accounts...)
+
+	// Fire N concurrent mutators, each touching a DIFFERENT account: half flip
+	// status to drain, half set a distinctive label. Without an intra-process
+	// lock these Load->mutate->Save calls clobber each other (whole-file
+	// rewrite), so some updates are lost. Run with -race to also surface the
+	// concurrent state access.
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*n)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("acct-%02d", i)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			errs <- m.SetStatus(id, StatusDrain)
+		}(id)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			errs <- m.SetLabel(id, "label-"+id)
+		}(id)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent mutator error = %v", err)
+		}
+	}
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(state.Accounts) != n {
+		t.Fatalf("accounts = %d, want %d (lost-update dropped an account)", len(state.Accounts), n)
+	}
+	for _, account := range state.Accounts {
+		if account.Status != StatusDrain {
+			t.Fatalf("account %s status = %s, want %s (status update lost)", account.ID, account.Status, StatusDrain)
+		}
+		if account.Label != "label-"+account.ID {
+			t.Fatalf("account %s label = %q, want %q (label update lost)", account.ID, account.Label, "label-"+account.ID)
+		}
+	}
+}
+
+func leasedQuotaResult(remaining float64, resetAt time.Time) quota.Result {
+	used := 100 - remaining
+	window := quota.Window{
+		Key:              "five_hour",
+		Label:            "5h",
+		UsedPercent:      used,
+		RemainingPercent: remaining,
+		UsedDisplay:      fmt.Sprintf("%.0f%%", used),
+		RemainingDisplay: fmt.Sprintf("%.0f%%", remaining),
+		ResetsAt:         resetAt.UTC().Format(time.RFC3339),
+	}
+	return quota.Result{
+		Status: quota.StatusSupported,
+		Plan:   "pro",
+		Quotas: []quota.Window{window},
+	}
+}
+
+func TestRecordLeasedQuotaKeepsCloudOwner(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:               "leased",
+		OwnerMode:        OwnerCloud,
+		Status:           StatusReady,
+		LeaseID:          "lease-active",
+		LeaseClientID:    "c1",
+		LeaseHolder:      "holder-1",
+		LeaseStartedAt:   time.Now().Add(-time.Minute),
+		LeaseHeartbeatAt: time.Now().Add(-30 * time.Second),
+		LeaseExpiresAt:   time.Now().Add(time.Hour),
+	})
+
+	result := leasedQuotaResult(40, time.Now().Add(time.Hour))
+	if err := m.RecordLeasedQuota("leased", "lease-active", "c1", result, time.Now()); err != nil {
+		t.Fatalf("RecordLeasedQuota() error = %v", err)
+	}
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	cache, ok := state.QuotaCache["leased"]
+	if !ok {
+		t.Fatal("QuotaCache missing leased entry")
+	}
+	if cache.Source != QuotaSourceClient {
+		t.Fatalf("cache source = %q, want %q", cache.Source, QuotaSourceClient)
+	}
+	if cache.ReporterClientID != "c1" {
+		t.Fatalf("cache reporter = %q, want c1", cache.ReporterClientID)
+	}
+	if cache.FiveHour == nil {
+		t.Fatal("cache FiveHour = nil, want a 5h window")
+	}
+	account := getTestAccount(t, m, "leased")
+	if account.OwnerMode != OwnerCloud {
+		t.Fatalf("owner mode = %q, want %q (client lease report must not flip ownership)", account.OwnerMode, OwnerCloud)
+	}
+	if account.OwnerClientID != "" {
+		t.Fatalf("owner client id = %q, want empty", account.OwnerClientID)
+	}
+}
+
+func TestRecordLeasedQuotaRejectsNonHolder(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:               "leased",
+		OwnerMode:        OwnerCloud,
+		Status:           StatusReady,
+		LeaseID:          "lease-active",
+		LeaseClientID:    "c1",
+		LeaseHolder:      "holder-1",
+		LeaseStartedAt:   time.Now().Add(-time.Minute),
+		LeaseHeartbeatAt: time.Now().Add(-30 * time.Second),
+		LeaseExpiresAt:   time.Now().Add(time.Hour),
+	})
+
+	result := leasedQuotaResult(40, time.Now().Add(time.Hour))
+	if err := m.RecordLeasedQuota("leased", "lease-active", "c2", result, time.Now()); err == nil {
+		t.Fatal("RecordLeasedQuota() with wrong client = nil error, want non-nil")
+	}
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if _, ok := state.QuotaCache["leased"]; ok {
+		t.Fatal("QuotaCache must be unchanged when the reporter does not hold the lease")
+	}
+
+	// A mismatched lease ID must also be rejected.
+	if err := m.RecordLeasedQuota("leased", "wrong-lease", "c1", result, time.Now()); err == nil {
+		t.Fatal("RecordLeasedQuota() with wrong lease id = nil error, want non-nil")
+	}
+}
+
+func TestShouldSwapLease(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "acct", OwnerMode: OwnerCloud, Status: StatusReady})
+
+	saveTestQuota(t, m, "acct", 5, time.Now().Add(time.Hour))
+	swap, err := m.ShouldSwapLease("acct")
+	if err != nil {
+		t.Fatalf("ShouldSwapLease() error = %v", err)
+	}
+	if !swap {
+		t.Fatalf("ShouldSwapLease() = false, want true for 5%% remaining below threshold %.0f", swapRemainingThreshold)
+	}
+
+	saveTestQuota(t, m, "acct", 50, time.Now().Add(time.Hour))
+	swap, err = m.ShouldSwapLease("acct")
+	if err != nil {
+		t.Fatalf("ShouldSwapLease() error = %v", err)
+	}
+	if swap {
+		t.Fatal("ShouldSwapLease() = true, want false for 50% remaining above threshold")
+	}
+
+	swap, err = m.ShouldSwapLease("no-cache")
+	if err != nil {
+		t.Fatalf("ShouldSwapLease() no-cache error = %v", err)
+	}
+	if swap {
+		t.Fatal("ShouldSwapLease() = true for account with no cache, want false")
+	}
+}
+
+func TestFetchQuotaSkipsNetworkWhenLeased(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:               "leased",
+		OwnerMode:        OwnerCloud,
+		Status:           StatusReady,
+		Generation:       3,
+		LeaseID:          "lease-active",
+		LeaseClientID:    "c1",
+		LeaseHolder:      "holder-1",
+		LeaseStartedAt:   time.Now().Add(-time.Minute),
+		LeaseHeartbeatAt: time.Now().Add(-30 * time.Second),
+		LeaseExpiresAt:   time.Now().Add(time.Hour),
+	})
+	saveTestQuota(t, m, "leased", 73, time.Now().Add(time.Hour))
+
+	authBefore := readTestAuth(t, m, "leased")
+
+	result, err := m.FetchQuota(context.Background(), "leased")
+	if err != nil {
+		t.Fatalf("FetchQuota() error = %v", err)
+	}
+	// The leased branch returns the cached result verbatim (status supported)
+	// with a "leased by" detail and never performs a network fetch.
+	if result.Status != quota.StatusSupported {
+		t.Fatalf("status = %q, want %q (cached value returned verbatim)", result.Status, quota.StatusSupported)
+	}
+	if !strings.Contains(result.Detail, "leased by c1") {
+		t.Fatalf("detail = %q, want a leased-by-c1 note", result.Detail)
+	}
+	if len(result.Quotas) != 1 || result.Quotas[0].RemainingPercent != 73 {
+		t.Fatalf("quotas = %+v, want the cached 73%% window", result.Quotas)
+	}
+
+	if authAfter := readTestAuth(t, m, "leased"); !bytes.Equal(authAfter, authBefore) {
+		t.Fatal("auth.json changed; FetchQuota performed a network fetch for a leased account")
+	}
+	account := getTestAccount(t, m, "leased")
+	if account.Generation != 3 {
+		t.Fatalf("generation = %d, want 3 (unchanged; no network fetch)", account.Generation)
 	}
 }
 
@@ -217,6 +734,42 @@ func saveTestAccounts(t *testing.T, m *Manager, accounts ...Account) {
 	}
 }
 
+func saveTestQuota(t *testing.T, m *Manager, accountID string, remaining float64, resetAt time.Time) {
+	t.Helper()
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if state.QuotaCache == nil {
+		state.QuotaCache = map[string]QuotaCache{}
+	}
+	used := 100 - remaining
+	window := quota.Window{
+		Key:              "five_hour",
+		Label:            "5h",
+		UsedPercent:      used,
+		RemainingPercent: remaining,
+		UsedDisplay:      fmt.Sprintf("%.0f%%", used),
+		RemainingDisplay: fmt.Sprintf("%.0f%%", remaining),
+		ResetsAt:         resetAt.UTC().Format(time.RFC3339),
+	}
+	state.QuotaCache[accountID] = QuotaCache{
+		AccountID: accountID,
+		UpdatedAt: time.Now(),
+		Result: quota.Result{
+			Status: quota.StatusSupported,
+			Plan:   "pro",
+			Quotas: []quota.Window{window},
+		},
+		FiveHour: &window,
+		Source:   QuotaSourceCloud,
+	}
+	if err := m.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+}
+
 func writeTestAuth(t *testing.T, codexHome, seed string) {
 	t.Helper()
 
@@ -286,4 +839,81 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestReleaseLeaseUnknownReturnsNotFound(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "available"})
+	saveTestQuota(t, m, "available", 80, time.Now().Add(time.Hour))
+
+	// Releasing a lease that was never claimed must surface ErrLeaseNotFound,
+	// not a silent nil success.
+	err := m.ReleaseLease("available", "bogus-lease-id", "client-x")
+	if err == nil {
+		t.Fatal("ReleaseLease(unknown) = nil, want ErrLeaseNotFound")
+	}
+	if !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("ReleaseLease(unknown) error = %v, want errors.Is ErrLeaseNotFound", err)
+	}
+
+	// A wrong accountID must likewise fail rather than report success.
+	if err := m.ReleaseLease("does-not-exist", "bogus", "client-x"); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("ReleaseLease(missing account) error = %v, want ErrLeaseNotFound", err)
+	}
+}
+
+func TestAccountViewByID(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m,
+		Account{ID: "alpha", Label: "Alpha"},
+		Account{ID: "beta", Label: "Beta"},
+	)
+
+	view, err := m.AccountViewByID("beta")
+	if err != nil {
+		t.Fatalf("AccountViewByID(beta) error = %v", err)
+	}
+	if view.ID != "beta" || view.Label != "Beta" {
+		t.Fatalf("AccountViewByID(beta) = %+v, want id=beta label=Beta", view)
+	}
+	if !view.AuthPresent {
+		t.Fatalf("AccountViewByID(beta).AuthPresent = false, want true (test auth was written)")
+	}
+
+	if _, err := m.AccountViewByID("ghost"); !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("AccountViewByID(ghost) error = %v, want ErrAccountNotFound", err)
+	}
+}
+
+func TestAccountViewByIDDoesNotModifyState(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "alpha"})
+
+	before, err := os.ReadFile(m.StatePath)
+	if err != nil {
+		t.Fatalf("ReadFile(state) error = %v", err)
+	}
+	infoBefore, err := os.Stat(m.StatePath)
+	if err != nil {
+		t.Fatalf("Stat(state) error = %v", err)
+	}
+
+	if _, err := m.AccountViewByID("alpha"); err != nil {
+		t.Fatalf("AccountViewByID(alpha) error = %v", err)
+	}
+
+	after, err := os.ReadFile(m.StatePath)
+	if err != nil {
+		t.Fatalf("ReadFile(state) after error = %v", err)
+	}
+	infoAfter, err := os.Stat(m.StatePath)
+	if err != nil {
+		t.Fatalf("Stat(state) after error = %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("AccountViewByID mutated state.json content (should be a pure read)")
+	}
+	if !infoBefore.ModTime().Equal(infoAfter.ModTime()) {
+		t.Fatal("AccountViewByID rewrote state.json (mtime changed; should be a pure read)")
+	}
 }

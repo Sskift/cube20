@@ -25,11 +25,11 @@ const (
 type Status string
 
 const (
-	StatusSupported     Status = "supported"
-	StatusUnsupported   Status = "unsupported_api_key"
-	StatusNotConfigured Status = "not_configured"
+	StatusSupported      Status = "supported"
+	StatusUnsupported    Status = "unsupported_api_key"
+	StatusNotConfigured  Status = "not_configured"
 	StatusRefreshInvalid Status = "refresh_token_invalidated"
-	StatusError         Status = "error"
+	StatusError          Status = "error"
 )
 
 type Result struct {
@@ -99,6 +99,11 @@ var httpClient = &http.Client{
 var errNotFound = errors.New("codex usage endpoint returned 404")
 var errUnauthorized = errors.New("unauthorized")
 
+// Indirection seams so tests can stub the networked refresh/usage calls.
+// They default to the real implementations.
+var refreshAuthFileFn = refreshAuthFile
+var fetchUsageFn = fetchUsage
+
 func FetchForCodexHome(ctx context.Context, codexHome string, now time.Time) (Result, error) {
 	result := Result{
 		Status: StatusNotConfigured,
@@ -130,7 +135,7 @@ func FetchForCodexHome(ctx context.Context, codexHome string, now time.Time) (Re
 
 	if accessToken == "" {
 		if refreshToken != "" {
-			refreshed, refreshErr := refreshAuthFile(ctx, authPath, data, refreshToken)
+			refreshed, refreshErr := refreshAuthFileFn(ctx, authPath, data, refreshToken)
 			if refreshErr != nil {
 				if isRefreshTokenInvalidated(refreshErr) {
 					result.Status = StatusRefreshInvalid
@@ -146,20 +151,20 @@ func FetchForCodexHome(ctx context.Context, codexHome string, now time.Time) (Re
 				auth.Tokens.IDToken = refreshed.IDToken
 			}
 		}
-		if apiKey != "" {
-			result.Status = StatusUnsupported
-			result.Detail = "API-key Codex auth cannot expose ChatGPT subscription quota."
-			return result, nil
-		}
 		if accessToken == "" {
+			if apiKey != "" {
+				result.Status = StatusUnsupported
+				result.Detail = "API-key Codex auth cannot expose ChatGPT subscription quota."
+				return result, nil
+			}
 			result.Detail = "auth.json has no OAuth access token"
 			return result, nil
 		}
 	}
 
-	response, err := fetchUsage(ctx, accessToken, accountID)
+	response, err := fetchUsageFn(ctx, accessToken, accountID)
 	if errors.Is(err, errUnauthorized) && refreshToken != "" {
-		refreshed, refreshErr := refreshAuthFile(ctx, authPath, data, refreshToken)
+		refreshed, refreshErr := refreshAuthFileFn(ctx, authPath, data, refreshToken)
 		if refreshErr != nil {
 			if isRefreshTokenInvalidated(refreshErr) {
 				result.Status = StatusRefreshInvalid
@@ -176,7 +181,7 @@ func FetchForCodexHome(ctx context.Context, codexHome string, now time.Time) (Re
 		if refreshed.IDToken != "" {
 			auth.Tokens.IDToken = refreshed.IDToken
 		}
-		response, err = fetchUsage(ctx, accessToken, accountID)
+		response, err = fetchUsageFn(ctx, accessToken, accountID)
 	}
 	if err != nil {
 		result.Status = StatusError

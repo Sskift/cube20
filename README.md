@@ -2,6 +2,9 @@
 
 `cube20` is a Codex account-pool manager. Its binary command is `cube`.
 
+For repository structure, data model, deployment, and maintenance notes, see
+[`docs/REPOSITORY.md`](docs/REPOSITORY.md).
+
 The cloud deployment model is:
 
 - One cloud `cube dashboard` server owns the account pool, auth snapshots,
@@ -33,6 +36,7 @@ The managed Postgres tables are created automatically:
 - `cube_clients`
 - `cube_usage`
 - `cube_usage_events`
+- `cube_dispatch_events`
 - `cube_quota_cache`
 - `cube_meta`
 
@@ -241,6 +245,7 @@ The main cloud endpoints are:
 - `POST /api/sync/quota/<id>` (client quota report)
 - `GET /api/stats`
 - `GET /api/refresh-queue`
+- `GET /api/dispatches`
 - `GET|POST /api/clients`
 - `GET /healthz`
 - `GET /readyz`
@@ -271,8 +276,12 @@ from an API key.
 `cube run` summarizes the temporary Codex session JSONL files after Codex exits
 and uploads today, seven-day, all-time, and per-model token totals to the cloud.
 The dashboard shows the cleaned account view, connected clients, per-account
-usage, and the 5h quota refresh queue.
+usage, dispatch history, and the 5h quota refresh queue.
 
 Postgres deployments also keep per-run/per-model rows in `cube_usage_events`.
 The current dashboard still reads the compact `cube_usage` summary; the event
 table is the durable source for future per-session views.
+
+`cube_dispatch_events` records load-balancer lease lifecycle events:
+`claimed`, `released`, and `expired`. The dashboard uses this table to show
+which account was sent to which client/PAT holder.
