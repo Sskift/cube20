@@ -24,6 +24,8 @@ interface QuotaRow {
   leaseClientId?: string;
   leaseActive?: boolean;
   quotaSource?: string;
+  sevenDayRemainingPercent?: number;
+  bindingWindow?: string;
 }
 
 interface TimelinePoint {
@@ -188,8 +190,9 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
                 <thead>
                   <tr className="border-b border-slate-200 text-left text-xs font-semibold uppercase text-slate-500">
                     <th className="px-4 py-3 font-semibold">{t("账号", "Account")}</th>
-                    <th className="px-4 py-3 font-semibold">{t("5h 用量%", "5h used %")}</th>
-                    <th className="px-4 py-3 font-semibold">{t("5h 剩余%", "5h left %")}</th>
+                    <th className="px-4 py-3 font-semibold">{t("用量%", "Used %")}</th>
+                    <th className="px-4 py-3 font-semibold">{t("剩余%", "Left %")}</th>
+                    <th className="px-4 py-3 font-semibold">{t("7d 剩余%", "7d left %")}</th>
                     <th className="px-4 py-3 font-semibold">{t("刷新时间", "Reset time")}</th>
                     <th className="px-4 py-3 font-semibold">{t("租用者", "Lessee")}</th>
                     <th className="px-4 py-3 font-semibold">{t("状态", "Status")}</th>
@@ -209,6 +212,7 @@ export function QuotaOverview({ queue }: { queue: QuotaRow[] }) {
                         </Chip>
                       </td>
                       <td className="px-4 py-3 font-medium text-slate-900">{fmtPercent(row.remainingPercent)}</td>
+                      <td className="px-4 py-3 font-medium text-slate-900">{fmtPercent(row.sevenDayRemainingPercent)}</td>
                       <td className="px-4 py-3 text-slate-600">{fmtTime(row.resetsAt)}</td>
                       <td className="px-4 py-3">
                         {row.leaseClientId ? (

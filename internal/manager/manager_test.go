@@ -221,6 +221,108 @@ func TestClaimLeaseWeightsQuotaNearReset(t *testing.T) {
 	}
 }
 
+func TestLoadBalanceStatusExcludesExhaustedSevenDayQuota(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:        "weekly-capped",
+		OwnerMode: OwnerCloud,
+		Status:    StatusReady,
+	})
+	// 5h healthy (100% remaining) but 7d exhausted (0% remaining).
+	saveTestQuotaWindows(t, m, "weekly-capped",
+		100, time.Now().Add(time.Hour),
+		0, time.Now().Add(72*time.Hour))
+
+	status, err := m.LoadBalanceStatus()
+	if err != nil {
+		t.Fatalf("LoadBalanceStatus() error = %v", err)
+	}
+	if len(status.Eligible) != 0 {
+		t.Fatalf("eligible accounts = %v, want none", loadBalanceIDs(status.Eligible))
+	}
+	account := findLoadBalanceAccount(t, status.Excluded, "weekly-capped")
+	if !strings.HasPrefix(account.Reason, "7d quota exhausted until ") {
+		t.Fatalf("excluded reason = %q, want 7d quota exhausted reason", account.Reason)
+	}
+	// Display must reflect the binding (7d) window, not the healthy 5h window.
+	if account.QuotaRemainingPercent != 0 {
+		t.Fatalf("quota remaining = %v, want 0 (binding 7d)", account.QuotaRemainingPercent)
+	}
+	if account.QuotaBindingWindow != "7d" {
+		t.Fatalf("binding window = %q, want 7d", account.QuotaBindingWindow)
+	}
+	if account.QuotaSevenDayRemainingPercent != 0 {
+		t.Fatalf("7d remaining = %v, want 0", account.QuotaSevenDayRemainingPercent)
+	}
+}
+
+func TestClaimLeaseSkipsExhaustedSevenDayQuota(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m,
+		Account{ID: "weekly-capped"},
+		Account{ID: "available"},
+	)
+	saveTestQuotaWindows(t, m, "weekly-capped",
+		100, time.Now().Add(time.Hour),
+		0, time.Now().Add(72*time.Hour))
+	saveTestQuotaWindows(t, m, "available",
+		80, time.Now().Add(3*time.Hour),
+		90, time.Now().Add(96*time.Hour))
+
+	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimLease() error = %v", err)
+	}
+	if lease.Lease.AccountID != "available" {
+		t.Fatalf("leased account = %q, want available", lease.Lease.AccountID)
+	}
+}
+
+func TestLoadBalanceStatusKeepsAccountFullOnBothWindows(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:        "healthy",
+		OwnerMode: OwnerCloud,
+		Status:    StatusReady,
+	})
+	saveTestQuotaWindows(t, m, "healthy",
+		90, time.Now().Add(time.Hour),
+		80, time.Now().Add(72*time.Hour))
+
+	status, err := m.LoadBalanceStatus()
+	if err != nil {
+		t.Fatalf("LoadBalanceStatus() error = %v", err)
+	}
+	account := findLoadBalanceAccount(t, status.Eligible, "healthy")
+	// Binding window is the lower-remaining 7d (80% < 90%).
+	if account.QuotaBindingWindow != "7d" || account.QuotaRemainingPercent != 80 {
+		t.Fatalf("binding = %q remaining = %v, want 7d / 80", account.QuotaBindingWindow, account.QuotaRemainingPercent)
+	}
+}
+
+func TestLoadBalanceStatusClientReportedNoSevenDayStaysEligible(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:        "client-only",
+		OwnerMode: OwnerCloud,
+		Status:    StatusReady,
+	})
+	// Client-reported style: only a 5h window present, no 7d.
+	saveTestQuota(t, m, "client-only", 75, time.Now().Add(2*time.Hour))
+
+	status, err := m.LoadBalanceStatus()
+	if err != nil {
+		t.Fatalf("LoadBalanceStatus() error = %v", err)
+	}
+	account := findLoadBalanceAccount(t, status.Eligible, "client-only")
+	if account.QuotaBindingWindow != "5h" || account.QuotaRemainingPercent != 75 {
+		t.Fatalf("binding = %q remaining = %v, want 5h / 75", account.QuotaBindingWindow, account.QuotaRemainingPercent)
+	}
+	if account.QuotaSevenDayRemainingPercent != 0 || account.QuotaSevenDayRemainingDisplay != "" {
+		t.Fatalf("7d fields should be empty for client-reported account: %+v", account)
+	}
+}
+
 func TestDispatchHistoryRecordsClaimAndRelease(t *testing.T) {
 	m := newTestManager(t)
 	saveTestAccounts(t, m, Account{ID: "available"})
@@ -763,6 +865,46 @@ func saveTestQuota(t *testing.T, m *Manager, accountID string, remaining float64
 			Quotas: []quota.Window{window},
 		},
 		FiveHour: &window,
+		Source:   QuotaSourceCloud,
+	}
+	if err := m.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+}
+
+func saveTestQuotaWindows(t *testing.T, m *Manager, accountID string, fiveRemaining float64, fiveReset time.Time, sevenRemaining float64, sevenReset time.Time) {
+	t.Helper()
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if state.QuotaCache == nil {
+		state.QuotaCache = map[string]QuotaCache{}
+	}
+	mk := func(key, label string, remaining float64, reset time.Time) quota.Window {
+		used := 100 - remaining
+		return quota.Window{
+			Key:              key,
+			Label:            label,
+			UsedPercent:      used,
+			RemainingPercent: remaining,
+			UsedDisplay:      fmt.Sprintf("%.0f%%", used),
+			RemainingDisplay: fmt.Sprintf("%.0f%%", remaining),
+			ResetsAt:         reset.UTC().Format(time.RFC3339),
+		}
+	}
+	five := mk("five_hour", "5h", fiveRemaining, fiveReset)
+	seven := mk("seven_day", "7d", sevenRemaining, sevenReset)
+	state.QuotaCache[accountID] = QuotaCache{
+		AccountID: accountID,
+		UpdatedAt: time.Now(),
+		Result: quota.Result{
+			Status: quota.StatusSupported,
+			Plan:   "pro",
+			Quotas: []quota.Window{five, seven},
+		},
+		FiveHour: &five,
 		Source:   QuotaSourceCloud,
 	}
 	if err := m.Save(state); err != nil {

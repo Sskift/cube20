@@ -88,7 +88,10 @@ export function AccountTable({
 
               <span className="cube-cell cube-cell-quota" role="cell">
                 <span className="cube-quota-head">
-                  <span className="truncate">{row.quotaLabel}</span>
+                  <span className="truncate">
+                    {row.quotaLabel}
+                    {row.bindingWindow && <span className="cube-muted"> · {row.bindingWindow}</span>}
+                  </span>
                   <strong className={`tone-${row.quotaColor}`}>{Math.round(row.quotaPercent)}%</strong>
                 </span>
                 <span className="cube-quota-track">
@@ -142,6 +145,14 @@ function RowDetail({ row, now }: { row: AccountRow; now: number }) {
         <Detail label={t("凭据", "auth")} value={row.authPresent ? t("就绪", "ready") : t("缺失", "missing")} />
         <Detail label={t("配额来源", "source")} value={row.quotaSource || "-"} />
         <Detail label={t("5h 重置", "5h reset")} value={row.resetsAt ? `${shortTime(row.resetsAt)} · ${countdown(row.resetsAt, now)}` : "-"} />
+        <Detail
+          label={t("7d 余量", "7d left")}
+          value={
+            typeof row.sevenDayPercent === "number"
+              ? `${row.sevenDayLabel || `${Math.round(row.sevenDayPercent)}%`}${row.sevenDayResetsAt ? ` · ${countdown(row.sevenDayResetsAt, now)}` : ""}`
+              : "-"
+          }
+        />
         <Detail
           label={t("当前租约", "current lease")}
           value={row.leaseActive ? `${dispatchTarget(row.leaseClientId, "", row.leaseHolder)} · ${t("至", "until")} ${shortTime(row.leaseExpiresAt)}` : "-"}

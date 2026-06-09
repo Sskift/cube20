@@ -125,11 +125,23 @@ func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
 			LeaseClientID:         account.LeaseClientID,
 			LeaseExpiresAt:        account.LeaseExpiresAt,
 		}
-		if cache.FiveHour != nil {
-			item.ResetsAt = cache.FiveHour.ResetsAt
-			item.RemainingDisplay = cache.FiveHour.RemainingDisplay
-			item.RemainingPercent = cache.FiveHour.RemainingPercent
-			item.UsedPercent = cache.FiveHour.UsedPercent
+		sevenDay := quotaSevenDay(cache.Result)
+		if sevenDay != nil {
+			item.SevenDayResetsAt = sevenDay.ResetsAt
+			item.SevenDayRemainingDisplay = sevenDay.RemainingDisplay
+			item.SevenDayRemainingPercent = sevenDay.RemainingPercent
+			item.SevenDayUsedPercent = sevenDay.UsedPercent
+		}
+		if binding := bindingWindow(cache.FiveHour, sevenDay); binding != nil {
+			item.ResetsAt = binding.ResetsAt
+			item.RemainingDisplay = binding.RemainingDisplay
+			item.RemainingPercent = binding.RemainingPercent
+			item.UsedPercent = binding.UsedPercent
+			if binding == sevenDay {
+				item.BindingWindow = "7d"
+			} else {
+				item.BindingWindow = "5h"
+			}
 		}
 		switch {
 		case !account.AuthPresent:

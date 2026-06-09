@@ -9,29 +9,34 @@ import (
 )
 
 type LoadBalanceAccount struct {
-	ID                    string           `json:"id"`
-	Label                 string           `json:"label"`
-	Status                AccountStatus    `json:"status"`
-	AuthPresent           bool             `json:"authPresent"`
-	ConfigPresent         bool             `json:"configPresent"`
-	Active                bool             `json:"active"`
-	CodexHome             string           `json:"codexHome"`
-	OwnerMode             AccountOwnerMode `json:"ownerMode"`
-	OwnerClientID         string           `json:"ownerClientId,omitempty"`
-	Generation            int64            `json:"generation"`
-	LeaseActive           bool             `json:"leaseActive"`
-	LeaseClientID         string           `json:"leaseClientId,omitempty"`
-	LeaseHolder           string           `json:"leaseHolder,omitempty"`
-	LeaseExpiresAt        time.Time        `json:"leaseExpiresAt,omitempty"`
-	Eligible              bool             `json:"eligible"`
-	Reason                string           `json:"reason,omitempty"`
-	QuotaStatus           quota.Status     `json:"quotaStatus,omitempty"`
-	QuotaRemainingDisplay string           `json:"quotaRemainingDisplay,omitempty"`
-	QuotaRemainingPercent float64          `json:"quotaRemainingPercent,omitempty"`
-	QuotaUsedPercent      float64          `json:"quotaUsedPercent,omitempty"`
-	QuotaResetsAt         string           `json:"quotaResetsAt,omitempty"`
-	QuotaUpdatedAt        time.Time        `json:"quotaUpdatedAt,omitempty"`
-	QuotaScore            float64          `json:"quotaScore,omitempty"`
+	ID                            string           `json:"id"`
+	Label                         string           `json:"label"`
+	Status                        AccountStatus    `json:"status"`
+	AuthPresent                   bool             `json:"authPresent"`
+	ConfigPresent                 bool             `json:"configPresent"`
+	Active                        bool             `json:"active"`
+	CodexHome                     string           `json:"codexHome"`
+	OwnerMode                     AccountOwnerMode `json:"ownerMode"`
+	OwnerClientID                 string           `json:"ownerClientId,omitempty"`
+	Generation                    int64            `json:"generation"`
+	LeaseActive                   bool             `json:"leaseActive"`
+	LeaseClientID                 string           `json:"leaseClientId,omitempty"`
+	LeaseHolder                   string           `json:"leaseHolder,omitempty"`
+	LeaseExpiresAt                time.Time        `json:"leaseExpiresAt,omitempty"`
+	Eligible                      bool             `json:"eligible"`
+	Reason                        string           `json:"reason,omitempty"`
+	QuotaStatus                   quota.Status     `json:"quotaStatus,omitempty"`
+	QuotaRemainingDisplay         string           `json:"quotaRemainingDisplay,omitempty"`
+	QuotaRemainingPercent         float64          `json:"quotaRemainingPercent,omitempty"`
+	QuotaUsedPercent              float64          `json:"quotaUsedPercent,omitempty"`
+	QuotaResetsAt                 string           `json:"quotaResetsAt,omitempty"`
+	QuotaUpdatedAt                time.Time        `json:"quotaUpdatedAt,omitempty"`
+	QuotaScore                    float64          `json:"quotaScore,omitempty"`
+	QuotaSevenDayRemainingDisplay string           `json:"quotaSevenDayRemainingDisplay,omitempty"`
+	QuotaSevenDayRemainingPercent float64          `json:"quotaSevenDayRemainingPercent,omitempty"`
+	QuotaSevenDayUsedPercent      float64          `json:"quotaSevenDayUsedPercent,omitempty"`
+	QuotaSevenDayResetsAt         string           `json:"quotaSevenDayResetsAt,omitempty"`
+	QuotaBindingWindow            string           `json:"quotaBindingWindow,omitempty"`
 }
 type LoadBalanceStatus struct {
 	Policy        string               `json:"policy"`
@@ -90,6 +95,11 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 		entry.QuotaResetsAt = evaluation.QuotaResetsAt
 		entry.QuotaUpdatedAt = evaluation.QuotaUpdatedAt
 		entry.QuotaScore = evaluation.QuotaScore
+		entry.QuotaSevenDayRemainingDisplay = evaluation.QuotaSevenDayRemainingDisplay
+		entry.QuotaSevenDayRemainingPercent = evaluation.QuotaSevenDayRemainingPercent
+		entry.QuotaSevenDayUsedPercent = evaluation.QuotaSevenDayUsedPercent
+		entry.QuotaSevenDayResetsAt = evaluation.QuotaSevenDayResetsAt
+		entry.QuotaBindingWindow = evaluation.QuotaBindingWindow
 		if entry.Eligible {
 			status.Eligible = append(status.Eligible, entry)
 		} else {
@@ -109,15 +119,20 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 }
 
 type loadBalanceEvaluation struct {
-	Eligible              bool
-	Reason                string
-	QuotaStatus           quota.Status
-	QuotaRemainingDisplay string
-	QuotaRemainingPercent float64
-	QuotaUsedPercent      float64
-	QuotaResetsAt         string
-	QuotaUpdatedAt        time.Time
-	QuotaScore            float64
+	Eligible                      bool
+	Reason                        string
+	QuotaStatus                   quota.Status
+	QuotaRemainingDisplay         string
+	QuotaRemainingPercent         float64
+	QuotaUsedPercent              float64
+	QuotaResetsAt                 string
+	QuotaUpdatedAt                time.Time
+	QuotaScore                    float64
+	QuotaSevenDayRemainingDisplay string
+	QuotaSevenDayRemainingPercent float64
+	QuotaSevenDayUsedPercent      float64
+	QuotaSevenDayResetsAt         string
+	QuotaBindingWindow            string
 }
 
 func loadBalanceEligibility(account AccountView, cache QuotaCache, now time.Time) loadBalanceEvaluation {
@@ -185,9 +200,28 @@ func evaluateLoadBalanceFields(ownerMode AccountOwnerMode, status AccountStatus,
 		evaluation.Reason = fmt.Sprintf("5h quota exhausted until %s", resetAt.Format(time.RFC3339))
 		return evaluation
 	}
+	// 7d window is present only for cloud-fetched accounts. When present and
+	// exhausted (or its reset has passed) the account cannot run even though the
+	// 5h window looks healthy. A missing 7d window means "no constraint".
+	sevenDay := quotaSevenDay(cache.Result)
+	if sevenDay != nil {
+		sevenReset := parseRFC3339(sevenDay.ResetsAt)
+		if !sevenReset.IsZero() && !sevenReset.After(now) {
+			evaluation.Reason = "7d reset passed; refresh needed"
+			return evaluation
+		}
+		if sevenDay.RemainingPercent <= loadBalanceMinFiveHourRemaining {
+			if sevenReset.IsZero() {
+				evaluation.Reason = "7d quota exhausted"
+			} else {
+				evaluation.Reason = fmt.Sprintf("7d quota exhausted until %s", sevenReset.Format(time.RFC3339))
+			}
+			return evaluation
+		}
+	}
 	evaluation.Eligible = true
 	evaluation.Reason = ""
-	evaluation.QuotaScore = loadBalanceQuotaScore(*cache.FiveHour, now)
+	evaluation.QuotaScore = loadBalanceQuotaScore(*bindingWindow(cache.FiveHour, sevenDay), now)
 	return evaluation
 }
 func loadBalanceQuotaEvaluation(cache QuotaCache, now time.Time) loadBalanceEvaluation {
@@ -195,13 +229,26 @@ func loadBalanceQuotaEvaluation(cache QuotaCache, now time.Time) loadBalanceEval
 		QuotaStatus:    cache.Result.Status,
 		QuotaUpdatedAt: cache.UpdatedAt,
 	}
-	if cache.FiveHour == nil {
+	sevenDay := quotaSevenDay(cache.Result)
+	if sevenDay != nil {
+		evaluation.QuotaSevenDayRemainingDisplay = sevenDay.RemainingDisplay
+		evaluation.QuotaSevenDayRemainingPercent = clampPercent(sevenDay.RemainingPercent)
+		evaluation.QuotaSevenDayUsedPercent = clampPercent(sevenDay.UsedPercent)
+		evaluation.QuotaSevenDayResetsAt = sevenDay.ResetsAt
+	}
+	binding := bindingWindow(cache.FiveHour, sevenDay)
+	if binding == nil {
 		return evaluation
 	}
-	evaluation.QuotaRemainingDisplay = cache.FiveHour.RemainingDisplay
-	evaluation.QuotaRemainingPercent = clampPercent(cache.FiveHour.RemainingPercent)
-	evaluation.QuotaUsedPercent = clampPercent(cache.FiveHour.UsedPercent)
-	evaluation.QuotaResetsAt = cache.FiveHour.ResetsAt
+	evaluation.QuotaRemainingDisplay = binding.RemainingDisplay
+	evaluation.QuotaRemainingPercent = clampPercent(binding.RemainingPercent)
+	evaluation.QuotaUsedPercent = clampPercent(binding.UsedPercent)
+	evaluation.QuotaResetsAt = binding.ResetsAt
+	if binding == sevenDay {
+		evaluation.QuotaBindingWindow = "7d"
+	} else {
+		evaluation.QuotaBindingWindow = "5h"
+	}
 	return evaluation
 }
 func loadBalanceQuotaScore(window quota.Window, now time.Time) float64 {

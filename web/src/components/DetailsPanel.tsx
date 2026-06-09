@@ -106,6 +106,8 @@ export function DetailsPanel({
               <Card.Content className="gap-3 text-xs">
                 <SignalLine label={t("5h 配额", "5h quota")} value={refresh?.remainingDisplay ? `${refresh.remainingDisplay} ${t("剩余", "left")}` : refresh?.refreshOrderReason || "-"} />
                 <SignalLine label={t("5h 刷新", "5h reset")} value={refresh?.resetsAt ? shortTime(refresh.resetsAt) : refresh?.refreshOrderReason || "-"} />
+                <SignalLine label={t("7d 配额", "7d quota")} value={refresh?.sevenDayRemainingDisplay ? `${refresh.sevenDayRemainingDisplay} ${t("剩余", "left")}` : "-"} />
+                <SignalLine label={t("7d 刷新", "7d reset")} value={refresh?.sevenDayResetsAt ? shortTime(refresh.sevenDayResetsAt) : "-"} />
                 <SignalLine label={t("配额来源", "quota source")} value={refresh?.quotaSource ? `${refresh.quotaSource}${refresh.quotaReporterClientId ? ` · ${refresh.quotaReporterClientId}` : ""}` : quota?.source || "-"} />
                 <SignalLine label={t("代次", "generation")} value={(selected.generation || 0).toString()} />
                 <SignalLine label={t("归属", "owner")} value={selected.ownerMode === "client" ? `client ${selected.ownerClientId || "-"}` : "cloud"} />

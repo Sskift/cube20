@@ -259,6 +259,31 @@ func quotaFiveHour(result quota.Result) *quota.Window {
 	}
 	return nil
 }
+func quotaSevenDay(result quota.Result) *quota.Window {
+	for _, window := range result.Quotas {
+		if window.Key == "seven_day" || strings.EqualFold(window.Label, "7d") {
+			copy := window
+			return &copy
+		}
+	}
+	return nil
+}
+
+// bindingWindow returns the most-constrained (lowest RemainingPercent) of the two
+// windows. A nil window is treated as "no constraint" and never wins. Returns nil
+// only when both are nil.
+func bindingWindow(fiveHour, sevenDay *quota.Window) *quota.Window {
+	switch {
+	case fiveHour == nil:
+		return sevenDay
+	case sevenDay == nil:
+		return fiveHour
+	}
+	if sevenDay.RemainingPercent < fiveHour.RemainingPercent {
+		return sevenDay
+	}
+	return fiveHour
+}
 func quotaSourceLabel(cache QuotaCache) string {
 	switch cache.Source {
 	case QuotaSourceClient:

@@ -499,10 +499,10 @@ func (m *Manager) verifyLeaseHolder(accountID, leaseID, clientID string, now tim
 	return nil
 }
 
-// ShouldSwapLease reports whether the cached 5h quota window for an account has
-// dropped below swapRemainingThreshold, suggesting the holder should swap to a
-// fresher account. Missing cache, missing 5h window, or an unsupported status
-// returns false with a nil error.
+// ShouldSwapLease reports whether the most-constrained cached quota window (5h or
+// 7d) for an account has dropped below swapRemainingThreshold, suggesting the
+// holder should swap to a fresher account. Missing cache, missing windows, or an
+// unsupported status returns false with a nil error.
 func (m *Manager) ShouldSwapLease(accountID string) (bool, error) {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
@@ -521,6 +521,9 @@ func (m *Manager) ShouldSwapLease(accountID string) (bool, error) {
 		if w := quotaFiveHour(cache.Result); w != nil {
 			window = w
 		}
+	}
+	if binding := bindingWindow(window, quotaSevenDay(cache.Result)); binding != nil {
+		window = binding
 	}
 	if window == nil {
 		return false, nil

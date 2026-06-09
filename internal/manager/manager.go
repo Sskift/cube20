@@ -166,24 +166,29 @@ type QuotaCache struct {
 }
 
 type RefreshQueueItem struct {
-	AccountID             string           `json:"accountId"`
-	Label                 string           `json:"label"`
-	Status                AccountStatus    `json:"status"`
-	AuthPresent           bool             `json:"authPresent"`
-	UpdatedAt             time.Time        `json:"updatedAt,omitempty"`
-	ResetsAt              string           `json:"resetsAt,omitempty"`
-	RemainingDisplay      string           `json:"remainingDisplay,omitempty"`
-	RemainingPercent      float64          `json:"remainingPercent,omitempty"`
-	UsedPercent           float64          `json:"usedPercent,omitempty"`
-	QuotaStatus           quota.Status     `json:"quotaStatus,omitempty"`
-	RefreshOrderReason    string           `json:"refreshOrderReason,omitempty"`
-	OwnerMode             AccountOwnerMode `json:"ownerMode,omitempty"`
-	OwnerClientID         string           `json:"ownerClientId,omitempty"`
-	QuotaSource           QuotaSource      `json:"quotaSource,omitempty"`
-	QuotaReporterClientID string           `json:"quotaReporterClientId,omitempty"`
-	LeaseActive           bool             `json:"leaseActive,omitempty"`
-	LeaseClientID         string           `json:"leaseClientId,omitempty"`
-	LeaseExpiresAt        time.Time        `json:"leaseExpiresAt,omitempty"`
+	AccountID                string           `json:"accountId"`
+	Label                    string           `json:"label"`
+	Status                   AccountStatus    `json:"status"`
+	AuthPresent              bool             `json:"authPresent"`
+	UpdatedAt                time.Time        `json:"updatedAt,omitempty"`
+	ResetsAt                 string           `json:"resetsAt,omitempty"`
+	RemainingDisplay         string           `json:"remainingDisplay,omitempty"`
+	RemainingPercent         float64          `json:"remainingPercent,omitempty"`
+	UsedPercent              float64          `json:"usedPercent,omitempty"`
+	SevenDayResetsAt         string           `json:"sevenDayResetsAt,omitempty"`
+	SevenDayRemainingDisplay string           `json:"sevenDayRemainingDisplay,omitempty"`
+	SevenDayRemainingPercent float64          `json:"sevenDayRemainingPercent,omitempty"`
+	SevenDayUsedPercent      float64          `json:"sevenDayUsedPercent,omitempty"`
+	BindingWindow            string           `json:"bindingWindow,omitempty"`
+	QuotaStatus              quota.Status     `json:"quotaStatus,omitempty"`
+	RefreshOrderReason       string           `json:"refreshOrderReason,omitempty"`
+	OwnerMode                AccountOwnerMode `json:"ownerMode,omitempty"`
+	OwnerClientID            string           `json:"ownerClientId,omitempty"`
+	QuotaSource              QuotaSource      `json:"quotaSource,omitempty"`
+	QuotaReporterClientID    string           `json:"quotaReporterClientId,omitempty"`
+	LeaseActive              bool             `json:"leaseActive,omitempty"`
+	LeaseClientID            string           `json:"leaseClientId,omitempty"`
+	LeaseExpiresAt           time.Time        `json:"leaseExpiresAt,omitempty"`
 }
 
 type JSONProfile struct {

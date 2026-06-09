@@ -75,7 +75,13 @@ export function LoadBalancerView({ data }: { data: DashboardData }) {
               empty={!next}
               emptyHint={t("当前没有账号同时具备就绪凭据、无活跃租约、且有可用 5h 配额。", "No account currently has ready auth, no active lease, and available 5h quota.")}
               name={next ? lbAccountName(next) : ""}
-              detail={next ? next.id : undefined}
+              detail={
+                next
+                  ? typeof next.quotaSevenDayRemainingPercent === "number"
+                    ? `${next.id} · 7d ${next.quotaSevenDayRemainingDisplay || `${Math.round(next.quotaSevenDayRemainingPercent)}%`}`
+                    : next.id
+                  : undefined
+              }
               score={next ? scoreLabel(next.quotaScore) : undefined}
               reset={next ? shortTime(next.quotaResetsAt) : undefined}
               scoreLabel={t("分数", "score")}

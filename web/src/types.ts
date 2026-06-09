@@ -115,6 +115,11 @@ export interface RefreshQueueItem {
   remainingDisplay?: string;
   remainingPercent?: number;
   usedPercent?: number;
+  sevenDayResetsAt?: string;
+  sevenDayRemainingDisplay?: string;
+  sevenDayRemainingPercent?: number;
+  sevenDayUsedPercent?: number;
+  bindingWindow?: string;
   quotaStatus?: string;
   refreshOrderReason?: string;
   ownerMode?: AccountOwnerMode;
@@ -151,6 +156,11 @@ export interface LoadBalanceAccount {
   quotaResetsAt?: string;
   quotaUpdatedAt?: string;
   quotaScore?: number;
+  quotaSevenDayRemainingDisplay?: string;
+  quotaSevenDayRemainingPercent?: number;
+  quotaSevenDayUsedPercent?: number;
+  quotaSevenDayResetsAt?: string;
+  quotaBindingWindow?: string;
 }
 
 export interface LoadBalanceStatus {

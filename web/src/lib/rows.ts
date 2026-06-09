@@ -36,6 +36,10 @@ export interface AccountRow {
   quotaPercent: number;
   quotaColor: ChipColor;
   resetsAt?: string;
+  bindingWindow?: string;
+  sevenDayPercent?: number;
+  sevenDayLabel?: string;
+  sevenDayResetsAt?: string;
   // lease
   leaseActive: boolean;
   leaseClientId?: string;
@@ -88,6 +92,10 @@ function lbRow(account: LoadBalanceAccount, dispatch: DispatchEvent | undefined,
     quotaPercent: percent,
     quotaColor: remainingColor(account.quotaRemainingPercent, account.quotaStatus === "supported"),
     resetsAt: account.quotaResetsAt,
+    bindingWindow: account.quotaBindingWindow,
+    sevenDayPercent: account.quotaSevenDayRemainingPercent,
+    sevenDayLabel: account.quotaSevenDayRemainingDisplay,
+    sevenDayResetsAt: account.quotaSevenDayResetsAt,
     leaseActive: !!account.leaseActive,
     leaseClientId: account.leaseClientId,
     leaseHolder: account.leaseHolder,
