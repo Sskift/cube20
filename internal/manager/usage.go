@@ -126,6 +126,12 @@ func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
 			LeaseExpiresAt:        account.LeaseExpiresAt,
 		}
 		sevenDay := quotaSevenDay(cache.Result)
+		if cache.FiveHour != nil {
+			item.FiveHourResetsAt = cache.FiveHour.ResetsAt
+			item.FiveHourRemainingDisplay = cache.FiveHour.RemainingDisplay
+			item.FiveHourRemainingPercent = cache.FiveHour.RemainingPercent
+			item.FiveHourUsedPercent = cache.FiveHour.UsedPercent
+		}
 		if sevenDay != nil {
 			item.SevenDayResetsAt = sevenDay.ResetsAt
 			item.SevenDayRemainingDisplay = sevenDay.RemainingDisplay

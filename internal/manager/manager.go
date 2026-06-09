@@ -175,6 +175,10 @@ type RefreshQueueItem struct {
 	RemainingDisplay         string           `json:"remainingDisplay,omitempty"`
 	RemainingPercent         float64          `json:"remainingPercent,omitempty"`
 	UsedPercent              float64          `json:"usedPercent,omitempty"`
+	FiveHourResetsAt         string           `json:"fiveHourResetsAt,omitempty"`
+	FiveHourRemainingDisplay string           `json:"fiveHourRemainingDisplay,omitempty"`
+	FiveHourRemainingPercent float64          `json:"fiveHourRemainingPercent,omitempty"`
+	FiveHourUsedPercent      float64          `json:"fiveHourUsedPercent,omitempty"`
 	SevenDayResetsAt         string           `json:"sevenDayResetsAt,omitempty"`
 	SevenDayRemainingDisplay string           `json:"sevenDayRemainingDisplay,omitempty"`
 	SevenDayRemainingPercent float64          `json:"sevenDayRemainingPercent,omitempty"`

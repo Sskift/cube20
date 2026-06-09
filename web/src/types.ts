@@ -115,6 +115,10 @@ export interface RefreshQueueItem {
   remainingDisplay?: string;
   remainingPercent?: number;
   usedPercent?: number;
+  fiveHourResetsAt?: string;
+  fiveHourRemainingDisplay?: string;
+  fiveHourRemainingPercent?: number;
+  fiveHourUsedPercent?: number;
   sevenDayResetsAt?: string;
   sevenDayRemainingDisplay?: string;
   sevenDayRemainingPercent?: number;
