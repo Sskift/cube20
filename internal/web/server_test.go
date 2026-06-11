@@ -321,9 +321,14 @@ func newTestServer(t *testing.T) (*Server, *manager.Manager, string, string) {
 	if err := m.Save(state); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
-	_, pat, err := m.CreateClient("tester")
+	client, pat, err := m.CreateClient("tester")
 	if err != nil {
 		t.Fatalf("CreateClient() error = %v", err)
+	}
+	// Enroll the test client into the default pool so lease claims resolve a
+	// workspace. The seeded "work" account lives in the default workspace.
+	if err := m.SetMembership(manager.DefaultWorkspaceID, client.ID, manager.RoleMember); err != nil {
+		t.Fatalf("SetMembership() error = %v", err)
 	}
 	adminToken := "admin-token"
 	return &Server{Manager: m, CloudToken: adminToken}, m, adminToken, pat

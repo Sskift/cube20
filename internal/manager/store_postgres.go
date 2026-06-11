@@ -132,6 +132,23 @@ func (m *Manager) ensurePostgres() error {
 			value text NOT NULL DEFAULT '',
 			updated_at timestamptz NOT NULL DEFAULT now()
 		)`,
+		`CREATE TABLE IF NOT EXISTS cube_workspaces (
+			id text PRIMARY KEY,
+			name text NOT NULL DEFAULT '',
+			created_by text NOT NULL DEFAULT '',
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now()
+		)`,
+		`CREATE TABLE IF NOT EXISTS cube_memberships (
+			workspace_id text NOT NULL,
+			client_id text NOT NULL,
+			role text NOT NULL DEFAULT 'member',
+			created_at timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (workspace_id, client_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS cube_memberships_client_idx ON cube_memberships (client_id)`,
+		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS workspace_id text NOT NULL DEFAULT 'default'`,
+		`CREATE INDEX IF NOT EXISTS cube_accounts_workspace_idx ON cube_accounts (workspace_id)`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -149,7 +166,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 	}
 
 	state := normalizeState(State{Version: 1})
-	accountRows, err := db.QueryContext(ctx, `SELECT id, label, plan, status, codex_home, owner_mode, owner_client_id, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, created_at, updated_at, last_error, auth_json::text FROM cube_accounts ORDER BY id`)
+	accountRows, err := db.QueryContext(ctx, `SELECT id, label, plan, status, codex_home, workspace_id, owner_mode, owner_client_id, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, created_at, updated_at, last_error, auth_json::text FROM cube_accounts ORDER BY id`)
 	if err != nil {
 		return State{}, err
 	}
@@ -168,6 +185,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 			&account.Plan,
 			&statusText,
 			&account.CodexHome,
+			&account.WorkspaceID,
 			&ownerModeText,
 			&account.OwnerClientID,
 			&account.Generation,
@@ -191,6 +209,9 @@ func (m *Manager) loadPostgresState() (State, error) {
 		account.OwnerMode = AccountOwnerMode(ownerModeText)
 		if !validOwnerMode(account.OwnerMode) {
 			account.OwnerMode = OwnerCloud
+		}
+		if strings.TrimSpace(account.WorkspaceID) == "" {
+			account.WorkspaceID = DefaultWorkspaceID
 		}
 		if strings.TrimSpace(account.CodexHome) == "" {
 			account.CodexHome = filepath.Join(m.AccountsDir, account.ID)
@@ -236,6 +257,43 @@ func (m *Manager) loadPostgresState() (State, error) {
 		state.Clients = append(state.Clients, client)
 	}
 	if err := clientRows.Err(); err != nil {
+		return State{}, err
+	}
+
+	workspaceRows, err := db.QueryContext(ctx, `SELECT id, name, created_by, created_at, updated_at FROM cube_workspaces ORDER BY id`)
+	if err != nil {
+		return State{}, err
+	}
+	defer workspaceRows.Close()
+	for workspaceRows.Next() {
+		var ws Workspace
+		if err := workspaceRows.Scan(&ws.ID, &ws.Name, &ws.CreatedBy, &ws.CreatedAt, &ws.UpdatedAt); err != nil {
+			return State{}, err
+		}
+		state.Workspaces = append(state.Workspaces, ws)
+	}
+	if err := workspaceRows.Err(); err != nil {
+		return State{}, err
+	}
+
+	membershipRows, err := db.QueryContext(ctx, `SELECT workspace_id, client_id, role, created_at FROM cube_memberships ORDER BY workspace_id, client_id`)
+	if err != nil {
+		return State{}, err
+	}
+	defer membershipRows.Close()
+	for membershipRows.Next() {
+		var ms Membership
+		var roleText string
+		if err := membershipRows.Scan(&ms.WorkspaceID, &ms.ClientID, &roleText, &ms.CreatedAt); err != nil {
+			return State{}, err
+		}
+		ms.Role = WorkspaceRole(roleText)
+		if !validWorkspaceRole(ms.Role) {
+			ms.Role = RoleMember
+		}
+		state.Memberships = append(state.Memberships, ms)
+	}
+	if err := membershipRows.Err(); err != nil {
 		return State{}, err
 	}
 
@@ -289,6 +347,15 @@ func (m *Manager) loadPostgresState() (State, error) {
 	if err := quotaRows.Err(); err != nil {
 		return State{}, err
 	}
+
+	var migratedValue string
+	if err := db.QueryRowContext(ctx, `SELECT value FROM cube_meta WHERE key = 'workspace_migrated'`).Scan(&migratedValue); err != nil {
+		if err != sql.ErrNoRows {
+			return State{}, err
+		}
+	}
+	state.WorkspaceMigrated = migratedValue == "true"
+
 	return normalizeState(state), nil
 }
 func (m *Manager) savePostgresState(state State) error {
@@ -340,13 +407,14 @@ func (m *Manager) savePostgresState(state State) error {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_accounts
-			(id, label, plan, status, codex_home, owner_mode, owner_client_id, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, auth_json, created_at, updated_at, last_error)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18)
+			(id, label, plan, status, codex_home, workspace_id, owner_mode, owner_client_id, generation, lease_id, lease_client_id, lease_holder, lease_started_at, lease_heartbeat_at, lease_expires_at, auth_json, created_at, updated_at, last_error)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, $18, $19)
 			ON CONFLICT (id) DO UPDATE SET
 				label = EXCLUDED.label,
 				plan = EXCLUDED.plan,
 				status = EXCLUDED.status,
 				codex_home = EXCLUDED.codex_home,
+				workspace_id = EXCLUDED.workspace_id,
 				owner_mode = EXCLUDED.owner_mode,
 				owner_client_id = EXCLUDED.owner_client_id,
 				generation = EXCLUDED.generation,
@@ -365,6 +433,7 @@ func (m *Manager) savePostgresState(state State) error {
 			account.Plan,
 			string(account.Status),
 			account.CodexHome,
+			workspaceOrDefault(account.WorkspaceID),
 			string(account.OwnerMode),
 			account.OwnerClientID,
 			account.Generation,
@@ -414,6 +483,63 @@ func (m *Manager) savePostgresState(state State) error {
 			client.CreatedAt,
 			lastSeen,
 			revoked,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, ws := range state.Workspaces {
+		if strings.TrimSpace(ws.ID) == "" {
+			continue
+		}
+		if ws.CreatedAt.IsZero() {
+			ws.CreatedAt = now
+		}
+		if ws.UpdatedAt.IsZero() {
+			ws.UpdatedAt = now
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_workspaces
+			(id, name, created_by, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (id) DO UPDATE SET
+				name = EXCLUDED.name,
+				created_by = EXCLUDED.created_by,
+				updated_at = EXCLUDED.updated_at`,
+			ws.ID,
+			ws.Name,
+			ws.CreatedBy,
+			ws.CreatedAt,
+			ws.UpdatedAt,
+		); err != nil {
+			return err
+		}
+	}
+
+	// Memberships are upsert-only here, mirroring accounts and clients: a generic
+	// whole-state Save must never delete rows it merely didn't see in a possibly
+	// stale snapshot (TouchClient saves on every PAT request). Revocation goes
+	// through the dedicated deletePostgresMembership path instead, so a concurrent
+	// remove can't be resurrected by a racing save.
+	for _, ms := range state.Memberships {
+		if strings.TrimSpace(ms.WorkspaceID) == "" || strings.TrimSpace(ms.ClientID) == "" {
+			continue
+		}
+		role := ms.Role
+		if !validWorkspaceRole(role) {
+			role = RoleMember
+		}
+		if ms.CreatedAt.IsZero() {
+			ms.CreatedAt = now
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_memberships
+			(workspace_id, client_id, role, created_at)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (workspace_id, client_id) DO UPDATE SET
+				role = EXCLUDED.role`,
+			ms.WorkspaceID,
+			ms.ClientID,
+			string(role),
+			ms.CreatedAt,
 		); err != nil {
 			return err
 		}
@@ -551,6 +677,14 @@ func (m *Manager) savePostgresState(state State) error {
 			string(cache.Source),
 			cache.ReporterClientID,
 		); err != nil {
+			return err
+		}
+	}
+
+	if state.WorkspaceMigrated {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_meta (key, value, updated_at)
+			VALUES ('workspace_migrated', 'true', now())
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`); err != nil {
 			return err
 		}
 	}
@@ -802,6 +936,20 @@ func (m *Manager) deletePostgresAccount(id string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// deletePostgresMembership removes a single membership row directly, mirroring
+// deletePostgresAccount. Membership revocation must use this targeted delete
+// rather than relying on the generic upsert-only Save, which never removes rows.
+func (m *Manager) deletePostgresMembership(workspaceID, clientID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `DELETE FROM cube_memberships WHERE workspace_id = $1 AND client_id = $2`, workspaceID, clientID)
+	return err
 }
 
 // recordPostgresQuotaResult is the Postgres-mode counterpart of

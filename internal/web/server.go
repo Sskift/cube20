@@ -160,6 +160,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/sync/usage", sync(s.handleSyncUsage))
 	mux.HandleFunc("/api/sync/quota/", sync(s.handleSyncQuota))
 	mux.HandleFunc("/api/me", sync(s.handleMe))
+	mux.HandleFunc("/api/workspaces", sync(s.handleWorkspaces))
+	mux.HandleFunc("/api/workspaces/", sync(s.handleWorkspaceAction))
 	mux.HandleFunc("/api/clients", admin(s.handleClients))
 	mux.HandleFunc("/api/clients/", admin(s.handleClientAction))
 	mux.HandleFunc("/api/stats", admin(s.handleStats))
@@ -284,6 +286,13 @@ func clientPATSyncForbidden(r *http.Request) string {
 		return "client PATs can only upload quota reports; use an admin token to fetch quota"
 	case strings.HasPrefix(path, "/api/sync/pull/"):
 		return "client PATs cannot pull auth snapshots; use an admin token"
+	case path == "/api/workspaces":
+		// Members list their own workspaces (GET); POST is gated to the admin
+		// token inside the handler. Both are allowed past the PAT gate here.
+		return ""
+	case strings.HasPrefix(path, "/api/workspaces/"):
+		// Workspace member management; the handler enforces workspace-admin role.
+		return ""
 	default:
 		return "client PAT is not allowed to call this sync route"
 	}
@@ -352,7 +361,7 @@ func (s *Server) handleLBStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	status, err := s.Manager.LoadBalanceStatus()
+	status, err := s.Manager.LoadBalanceStatus(strings.TrimSpace(r.URL.Query().Get("workspace")))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -369,7 +378,7 @@ func (s *Server) handleLBReset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	status, err := s.Manager.LoadBalanceStatus()
+	status, err := s.Manager.LoadBalanceStatus(strings.TrimSpace(r.URL.Query().Get("workspace")))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -565,7 +574,12 @@ func (s *Server) handleSyncClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	auth := authFromRequest(r)
-	leaseSnapshot, err := s.Manager.ClaimLease(r.Context(), auth.ClientID, firstText(auth.ClientID, r.RemoteAddr), 90*time.Second)
+	workspaceID, err := s.Manager.ResolveWorkspaceForClient(auth.ClientID, strings.TrimSpace(r.URL.Query().Get("workspace")))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	leaseSnapshot, err := s.Manager.ClaimLease(r.Context(), auth.ClientID, firstText(auth.ClientID, r.RemoteAddr), workspaceID, 90*time.Second)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -582,6 +596,7 @@ func (s *Server) handleSyncLeases(w http.ResponseWriter, r *http.Request) {
 		ClientID   string `json:"clientId"`
 		Client     string `json:"client"`
 		Holder     string `json:"holder"`
+		Workspace  string `json:"workspace"`
 		TTLSeconds int    `json:"ttlSeconds"`
 	}
 	if r.Body != nil {
@@ -592,9 +607,15 @@ func (s *Server) handleSyncLeases(w http.ResponseWriter, r *http.Request) {
 	if clientID == "" {
 		clientID = strings.TrimSpace(body.ClientID)
 	}
+	requestedWS := firstText(strings.TrimSpace(body.Workspace), strings.TrimSpace(r.URL.Query().Get("workspace")))
+	workspaceID, err := s.Manager.ResolveWorkspaceForClient(clientID, requestedWS)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	holder := firstText(body.Holder, body.Client, clientID, r.RemoteAddr)
 	ttl := time.Duration(body.TTLSeconds) * time.Second
-	leaseSnapshot, err := s.Manager.ClaimLease(r.Context(), clientID, holder, ttl)
+	leaseSnapshot, err := s.Manager.ClaimLease(r.Context(), clientID, holder, workspaceID, ttl)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -736,6 +757,9 @@ func (s *Server) handleSyncUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	auth := authFromRequest(r)
+	if !s.requireAccountReportAccess(w, auth, body.AccountID) {
+		return
+	}
 	if err := s.Manager.RecordUsageWithContext(body.AccountID, auth.ClientID, body.LeaseID, body.RunID, body.Usage); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -777,6 +801,9 @@ func (s *Server) handleSyncQuota(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		auth := authFromRequest(r)
+		if !s.requireAccountReportAccess(w, auth, id) {
+			return
+		}
 		if err := s.Manager.RecordQuotaReport(id, result, auth.ClientID); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -945,10 +972,17 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	workspaces, err := s.Manager.ListWorkspacesForClient(auth.ClientID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"mode":         "client",
 		"admin":        false,
 		"client":       currentClient,
+		"workspaces":   workspaces,
 		"usage":        clientUsage,
 		"totals":       totals,
 		"refreshQueue": clientQueue,

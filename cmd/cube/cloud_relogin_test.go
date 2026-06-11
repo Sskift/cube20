@@ -58,9 +58,9 @@ func TestParseCloudReloginOptionsAuthFileMissingValue(t *testing.T) {
 func TestSanitizeAuthFileIDNoEscape(t *testing.T) {
 	cases := map[string]string{
 		"d4104449-6582-4e29": "d4104449-6582-4e29",
-		"../../etc/passwd":    "______etc_passwd",
-		"a/b\\c":              "a_b_c",
-		"":                    "account",
+		"../../etc/passwd":   "______etc_passwd",
+		"a/b\\c":             "a_b_c",
+		"":                   "account",
 	}
 	for in, want := range cases {
 		if got := sanitizeAuthFileID(in); got != want {

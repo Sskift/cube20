@@ -60,6 +60,7 @@ type Account struct {
 	Plan             string           `json:"plan"`
 	Status           AccountStatus    `json:"status"`
 	CodexHome        string           `json:"codexHome"`
+	WorkspaceID      string           `json:"workspaceId"`
 	OwnerMode        AccountOwnerMode `json:"ownerMode"`
 	OwnerClientID    string           `json:"ownerClientId,omitempty"`
 	Generation       int64            `json:"generation"`
@@ -103,12 +104,19 @@ type LeaseSnapshot struct {
 }
 
 type State struct {
-	Version    int                     `json:"version"`
-	Accounts   []Account               `json:"accounts"`
-	Clients    []Client                `json:"clients,omitempty"`
-	Usage      map[string]AccountUsage `json:"usage,omitempty"`
-	QuotaCache map[string]QuotaCache   `json:"quotaCache,omitempty"`
-	Dispatches []DispatchEvent         `json:"dispatches,omitempty"`
+	Version     int          `json:"version"`
+	Accounts    []Account    `json:"accounts"`
+	Clients     []Client     `json:"clients,omitempty"`
+	Workspaces  []Workspace  `json:"workspaces,omitempty"`
+	Memberships []Membership `json:"memberships,omitempty"`
+	// WorkspaceMigrated records that the one-time legacy flat-pool migration has
+	// already run, so it never re-enrolls clients created after the upgrade. It
+	// is set the first time migrateDefaultWorkspace runs and persisted alongside
+	// the rest of the state (a row in cube_meta on Postgres).
+	WorkspaceMigrated bool                    `json:"workspaceMigrated,omitempty"`
+	Usage             map[string]AccountUsage `json:"usage,omitempty"`
+	QuotaCache        map[string]QuotaCache   `json:"quotaCache,omitempty"`
+	Dispatches        []DispatchEvent         `json:"dispatches,omitempty"`
 }
 
 type Client struct {
@@ -127,6 +135,40 @@ type ClientView struct {
 	LastSeenAt time.Time  `json:"lastSeenAt,omitempty"`
 	RevokedAt  *time.Time `json:"revokedAt,omitempty"`
 	Active     bool       `json:"active"`
+}
+
+// WorkspaceRole is a member's role within a single workspace. Roles are stored
+// per-membership, so the same client can be an admin of one workspace and a
+// plain member of another.
+type WorkspaceRole string
+
+const (
+	RoleAdmin  WorkspaceRole = "admin"
+	RoleMember WorkspaceRole = "member"
+)
+
+// DefaultWorkspaceID is the pool every pre-workspace account and client is
+// migrated into. Requests that omit a workspace resolve here, so old clients
+// that predate the multi-tenant change keep working unchanged.
+const DefaultWorkspaceID = "default"
+
+// Workspace is an isolated account pool. Accounts belong to exactly one
+// workspace; load balancing, leases, and quota views are all scoped to it.
+type Workspace struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedBy string    `json:"createdBy,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// Membership links a client to a workspace with a role (many-to-many). A client
+// may hold memberships in several workspaces at once.
+type Membership struct {
+	WorkspaceID string        `json:"workspaceId"`
+	ClientID    string        `json:"clientId"`
+	Role        WorkspaceRole `json:"role"`
+	CreatedAt   time.Time     `json:"createdAt"`
 }
 
 type DispatchEvent struct {
@@ -324,6 +366,9 @@ func normalizeState(state State) State {
 		if !validOwnerMode(state.Accounts[i].OwnerMode) {
 			state.Accounts[i].OwnerMode = OwnerCloud
 		}
+		if strings.TrimSpace(state.Accounts[i].WorkspaceID) == "" {
+			state.Accounts[i].WorkspaceID = DefaultWorkspaceID
+		}
 		if state.Accounts[i].Generation < 0 {
 			state.Accounts[i].Generation = 0
 		}
@@ -331,6 +376,13 @@ func normalizeState(state State) State {
 	if state.Clients == nil {
 		state.Clients = []Client{}
 	}
+	if state.Workspaces == nil {
+		state.Workspaces = []Workspace{}
+	}
+	if state.Memberships == nil {
+		state.Memberships = []Membership{}
+	}
+	migrateDefaultWorkspace(&state)
 	if state.Usage == nil {
 		state.Usage = map[string]AccountUsage{}
 	}
@@ -350,6 +402,90 @@ func validOwnerMode(ownerMode AccountOwnerMode) bool {
 	default:
 		return false
 	}
+}
+
+func validWorkspaceRole(role WorkspaceRole) bool {
+	switch role {
+	case RoleAdmin, RoleMember:
+		return true
+	default:
+		return false
+	}
+}
+
+// workspaceOrDefault normalizes a possibly-empty workspace id to the default
+// pool, so a row never persists with an empty workspace_id.
+func workspaceOrDefault(id string) string {
+	if strings.TrimSpace(id) == "" {
+		return DefaultWorkspaceID
+	}
+	return id
+}
+
+// migrateDefaultWorkspace makes a pre-workspace state self-consistent without
+// capturing accounts/clients created after the upgrade. Two concerns:
+//
+//	(A) Always ensure the default workspace ROW exists when any account lives in
+//	    it — idempotent, safe on every Load.
+//	(B) ONE-TIME enroll of pre-workspace clients into the default pool. This runs
+//	    only while state.WorkspaceMigrated is false AND the raw state has the
+//	    legacy flat-pool signature (no workspaces, has accounts). The flag is then
+//	    set and persisted, so enrollment never re-fires for clients created after
+//	    the upgrade — even in the window before the first account exists.
+func migrateDefaultWorkspace(state *State) {
+	legacyFlatPool := !state.WorkspaceMigrated && len(state.Workspaces) == 0 && len(state.Accounts) > 0
+
+	// (A) Default workspace row for any account homed in it. Account workspace
+	// ids were already defaulted to DefaultWorkspaceID by normalizeState.
+	accountInDefault := false
+	for i := range state.Accounts {
+		if state.Accounts[i].WorkspaceID == DefaultWorkspaceID {
+			accountInDefault = true
+			break
+		}
+	}
+	if (accountInDefault || legacyFlatPool) && !hasWorkspace(state.Workspaces, DefaultWorkspaceID) {
+		now := time.Now()
+		state.Workspaces = append(state.Workspaces, Workspace{
+			ID:        DefaultWorkspaceID,
+			Name:      "Default",
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+	}
+
+	// (B) One-time legacy client enrollment.
+	if !legacyFlatPool {
+		return
+	}
+	existing := make(map[string]bool, len(state.Memberships))
+	for _, m := range state.Memberships {
+		existing[m.WorkspaceID+"\x00"+m.ClientID] = true
+	}
+	now := time.Now()
+	for _, client := range state.Clients {
+		key := DefaultWorkspaceID + "\x00" + client.ID
+		if existing[key] {
+			continue
+		}
+		state.Memberships = append(state.Memberships, Membership{
+			WorkspaceID: DefaultWorkspaceID,
+			ClientID:    client.ID,
+			Role:        RoleMember,
+			CreatedAt:   now,
+		})
+		existing[key] = true
+	}
+	state.WorkspaceMigrated = true
+}
+
+func hasWorkspace(workspaces []Workspace, id string) bool {
+	for i := range workspaces {
+		if workspaces[i].ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func validAccountStatus(status AccountStatus) bool {

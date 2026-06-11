@@ -87,7 +87,7 @@ func TestLoadBalanceStatusExcludesClientOwnedAccounts(t *testing.T) {
 		OwnerClientID: "client-1",
 	})
 
-	status, err := m.LoadBalanceStatus()
+	status, err := m.LoadBalanceStatus("")
 	if err != nil {
 		t.Fatalf("LoadBalanceStatus() error = %v", err)
 	}
@@ -116,7 +116,7 @@ func TestLoadBalanceStatusExcludesActiveLease(t *testing.T) {
 		LeaseExpiresAt:   time.Now().Add(time.Hour),
 	})
 
-	status, err := m.LoadBalanceStatus()
+	status, err := m.LoadBalanceStatus("")
 	if err != nil {
 		t.Fatalf("LoadBalanceStatus() error = %v", err)
 	}
@@ -142,7 +142,7 @@ func TestLoadBalanceStatusIncludesCloudOwnedReadyAccount(t *testing.T) {
 	})
 	saveTestQuota(t, m, "cloud-ready", 95, time.Now().Add(time.Hour))
 
-	status, err := m.LoadBalanceStatus()
+	status, err := m.LoadBalanceStatus("")
 	if err != nil {
 		t.Fatalf("LoadBalanceStatus() error = %v", err)
 	}
@@ -168,7 +168,7 @@ func TestLoadBalanceStatusExcludesExhaustedQuota(t *testing.T) {
 	})
 	saveTestQuota(t, m, "exhausted", 0, time.Now().Add(time.Hour))
 
-	status, err := m.LoadBalanceStatus()
+	status, err := m.LoadBalanceStatus("")
 	if err != nil {
 		t.Fatalf("LoadBalanceStatus() error = %v", err)
 	}
@@ -194,7 +194,7 @@ func TestClaimLeaseSkipsExhaustedQuota(t *testing.T) {
 	saveTestQuota(t, m, "exhausted", 0, time.Now().Add(time.Hour))
 	saveTestQuota(t, m, "available", 80, time.Now().Add(3*time.Hour))
 
-	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", time.Minute)
+	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", "", time.Minute)
 	if err != nil {
 		t.Fatalf("ClaimLease() error = %v", err)
 	}
@@ -212,7 +212,7 @@ func TestClaimLeaseWeightsQuotaNearReset(t *testing.T) {
 	saveTestQuota(t, m, "far-reset", 80, time.Now().Add(4*time.Hour))
 	saveTestQuota(t, m, "near-reset", 70, time.Now().Add(30*time.Minute))
 
-	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", time.Minute)
+	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", "", time.Minute)
 	if err != nil {
 		t.Fatalf("ClaimLease() error = %v", err)
 	}
@@ -233,7 +233,7 @@ func TestLoadBalanceStatusExcludesExhaustedSevenDayQuota(t *testing.T) {
 		100, time.Now().Add(time.Hour),
 		0, time.Now().Add(72*time.Hour))
 
-	status, err := m.LoadBalanceStatus()
+	status, err := m.LoadBalanceStatus("")
 	if err != nil {
 		t.Fatalf("LoadBalanceStatus() error = %v", err)
 	}
@@ -269,7 +269,7 @@ func TestClaimLeaseSkipsExhaustedSevenDayQuota(t *testing.T) {
 		80, time.Now().Add(3*time.Hour),
 		90, time.Now().Add(96*time.Hour))
 
-	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", time.Minute)
+	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", "", time.Minute)
 	if err != nil {
 		t.Fatalf("ClaimLease() error = %v", err)
 	}
@@ -289,7 +289,7 @@ func TestLoadBalanceStatusKeepsAccountFullOnBothWindows(t *testing.T) {
 		90, time.Now().Add(time.Hour),
 		80, time.Now().Add(72*time.Hour))
 
-	status, err := m.LoadBalanceStatus()
+	status, err := m.LoadBalanceStatus("")
 	if err != nil {
 		t.Fatalf("LoadBalanceStatus() error = %v", err)
 	}
@@ -310,7 +310,7 @@ func TestLoadBalanceStatusClientReportedNoSevenDayStaysEligible(t *testing.T) {
 	// Client-reported style: only a 5h window present, no 7d.
 	saveTestQuota(t, m, "client-only", 75, time.Now().Add(2*time.Hour))
 
-	status, err := m.LoadBalanceStatus()
+	status, err := m.LoadBalanceStatus("")
 	if err != nil {
 		t.Fatalf("LoadBalanceStatus() error = %v", err)
 	}
@@ -331,7 +331,7 @@ func TestDispatchHistoryRecordsClaimAndRelease(t *testing.T) {
 		t.Fatalf("CreateClient() error = %v", err)
 	}
 
-	lease, err := m.ClaimLease(context.Background(), "client-liushiao-local", "liushiao-local", time.Minute)
+	lease, err := m.ClaimLease(context.Background(), "client-liushiao-local", "liushiao-local", "", time.Minute)
 	if err != nil {
 		t.Fatalf("ClaimLease() error = %v", err)
 	}

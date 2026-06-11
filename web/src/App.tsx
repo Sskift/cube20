@@ -187,6 +187,19 @@ export default function App() {
         </div>
       </div>
       <div className="cube-navbar-actions flex shrink-0 items-center gap-1.5 sm:gap-2">
+        <select
+          aria-label={t("工作区", "Workspace")}
+          className="hidden h-8 max-w-[10rem] rounded-md border border-slate-200 bg-surface px-2 text-sm text-slate-700 shadow-sm outline-none focus:border-slate-400 min-[820px]:inline-flex"
+          value={data.selectedWorkspace}
+          onChange={(event) => data.setSelectedWorkspace(event.currentTarget.value)}
+        >
+          <option value="">{t("全部工作区", "All workspaces")}</option>
+          {data.workspaces.map((ws) => (
+            <option key={ws.id} value={ws.id}>
+              {ws.name || ws.id}
+            </option>
+          ))}
+        </select>
         <Chip className="hidden min-[900px]:inline-flex" color={data.meta?.liveAuthPresent ? "success" : "warning"} size="sm" variant="soft">
           {t("本地凭据", "live auth")} {data.meta?.liveAuthPresent ? t("就绪", "ready") : t("缺失", "missing")}
         </Chip>

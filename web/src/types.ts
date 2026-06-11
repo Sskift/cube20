@@ -15,6 +15,7 @@ export interface Account {
   plan: string;
   status: AccountStatus;
   codexHome: string;
+  workspaceId?: string;
   ownerMode?: AccountOwnerMode;
   ownerClientId?: string;
   generation?: number;
@@ -105,6 +106,30 @@ export interface Client {
   active: boolean;
 }
 
+export type WorkspaceRole = "admin" | "member";
+
+export interface Workspace {
+  id: string;
+  name: string;
+  createdBy?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Mirrors manager.WorkspaceMembershipView: a workspace plus the requesting
+// client's role in it (returned by GET /api/workspaces for non-admins and in
+// /api/me).
+export interface WorkspaceMembershipView extends Workspace {
+  role: WorkspaceRole;
+}
+
+export interface Membership {
+  workspaceId: string;
+  clientId: string;
+  role: WorkspaceRole;
+  createdAt: string;
+}
+
 export interface RefreshQueueItem {
   accountId: string;
   label: string;
@@ -144,6 +169,7 @@ export interface LoadBalanceAccount {
   configPresent: boolean;
   active: boolean;
   codexHome: string;
+  workspaceId?: string;
   ownerMode?: AccountOwnerMode;
   ownerClientId?: string;
   generation?: number;

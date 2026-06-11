@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -16,6 +17,7 @@ type LoadBalanceAccount struct {
 	ConfigPresent                 bool             `json:"configPresent"`
 	Active                        bool             `json:"active"`
 	CodexHome                     string           `json:"codexHome"`
+	WorkspaceID                   string           `json:"workspaceId,omitempty"`
 	OwnerMode                     AccountOwnerMode `json:"ownerMode"`
 	OwnerClientID                 string           `json:"ownerClientId,omitempty"`
 	Generation                    int64            `json:"generation"`
@@ -46,7 +48,10 @@ type LoadBalanceStatus struct {
 	Excluded      []LoadBalanceAccount `json:"excluded"`
 }
 
-func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
+// LoadBalanceStatus reports pool eligibility. workspaceID scopes the view to a
+// single pool; an empty workspaceID returns every account across all pools (the
+// platform-wide admin view).
+func (m *Manager) LoadBalanceStatus(workspaceID string) (LoadBalanceStatus, error) {
 	roundRobin, err := m.loadRoundRobinState()
 	if err != nil {
 		return LoadBalanceStatus{}, err
@@ -68,7 +73,11 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 		Eligible:      []LoadBalanceAccount{},
 		Excluded:      []LoadBalanceAccount{},
 	}
+	workspaceID = strings.TrimSpace(workspaceID)
 	for _, account := range accounts {
+		if workspaceID != "" && workspaceOrDefault(account.WorkspaceID) != workspaceID {
+			continue
+		}
 		entry := LoadBalanceAccount{
 			ID:             account.ID,
 			Label:          account.Label,
@@ -77,6 +86,7 @@ func (m *Manager) LoadBalanceStatus() (LoadBalanceStatus, error) {
 			ConfigPresent:  account.ConfigPresent,
 			Active:         account.Active,
 			CodexHome:      account.CodexHome,
+			WorkspaceID:    workspaceOrDefault(account.WorkspaceID),
 			OwnerMode:      account.OwnerMode,
 			OwnerClientID:  account.OwnerClientID,
 			Generation:     account.Generation,

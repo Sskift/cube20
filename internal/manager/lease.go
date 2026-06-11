@@ -76,7 +76,12 @@ func (m *Manager) SelectAccountForRun() (AccountView, error) {
 	}
 	return selected.account, nil
 }
-func (m *Manager) ClaimLease(ctx context.Context, clientID, holder string, ttl time.Duration) (LeaseSnapshot, error) {
+
+// ClaimLease leases the best available account. workspaceID scopes selection to
+// a single pool; an empty workspaceID considers every account (used by internal
+// callers and tests). Web callers always pass a concrete workspace so a member
+// can never lease an account from a pool they do not belong to.
+func (m *Manager) ClaimLease(ctx context.Context, clientID, holder, workspaceID string, ttl time.Duration) (LeaseSnapshot, error) {
 	// RecoverExpiredLeases takes stateMu itself and performs a network quota
 	// re-probe with NO lock held, so it must run BEFORE we take stateMu here;
 	// taking stateMu first would deadlock (stateMu is not reentrant) and would
@@ -109,7 +114,11 @@ func (m *Manager) ClaimLease(ctx context.Context, clientID, holder string, ttl t
 		score   float64
 	}
 	available := []candidate{}
+	workspaceID = strings.TrimSpace(workspaceID)
 	for i, account := range state.Accounts {
+		if workspaceID != "" && workspaceOrDefault(account.WorkspaceID) != workspaceID {
+			continue
+		}
 		evaluation := loadBalanceEligibilityForAccount(account, m.accountAuthPresent(account), state.QuotaCache[account.ID], now)
 		if !evaluation.Eligible {
 			continue

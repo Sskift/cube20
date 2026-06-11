@@ -71,6 +71,8 @@ func run(args []string) error {
 		return runCloud(m, args[1:])
 	case "clients":
 		return runClients(m, args[1:])
+	case "workspace", "workspaces":
+		return runWorkspace(m, args[1:])
 	case "report":
 		return runReport(m, args[1:])
 	case "dashboard":
@@ -136,10 +138,11 @@ func splitArgs(input string) []string {
 }
 
 type cloudSyncOptions struct {
-	Server   string
-	Token    string
-	Client   string
-	Interval time.Duration
+	Server    string
+	Token     string
+	Client    string
+	Workspace string
+	Interval  time.Duration
 }
 
 func runCloud(m *manager.Manager, args []string) error {
@@ -287,6 +290,9 @@ func defaultCloudSyncOptions(m *manager.Manager) cloudSyncOptions {
 	}
 	if value := strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")); value != "" {
 		opts.Token = value
+	}
+	if value := strings.TrimSpace(os.Getenv("CUBE_WORKSPACE")); value != "" {
+		opts.Workspace = value
 	}
 	if host, err := os.Hostname(); err == nil {
 		opts.Client = host
@@ -556,6 +562,12 @@ func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, 
 			}
 			opts.Client = strings.TrimSpace(args[i+1])
 			i++
+		case "--workspace":
+			if i+1 >= len(args) {
+				return opts, nil, fmt.Errorf("missing value for --workspace")
+			}
+			opts.Workspace = strings.TrimSpace(args[i+1])
+			i++
 		case "--heartbeat", "--interval":
 			if i+1 >= len(args) {
 				return opts, nil, fmt.Errorf("missing value for %s", args[i])
@@ -586,9 +598,11 @@ func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, 
 func claimLeaseSnapshot(ctx context.Context, opts cloudSyncOptions) (manager.LeaseSnapshot, error) {
 	body := struct {
 		Client     string `json:"client"`
+		Workspace  string `json:"workspace,omitempty"`
 		TTLSeconds int    `json:"ttlSeconds"`
 	}{
 		Client:     opts.Client,
+		Workspace:  opts.Workspace,
 		TTLSeconds: leaseTTLSeconds(opts),
 	}
 	var leaseSnapshot manager.LeaseSnapshot
@@ -1188,12 +1202,18 @@ func printHelp() {
 	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...>")
 	fmt.Println("  cube cloud quota <account-id>")
 	fmt.Println("  cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]")
-	fmt.Println("  cube run [--server <url>] [--token <token>] [--heartbeat 20s] [-- codex args...]")
+	fmt.Println("  cube run [--server <url>] [--token <token>] [--workspace <id>] [--heartbeat 20s] [-- codex args...]")
 	fmt.Println("  cube report [--daemon] [--interval 5m]")
 	fmt.Println("  cube config edit")
 	fmt.Println("  cube config path")
 	fmt.Println("  cube clients list")
 	fmt.Println("  cube clients create [label]")
 	fmt.Println("  cube clients revoke <client-id>")
+	fmt.Println("  cube workspace list")
+	fmt.Println("  cube workspace create <name>")
+	fmt.Println("  cube workspace members <workspace-id>")
+	fmt.Println("  cube workspace invite <workspace-id> <client-id> [--role admin|member]")
+	fmt.Println("  cube workspace grant-admin <workspace-id> <client-id>")
+	fmt.Println("  cube workspace remove <workspace-id> <client-id>")
 	fmt.Println("  cube dashboard [--host 127.0.0.1] [--port 8720] [--cloud-token <admin-token>] [--quota-refresh-interval 5m]")
 }

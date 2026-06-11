@@ -11,11 +11,14 @@ import type {
   Client,
   DispatchEvent,
   LoadBalanceStatus,
+  Membership,
   Meta,
   PersonalPayload,
   QuotaResult,
   RefreshQueueItem,
   TranslateFn,
+  Workspace,
+  WorkspaceRole,
 } from "../types";
 
 export interface AccountDraft {
@@ -36,6 +39,9 @@ export function useDashboardData(t: TranslateFn) {
   const [selectedId, setSelectedId] = useState("");
   const [quotas, setQuotas] = useState<Record<string, QuotaResult>>({});
   const [clients, setClients] = useState<Client[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  // Empty string = "all pools" (the platform-wide admin view).
+  const [selectedWorkspace, setSelectedWorkspace] = useState("");
   const [refreshQueue, setRefreshQueue] = useState<RefreshQueueItem[]>([]);
   const [dispatches, setDispatches] = useState<DispatchEvent[]>([]);
   const [personal, setPersonal] = useState<PersonalPayload | null>(null);
@@ -57,12 +63,14 @@ export function useDashboardData(t: TranslateFn) {
     async (preferredId?: string) => {
       setLoading(true);
       try {
-        const [metaData, accountData, lbData, clientData, queueData] = await Promise.all([
+        const wsQuery = selectedWorkspace ? `?workspace=${encodeURIComponent(selectedWorkspace)}` : "";
+        const [metaData, accountData, lbData, clientData, queueData, workspaceData] = await Promise.all([
           apiJSON<Meta>("/api/meta"),
           apiJSON<Account[]>("/api/accounts"),
-          apiJSON<LoadBalanceStatus>("/api/lb/status"),
+          apiJSON<LoadBalanceStatus>(`/api/lb/status${wsQuery}`),
           apiJSON<Client[]>("/api/clients"),
           apiJSON<RefreshQueueItem[]>("/api/refresh-queue"),
+          apiJSON<{ workspaces: Workspace[] }>("/api/workspaces"),
         ]);
         const dispatchData = await apiJSON<DispatchEvent[]>("/api/dispatches?limit=80");
         setMeta(metaData);
@@ -70,6 +78,7 @@ export function useDashboardData(t: TranslateFn) {
         setLB(lbData);
         setClients(clientData);
         setRefreshQueue(queueData);
+        setWorkspaces(workspaceData.workspaces || []);
         setDispatches(dispatchData);
         setSelectedId((current) => {
           const target = preferredId ?? current;
@@ -90,7 +99,7 @@ export function useDashboardData(t: TranslateFn) {
         setLoading(false);
       }
     },
-    [loadPersonal, t],
+    [loadPersonal, selectedWorkspace, t],
   );
 
   const fetchQuota = useCallback(
@@ -227,6 +236,51 @@ export function useDashboardData(t: TranslateFn) {
     [withBusy, loadAll, t],
   );
 
+  // ---- Workspace actions --------------------------------------------------
+  const createWorkspace = useCallback(
+    (name: string) =>
+      withBusy(async () => {
+        const ws = await apiJSON<Workspace>("/api/workspaces", {
+          method: "POST",
+          body: JSON.stringify({ name }),
+        });
+        setMessage(`${t("已创建工作区", "Workspace created")} ${ws.id}`);
+        await loadAll();
+      }),
+    [withBusy, loadAll, t],
+  );
+
+  const listMembers = useCallback(async (workspaceId: string) => {
+    const resp = await apiJSON<{ members: Membership[] }>(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/members`,
+    );
+    return resp.members || [];
+  }, []);
+
+  const setMember = useCallback(
+    (workspaceId: string, clientId: string, role: WorkspaceRole) =>
+      withBusy(async () => {
+        await apiJSON(`/api/workspaces/${encodeURIComponent(workspaceId)}/members`, {
+          method: "POST",
+          body: JSON.stringify({ clientId, role }),
+        });
+        setMessage(`${t("成员已更新", "Member updated")} ${clientId}`);
+      }),
+    [withBusy, t],
+  );
+
+  const removeMember = useCallback(
+    (workspaceId: string, clientId: string) =>
+      withBusy(async () => {
+        await apiJSON(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(clientId)}`,
+          { method: "DELETE" },
+        );
+        setMessage(`${t("成员已移除", "Member removed")} ${clientId}`);
+      }),
+    [withBusy, t],
+  );
+
   const applyToken = useCallback(
     async (token: string) => {
       saveCloudToken(token);
@@ -282,6 +336,7 @@ export function useDashboardData(t: TranslateFn) {
     lb,
     quotas,
     clients,
+    workspaces,
     refreshQueue,
     dispatches,
     personal,
@@ -289,6 +344,8 @@ export function useDashboardData(t: TranslateFn) {
     // ui-ish shared state
     selectedId,
     setSelectedId,
+    selectedWorkspace,
+    setSelectedWorkspace,
     message,
     setMessage,
     loading,
@@ -302,6 +359,10 @@ export function useDashboardData(t: TranslateFn) {
     uploadFiles,
     createClient,
     revokeClient,
+    createWorkspace,
+    listMembers,
+    setMember,
+    removeMember,
     applyToken,
     clearToken,
     // derived
