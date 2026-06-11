@@ -159,7 +159,7 @@ func runCloud(m *manager.Manager, args []string) error {
 	case "relogin":
 		return runCloudRelogin(m, args[1:])
 	default:
-		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token>|quota <account-id>|relogin <account-id> [--status ready|drain] [--owner cloud|client]]")
+		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token>|quota <account-id>|relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]]")
 	}
 }
 
@@ -1187,7 +1187,7 @@ func printHelp() {
 	fmt.Println("  cube cloud status")
 	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...>")
 	fmt.Println("  cube cloud quota <account-id>")
-	fmt.Println("  cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client]")
+	fmt.Println("  cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]")
 	fmt.Println("  cube run [--server <url>] [--token <token>] [--heartbeat 20s] [-- codex args...]")
 	fmt.Println("  cube report [--daemon] [--interval 5m]")
 	fmt.Println("  cube config edit")

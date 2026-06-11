@@ -22,6 +22,7 @@ type cloudReloginOptions struct {
 	AccountID string
 	Status    manager.AccountStatus
 	Owner     manager.AccountOwnerMode
+	AuthFile  string // when set, skip `codex login` and upload this auth.json
 }
 
 func runCloudRelogin(m *manager.Manager, args []string) error {
@@ -44,25 +45,40 @@ func runCloudRelogin(m *manager.Manager, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	codexHome, err := os.MkdirTemp("", "cube20-relogin-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(codexHome)
+	var authRaw json.RawMessage
 
-	fmt.Fprintf(os.Stderr, "cube: logging in %s with temporary CODEX_HOME\n", relogin.AccountID)
-	if err := runDeviceLogin(codexHome); err != nil {
-		if ctx.Err() != nil {
-			// User interrupted the login; exit cleanly (temp dir already cleaned
-			// up by the deferred RemoveAll).
-			return ctx.Err()
+	// --auth-file skips the interactive login entirely and re-uses an existing
+	// auth.json. This is the recovery path: when a previous relogin logged in
+	// successfully but failed to upload (e.g. a client PAT hitting the admin-only
+	// /api/sync/push, or a transient network error), the credential was saved to
+	// disk and can be re-pushed with a proper token — no second browser round.
+	if relogin.AuthFile != "" {
+		authRaw, err = readAuthFile(relogin.AuthFile)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("codex login failed: %w", err)
-	}
+		fmt.Fprintf(os.Stderr, "cube: uploading %s from %s (skipping codex login)\n", relogin.AccountID, relogin.AuthFile)
+	} else {
+		codexHome, err := os.MkdirTemp("", "cube20-relogin-*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(codexHome)
 
-	authRaw, err := readTempAuth(codexHome)
-	if err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "cube: logging in %s with temporary CODEX_HOME\n", relogin.AccountID)
+		if err := runDeviceLogin(codexHome); err != nil {
+			if ctx.Err() != nil {
+				// User interrupted the login; exit cleanly (temp dir already
+				// cleaned up by the deferred RemoveAll).
+				return ctx.Err()
+			}
+			return fmt.Errorf("codex login failed: %w", err)
+		}
+
+		authRaw, err = readTempAuth(codexHome)
+		if err != nil {
+			return err
+		}
 	}
 
 	snapshot := manager.ProfileSnapshot{
@@ -76,12 +92,29 @@ func runCloudRelogin(m *manager.Manager, args []string) error {
 
 	var account manager.AccountView
 	if err := cloudJSON(ctx, http.MethodPost, opts, "/api/sync/push", snapshot, &account); err != nil {
-		if strings.Contains(err.Error(), "403") || strings.Contains(strings.ToLower(err.Error()), "forbidden") {
-			return fmt.Errorf("upload failed: %w; cloud relogin replaces stored auth and requires an admin token", err)
+		// The login already succeeded and the credential is in memory; persist it
+		// so the user can retry the upload (with a proper token) instead of
+		// re-running the whole browser login. Skip when we read it from a file —
+		// it is already safely on disk at relogin.AuthFile.
+		hint := ""
+		if relogin.AuthFile == "" {
+			if saved, saveErr := saveRecoveredAuth(m, relogin.AccountID, authRaw); saveErr == nil {
+				hint = fmt.Sprintf("\n  credential saved to %s\n  retry without re-login: cube cloud relogin %s --auth-file %s --status %s --owner %s",
+					saved, relogin.AccountID, saved, relogin.Status, relogin.Owner)
+			} else {
+				fmt.Fprintf(os.Stderr, "cube: warning: could not save recovered credential: %v\n", saveErr)
+			}
 		}
-		return fmt.Errorf("upload failed: %w", err)
+		if strings.Contains(err.Error(), "403") || strings.Contains(strings.ToLower(err.Error()), "forbidden") {
+			return fmt.Errorf("upload failed: %w; cloud relogin replaces stored auth and requires an admin token%s", err, hint)
+		}
+		return fmt.Errorf("upload failed: %w%s", err, hint)
 	}
 	fmt.Printf("uploaded %s owner=%s status=%s\n", account.ID, account.OwnerMode, account.Status)
+
+	// Upload succeeded: drop any stale recovered credential for this account so a
+	// real secret does not linger on disk after it is no longer needed.
+	removeRecoveredAuth(m, relogin.AccountID)
 
 	var result quota.Result
 	if err := cloudJSON(ctx, http.MethodGet, opts, "/api/sync/quota/"+url.PathEscape(relogin.AccountID), nil, &result); err != nil {
@@ -90,6 +123,52 @@ func runCloudRelogin(m *manager.Manager, args []string) error {
 	printQuotaResult(result)
 	printReloginNextStep(relogin, result)
 	return nil
+}
+
+// recoveredAuthPath is where a successfully-logged-in but not-yet-uploaded
+// credential is parked so it can be retried without a second browser login.
+func recoveredAuthPath(m *manager.Manager, accountID string) string {
+	return filepath.Join(m.StateDir, "recovered-auth-"+sanitizeAuthFileID(accountID)+".json")
+}
+
+// sanitizeAuthFileID keeps the recovered-auth filename to a safe charset so an
+// account ID can never escape m.StateDir via path separators.
+func sanitizeAuthFileID(id string) string {
+	mapped := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, id)
+	if mapped == "" {
+		return "account"
+	}
+	return mapped
+}
+
+func saveRecoveredAuth(m *manager.Manager, accountID string, authRaw json.RawMessage) (string, error) {
+	path := recoveredAuthPath(m, accountID)
+	if err := os.WriteFile(path, authRaw, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func removeRecoveredAuth(m *manager.Manager, accountID string) {
+	_ = os.Remove(recoveredAuthPath(m, accountID))
+}
+
+func readAuthFile(path string) (json.RawMessage, error) {
+	authRaw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not read auth file %s: %w", path, err)
+	}
+	if !json.Valid(authRaw) {
+		return nil, fmt.Errorf("auth file %s is not valid JSON", path)
+	}
+	return json.RawMessage(authRaw), nil
 }
 
 func parseCloudReloginOptions(args []string) (cloudReloginOptions, error) {
@@ -124,6 +203,12 @@ func parseCloudReloginOptions(args []string) (cloudReloginOptions, error) {
 				return opts, fmt.Errorf("--owner must be cloud or client")
 			}
 			i++
+		case "--auth-file":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing value for --auth-file")
+			}
+			opts.AuthFile = strings.TrimSpace(args[i+1])
+			i++
 		default:
 			if strings.HasPrefix(args[i], "--") {
 				return opts, fmt.Errorf("unknown relogin flag %q", args[i])
@@ -132,7 +217,7 @@ func parseCloudReloginOptions(args []string) (cloudReloginOptions, error) {
 		}
 	}
 	if len(ids) != 1 || ids[0] == "" {
-		return opts, fmt.Errorf("usage: cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client]")
+		return opts, fmt.Errorf("usage: cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]")
 	}
 	opts.AccountID = ids[0]
 	return opts, nil
