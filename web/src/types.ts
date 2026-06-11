@@ -217,4 +217,4 @@ export interface PersonalPayload {
 }
 
 export type AccessMode = "unknown" | "admin" | "personal";
-export type DashboardView = "accounts" | "load-balancer" | "people" | "import" | "overview";
+export type DashboardView = "accounts" | "load-balancer" | "people" | "import" | "overview" | "workspaces";

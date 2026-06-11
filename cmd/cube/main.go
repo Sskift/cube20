@@ -700,11 +700,12 @@ func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapsh
 
 func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, accountID, codexHome string) (manager.Lease, bool, error) {
 	body := struct {
-		AccountID        string        `json:"accountId"`
-		Client           string        `json:"client"`
-		TTLSeconds       int           `json:"ttlSeconds"`
-		FiveHour         *quota.Window `json:"fiveHour,omitempty"`
-		RateLimitReached bool          `json:"rateLimitReached,omitempty"`
+		AccountID        string         `json:"accountId"`
+		Client           string         `json:"client"`
+		TTLSeconds       int            `json:"ttlSeconds"`
+		FiveHour         *quota.Window  `json:"fiveHour,omitempty"`
+		Quotas           []quota.Window `json:"quotas,omitempty"`
+		RateLimitReached bool           `json:"rateLimitReached,omitempty"`
 	}{
 		AccountID:  accountID,
 		Client:     opts.Client,
@@ -712,6 +713,7 @@ func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, account
 	}
 	rl := usage.LatestRateLimits(codexHome)
 	body.FiveHour = rateLimitsToWindow(rl)
+	body.Quotas = rateLimitsToWindows(rl)
 	body.RateLimitReached = rl.ReachedType != ""
 
 	var resp struct {
@@ -835,6 +837,35 @@ func rateLimitsToWindow(rl usage.RateLimits) *quota.Window {
 		RemainingPercent: 100 - rl.FiveHourUsedPercent,
 		ResetsAt:         resetsAt,
 	}
+}
+
+// rateLimitsToWindows builds the full set of quota windows the client knows about
+// from its parsed rate-limit record: always the 5h window, plus the 7d window
+// when the secondary limit was present. The cloud relies entirely on these
+// client reports during a lease (it does not probe quota itself), so reporting
+// both windows keeps the binding-window model accurate while an account is held.
+func rateLimitsToWindows(rl usage.RateLimits) []quota.Window {
+	if !rl.Found {
+		return nil
+	}
+	windows := []quota.Window{}
+	if w := rateLimitsToWindow(rl); w != nil {
+		windows = append(windows, *w)
+	}
+	if !rl.SevenDayResetsAt.IsZero() || rl.SevenDayUsedPercent > 0 {
+		sevenReset := ""
+		if !rl.SevenDayResetsAt.IsZero() {
+			sevenReset = rl.SevenDayResetsAt.Format(time.RFC3339)
+		}
+		windows = append(windows, quota.Window{
+			Key:              "seven_day",
+			Label:            "7d",
+			UsedPercent:      rl.SevenDayUsedPercent,
+			RemainingPercent: 100 - rl.SevenDayUsedPercent,
+			ResetsAt:         sevenReset,
+		})
+	}
+	return windows
 }
 
 // scrubAuth removes the leased credentials (auth.json and the config.toml
@@ -1087,7 +1118,12 @@ func cloudJSON(ctx context.Context, method string, opts cloudSyncOptions, path s
 func runDashboard(m *manager.Manager, args []string) error {
 	host := "127.0.0.1"
 	port := 8720
-	quotaRefreshInterval := 5 * time.Minute
+	// Quota is client-driven: members running `cube run` report their 5h/7d
+	// windows on every lease heartbeat, and the cloud persists those. The cloud
+	// does NOT probe quota itself by default (interval 0 = worker off). Operators
+	// can still opt into background cloud probing with --quota-refresh-interval or
+	// CUBE_QUOTA_REFRESH_INTERVAL if they want the old self-refresh behavior.
+	quotaRefreshInterval := time.Duration(0)
 	cloudToken := strings.TrimSpace(m.CloudToken)
 	if value := strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")); value != "" {
 		cloudToken = value

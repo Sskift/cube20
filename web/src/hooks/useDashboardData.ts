@@ -281,6 +281,19 @@ export function useDashboardData(t: TranslateFn) {
     [withBusy, t],
   );
 
+  const setAccountWorkspace = useCallback(
+    (accountId: string, workspaceId: string) =>
+      withBusy(async () => {
+        await apiJSON(`/api/accounts/${encodeURIComponent(accountId)}/workspace`, {
+          method: "PATCH",
+          body: JSON.stringify({ workspaceId }),
+        });
+        setMessage(t("账号已移动", "Account moved"));
+        await loadAll();
+      }),
+    [withBusy, loadAll, t],
+  );
+
   const applyToken = useCallback(
     async (token: string) => {
       saveCloudToken(token);
@@ -363,6 +376,7 @@ export function useDashboardData(t: TranslateFn) {
     listMembers,
     setMember,
     removeMember,
+    setAccountWorkspace,
     applyToken,
     clearToken,
     // derived

@@ -637,12 +637,13 @@ type heartbeatResponse struct {
 // window (best-effort), refreshes the lease, and returns a swap hint.
 func (s *Server) heartbeatLease(w http.ResponseWriter, r *http.Request, leaseID string, auth requestAuth) {
 	var body struct {
-		AccountID        string        `json:"accountId"`
-		Client           string        `json:"client"`
-		Holder           string        `json:"holder"`
-		TTLSeconds       int           `json:"ttlSeconds"`
-		FiveHour         *quota.Window `json:"fiveHour"`
-		RateLimitReached bool          `json:"rateLimitReached"`
+		AccountID        string         `json:"accountId"`
+		Client           string         `json:"client"`
+		Holder           string         `json:"holder"`
+		TTLSeconds       int            `json:"ttlSeconds"`
+		FiveHour         *quota.Window  `json:"fiveHour"`
+		Quotas           []quota.Window `json:"quotas"`
+		RateLimitReached bool           `json:"rateLimitReached"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
@@ -650,13 +651,20 @@ func (s *Server) heartbeatLease(w http.ResponseWriter, r *http.Request, leaseID 
 	ttl := time.Duration(body.TTLSeconds) * time.Second
 	accountID := strings.TrimSpace(body.AccountID)
 
-	// Best-effort: persist the client-reported 5h window without flipping the
-	// account's owner mode. A failed report (e.g. the lease just expired) must
-	// never break the heartbeat itself, so we ignore the error and proceed.
-	if body.FiveHour != nil {
+	// Best-effort: persist the client-reported quota windows without flipping the
+	// account's owner mode. Newer clients send the full window set in Quotas
+	// (5h + 7d); older clients send only FiveHour. The cloud does not probe quota
+	// itself during a lease, so these reports are the sole source of truth while
+	// an account is held. A failed report (e.g. the lease just expired) must never
+	// break the heartbeat, so we ignore the error and proceed.
+	windows := body.Quotas
+	if len(windows) == 0 && body.FiveHour != nil {
+		windows = []quota.Window{*body.FiveHour}
+	}
+	if len(windows) > 0 {
 		result := quota.Result{
 			Status: quota.StatusSupported,
-			Quotas: []quota.Window{*body.FiveHour},
+			Quotas: windows,
 		}
 		_ = s.Manager.RecordLeasedQuota(accountID, leaseID, auth.ClientID, result, time.Now())
 	}
@@ -1131,6 +1139,23 @@ func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": string(body.Status)})
+	case "workspace":
+		if r.Method != http.MethodPatch {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var body struct {
+			WorkspaceID string `json:"workspaceId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		if err := s.Manager.SetAccountWorkspace(id, body.WorkspaceID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"workspaceId": body.WorkspaceID})
 	case "owner":
 		if r.Method != http.MethodPatch {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")

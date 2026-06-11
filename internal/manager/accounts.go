@@ -528,6 +528,30 @@ func (m *Manager) SetStatus(id string, status AccountStatus) error {
 	}
 	return fmt.Errorf("account %q not found", id)
 }
+
+// SetAccountWorkspace moves an account into a different pool. The target
+// workspace must exist; an empty id resolves to the default pool.
+func (m *Manager) SetAccountWorkspace(id, workspaceID string) error {
+	workspaceID = workspaceOrDefault(workspaceID)
+
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	if !workspaceExists(state, workspaceID) {
+		return fmt.Errorf("workspace %q not found", workspaceID)
+	}
+	for i := range state.Accounts {
+		if state.Accounts[i].ID == id {
+			state.Accounts[i].WorkspaceID = workspaceID
+			state.Accounts[i].UpdatedAt = time.Now()
+			return m.Save(state)
+		}
+	}
+	return fmt.Errorf("account %q not found", id)
+}
 func (m *Manager) SetLabel(id, label string) error {
 	label = strings.TrimSpace(label)
 	m.stateMu.Lock()

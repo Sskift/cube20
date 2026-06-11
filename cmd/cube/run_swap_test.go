@@ -189,3 +189,40 @@ func TestStableRunHomeCreates(t *testing.T) {
 		t.Fatalf("expected distinct run homes, got %q twice", first)
 	}
 }
+
+func TestRateLimitsToWindowsBothWindows(t *testing.T) {
+	if ws := rateLimitsToWindows(usage.RateLimits{Found: false}); ws != nil {
+		t.Fatalf("expected nil when Found=false, got %+v", ws)
+	}
+
+	fiveReset := time.Date(2026, 6, 11, 12, 0, 0, 0, time.UTC)
+	sevenReset := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
+	ws := rateLimitsToWindows(usage.RateLimits{
+		Found:               true,
+		FiveHourUsedPercent: 30,
+		FiveHourResetsAt:    fiveReset,
+		SevenDayUsedPercent: 10,
+		SevenDayResetsAt:    sevenReset,
+	})
+	if len(ws) != 2 {
+		t.Fatalf("expected 2 windows (5h+7d), got %d: %+v", len(ws), ws)
+	}
+	byKey := map[string]float64{}
+	for _, w := range ws {
+		byKey[w.Key] = w.RemainingPercent
+	}
+	if byKey["five_hour"] != 70 {
+		t.Errorf("5h remaining = %v, want 70", byKey["five_hour"])
+	}
+	if byKey["seven_day"] != 90 {
+		t.Errorf("7d remaining = %v, want 90", byKey["seven_day"])
+	}
+}
+
+func TestRateLimitsToWindowsFiveHourOnly(t *testing.T) {
+	// No 7d data (zero used + zero reset) -> only the 5h window is emitted.
+	ws := rateLimitsToWindows(usage.RateLimits{Found: true, FiveHourUsedPercent: 20})
+	if len(ws) != 1 || ws[0].Key != "five_hour" {
+		t.Fatalf("expected only the 5h window, got %+v", ws)
+	}
+}

@@ -6,6 +6,7 @@ import {
   FileJson,
   Gauge,
   Info,
+  Layers,
   PanelRightClose,
   PanelRightOpen,
   RefreshCw,
@@ -29,6 +30,7 @@ import { PeopleView } from "./views/PeopleView";
 import { ImportView } from "./views/ImportView";
 import { PersonalDashboard } from "./views/PersonalDashboard";
 import { QuotaOverview } from "./views/QuotaOverview";
+import { WorkspacesView } from "./views/WorkspacesView";
 
 // App is the thin shell: it owns only shell-level UI state (active view, the
 // responsive sidebar/aside flags, and the token input field) and delegates all
@@ -108,6 +110,7 @@ export default function App() {
     { view: "accounts", icon: <Database size={17} />, label: t("账号", "Accounts"), badge: data.accounts.length.toString() },
     { view: "overview", icon: <Gauge size={17} />, label: t("配额总览", "Quota Overview"), badge: data.refreshQueue.length.toString() },
     { view: "people", icon: <Users size={17} />, label: t("成员", "People"), badge: data.activeClientCount.toString() },
+    { view: "workspaces", icon: <Layers size={17} />, label: t("工作区", "Workspaces"), badge: data.workspaces.length.toString() },
     { view: "import", icon: <FileJson size={17} />, label: t("导入凭据", "Import auth") },
   ];
   const navTitle = navItems.find((item) => item.view === activeView)?.label ?? "cube20";
@@ -254,6 +257,7 @@ export default function App() {
           </section>
         )}
         {activeView === "people" && <PeopleView data={data} />}
+        {activeView === "workspaces" && <WorkspacesView data={data} />}
         {activeView === "import" && <ImportView data={data} />}
 
         {data.message && (
