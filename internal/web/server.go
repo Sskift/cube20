@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,14 +32,26 @@ type Server struct {
 	CloudToken           string
 	QuotaRefreshInterval time.Duration
 
-	httpServer *http.Server
+	httpServer  *http.Server
+	limiterOnce sync.Once
+	limiterImpl *loginLimiter
+}
+
+// limiter lazily builds the login rate limiter so a zero-value Server (struct
+// literal in main.go) needs no constructor change.
+func (s *Server) limiterGet() *loginLimiter {
+	s.limiterOnce.Do(func() { s.limiterImpl = newLoginLimiter() })
+	return s.limiterImpl
 }
 
 type authContextKey struct{}
 
 type requestAuth struct {
-	Admin    bool
-	ClientID string
+	Admin     bool
+	ClientID  string
+	UserID    string
+	DeviceID  string
+	SessionID string
 }
 
 func (s *Server) ListenAndServe() error {
@@ -150,8 +163,20 @@ func (s *Server) Handler() http.Handler {
 	sync := func(handler http.HandlerFunc) http.HandlerFunc {
 		return s.withSyncAuth(handler)
 	}
+	session := func(handler http.HandlerFunc) http.HandlerFunc {
+		return s.withSessionAuth(handler)
+	}
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
+	// Website auth (session cookie). register/login are unauthenticated.
+	mux.HandleFunc("/api/auth/register", s.handleAuthRegister)
+	mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/auth/logout", session(s.handleAuthLogout))
+	mux.HandleFunc("/api/auth/me", session(s.handleAuthMe))
+	mux.HandleFunc("/api/devices", session(s.handleDevices))
+	mux.HandleFunc("/api/devices/", session(s.handleDeviceAction))
+	mux.HandleFunc("/api/users", session(s.handleUsers))
+	mux.HandleFunc("/api/users/", session(s.handleUserAction))
 	mux.HandleFunc("/api/sync/push", sync(s.handleSyncPush))
 	mux.HandleFunc("/api/sync/pull/", sync(s.handleSyncPull))
 	mux.HandleFunc("/api/sync/claim", sync(s.handleSyncClaim))
@@ -165,7 +190,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/clients", admin(s.handleClients))
 	mux.HandleFunc("/api/clients/", admin(s.handleClientAction))
 	mux.HandleFunc("/api/stats", admin(s.handleStats))
-	mux.HandleFunc("/api/dispatches", admin(s.handleDispatches))
+	mux.HandleFunc("/api/dispatches", session(s.handleDispatches))
 	mux.HandleFunc("/api/refresh-queue", admin(s.handleRefreshQueue))
 	mux.HandleFunc("/api/accounts/import-json", admin(s.handleImportJSON))
 	mux.HandleFunc("/api/accounts/pick", admin(s.handleLBPick))
@@ -205,7 +230,10 @@ func (s *Server) withSyncAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		token := requestToken(r)
 		if client, ok := s.Manager.AuthenticateClientToken(token); ok {
-			auth := requestAuth{ClientID: client.ID}
+			// The client row IS the device; setting ClientID=DeviceID keeps every
+			// existing ClientID-keyed handler working, while UserID/DeviceID give
+			// the new audit dimension.
+			auth := requestAuth{ClientID: client.ID, DeviceID: client.ID, UserID: client.UserID}
 			if message := clientPATSyncForbidden(r); message != "" {
 				writeError(w, http.StatusForbidden, message)
 				return
@@ -389,6 +417,10 @@ func (s *Server) handleLBReset(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDispatches(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.userIsPlatformAdmin(authFromRequest(r)) {
+		writeError(w, http.StatusForbidden, "admin only")
 		return
 	}
 	limit := 50

@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -90,6 +91,83 @@ func generatePAT() (string, error) {
 	}
 	return "cube_pat_" + base64.RawURLEncoding.EncodeToString(raw), nil
 }
+
+// generateDeviceToken mints the per-device bearer the cube CLI uses. Same shape
+// and entropy as a PAT — only the prefix differs so new and legacy tokens are
+// distinguishable, though both validate identically by hash.
+func generateDeviceToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return "cube_dev_" + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// generateSessionToken mints the opaque value stored in the website session
+// cookie. Only its sha256 hash is persisted server-side.
+func generateSessionToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return "cube_ses_" + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// pbkdf2 parameters for password hashing. Passwords are low-entropy and chosen
+// by humans, so they need a slow KDF (unlike the high-entropy random tokens that
+// hashToken/sha256 covers). Stored format: pbkdf2$<iter>$<saltB64>$<hashB64>.
+const (
+	pbkdf2Iterations = 210000
+	pbkdf2KeyLen     = 32
+	pbkdf2SaltLen    = 16
+)
+
+func hashPassword(password string) (string, error) {
+	salt := make([]byte, pbkdf2SaltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	key, err := pbkdf2.Key(sha256.New, password, salt, pbkdf2Iterations, pbkdf2KeyLen)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("pbkdf2$%d$%s$%s",
+		pbkdf2Iterations,
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(key),
+	), nil
+}
+
+// checkPassword verifies a plaintext password against a stored pbkdf2 hash in
+// constant time. Returns false for any malformed/empty stored hash so a user
+// with no password (login-disabled) can never be logged into.
+func checkPassword(stored, password string) bool {
+	if strings.TrimSpace(stored) == "" {
+		return false
+	}
+	parts := strings.Split(stored, "$")
+	if len(parts) != 4 || parts[0] != "pbkdf2" {
+		return false
+	}
+	var iter int
+	if _, err := fmt.Sscanf(parts[1], "%d", &iter); err != nil || iter <= 0 {
+		return false
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[2])
+	if err != nil {
+		return false
+	}
+	want, err := base64.RawStdEncoding.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	got, err := pbkdf2.Key(sha256.New, password, salt, iter, len(want))
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(got, want) == 1
+}
+
 func generateLeaseID() (string, error) {
 	raw := make([]byte, 18)
 	if _, err := rand.Read(raw); err != nil {

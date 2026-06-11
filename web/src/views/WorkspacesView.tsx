@@ -136,6 +136,11 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
   const memberIds = new Set(members.map((m) => m.clientId));
   const candidates = clients.filter((c) => c.active && !memberIds.has(c.id));
   const labelFor = (id: string) => clients.find((c) => c.id === id)?.label || id;
+  // A member is keyed by clientId today, but the user/device feature adds an
+  // optional userId. Prefer a username-style display (userId) when present and
+  // fall back to the client label so legacy client-only members keep working.
+  const memberKey = (m: Membership) => m.userId || m.clientId;
+  const memberDisplay = (m: Membership) => m.userId || labelFor(m.clientId);
 
   return (
     <div className="flex flex-col gap-4">
@@ -207,9 +212,9 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
         <Card.Content className="p-0">
           <div className="divide-y divide-slate-100">
             {members.map((m) => (
-              <div key={m.clientId} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5">
+              <div key={memberKey(m)} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5">
                 <div className="min-w-0">
-                  <span className="truncate text-sm text-slate-900">{labelFor(m.clientId)}</span>
+                  <span className="truncate text-sm text-slate-900">{memberDisplay(m)}</span>
                   <div className="font-mono text-[11px] text-slate-400">{m.clientId}</div>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">

@@ -186,6 +186,25 @@ func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
 	return items, nil
 }
 func dispatchEventFromAccount(state State, account Account, event string, now time.Time) DispatchEvent {
+	// LeaseClientID is the device id (auth sets ClientID=DeviceID). Resolve the
+	// owning user so the audit trail records who+which-device borrowed.
+	deviceID := account.LeaseClientID
+	var deviceLabel, userID, username string
+	for _, c := range state.Clients {
+		if c.ID == deviceID {
+			deviceLabel = c.Label
+			userID = c.UserID
+			break
+		}
+	}
+	if userID != "" {
+		for _, u := range state.Users {
+			if u.ID == userID {
+				username = u.Username
+				break
+			}
+		}
+	}
 	return DispatchEvent{
 		ID:           dispatchEventID(account, event, now),
 		LeaseID:      account.LeaseID,
@@ -193,6 +212,10 @@ func dispatchEventFromAccount(state State, account Account, event string, now ti
 		AccountLabel: account.Label,
 		ClientID:     account.LeaseClientID,
 		ClientLabel:  clientLabelFromState(state, account.LeaseClientID),
+		UserID:       userID,
+		Username:     username,
+		DeviceID:     deviceID,
+		DeviceLabel:  deviceLabel,
 		Holder:       account.LeaseHolder,
 		Event:        event,
 		Generation:   account.Generation,

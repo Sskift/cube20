@@ -6,12 +6,15 @@ import { copyText, maskSecret, shortID, shortTime, tokens } from "../lib/format"
 import { AppLayout, CopyLine, FieldLabel, MetricCard, SignalLine } from "../components/primitives";
 import { LangToggle, ThemeToggle } from "../components/chrome";
 import { DispatchTimeline } from "../components/DispatchTimeline";
+import { DevicesView } from "./DevicesView";
 import type { ThemeMode } from "../hooks/useTheme";
 import type { AccountUsage, PersonalPayload } from "../types";
+import type { DashboardData } from "../hooks/useDashboardData";
 
 // Personal (non-admin) client dashboard: profile, access token management, and per-account usage.
 export function PersonalDashboard({
   busy,
+  data,
   message,
   onApplyToken,
   onClearToken,
@@ -24,6 +27,7 @@ export function PersonalDashboard({
   usage,
 }: {
   busy: boolean;
+  data: DashboardData;
   message: string;
   onApplyToken: () => Promise<void>;
   onClearToken: () => Promise<void>;
@@ -125,6 +129,9 @@ export function PersonalDashboard({
             </Card.Content>
           </Card>
         </div>
+
+        {/* Device tokens: non-admin users mint their own per-device tokens here. */}
+        <DevicesView data={data} />
 
         <Card className="cube-card">
           <Card.Header className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">

@@ -43,7 +43,10 @@ export async function apiJSON<T>(path: string, init: RequestInit = {}): Promise<
   if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const token = cloudToken();
   if (token && !headers.has("Authorization")) headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(path, { ...init, headers });
+  // `credentials: "include"` rides the session cookie alongside any bearer
+  // token: the cookie (login/register) and the admin/device token are parallel
+  // auth paths and must coexist (the latter keeps headless bootstrap working).
+  const response = await fetch(path, { ...init, headers, credentials: "include" });
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) throw new Error(data.error || response.statusText);

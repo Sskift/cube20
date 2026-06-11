@@ -149,6 +149,37 @@ func (m *Manager) ensurePostgres() error {
 		`CREATE INDEX IF NOT EXISTS cube_memberships_client_idx ON cube_memberships (client_id)`,
 		`ALTER TABLE cube_accounts ADD COLUMN IF NOT EXISTS workspace_id text NOT NULL DEFAULT 'default'`,
 		`CREATE INDEX IF NOT EXISTS cube_accounts_workspace_idx ON cube_accounts (workspace_id)`,
+		`CREATE TABLE IF NOT EXISTS cube_users (
+			id text PRIMARY KEY,
+			username text NOT NULL DEFAULT '',
+			password_hash text NOT NULL DEFAULT '',
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			last_login_at timestamptz,
+			disabled_at timestamptz
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS cube_users_username_idx ON cube_users (lower(username)) WHERE username <> ''`,
+		`CREATE TABLE IF NOT EXISTS cube_sessions (
+			id text PRIMARY KEY,
+			token_hash text NOT NULL,
+			user_id text NOT NULL,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			expires_at timestamptz NOT NULL,
+			last_seen_at timestamptz
+		)`,
+		`CREATE INDEX IF NOT EXISTS cube_sessions_token_idx ON cube_sessions (token_hash)`,
+		`CREATE INDEX IF NOT EXISTS cube_sessions_user_idx ON cube_sessions (user_id)`,
+		`CREATE INDEX IF NOT EXISTS cube_sessions_exp_idx ON cube_sessions (expires_at)`,
+		`ALTER TABLE cube_clients ADD COLUMN IF NOT EXISTS user_id text NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS cube_clients_user_idx ON cube_clients (user_id)`,
+		`ALTER TABLE cube_memberships ADD COLUMN IF NOT EXISTS user_id text NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS cube_memberships_user_idx ON cube_memberships (user_id)`,
+		`ALTER TABLE cube_dispatch_events ADD COLUMN IF NOT EXISTS user_id text NOT NULL DEFAULT ''`,
+		`ALTER TABLE cube_dispatch_events ADD COLUMN IF NOT EXISTS username text NOT NULL DEFAULT ''`,
+		`ALTER TABLE cube_dispatch_events ADD COLUMN IF NOT EXISTS device_id text NOT NULL DEFAULT ''`,
+		`ALTER TABLE cube_dispatch_events ADD COLUMN IF NOT EXISTS device_label text NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS cube_dispatch_events_user_idx ON cube_dispatch_events (user_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS cube_dispatch_events_device_idx ON cube_dispatch_events (device_id, created_at DESC)`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -236,7 +267,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 		return State{}, err
 	}
 
-	clientRows, err := db.QueryContext(ctx, `SELECT id, label, token_hash, created_at, last_seen_at, revoked_at FROM cube_clients ORDER BY id`)
+	clientRows, err := db.QueryContext(ctx, `SELECT id, user_id, label, token_hash, created_at, last_seen_at, revoked_at FROM cube_clients ORDER BY id`)
 	if err != nil {
 		return State{}, err
 	}
@@ -245,7 +276,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 		var client Client
 		var lastSeen sql.NullTime
 		var revoked sql.NullTime
-		if err := clientRows.Scan(&client.ID, &client.Label, &client.TokenHash, &client.CreatedAt, &lastSeen, &revoked); err != nil {
+		if err := clientRows.Scan(&client.ID, &client.UserID, &client.Label, &client.TokenHash, &client.CreatedAt, &lastSeen, &revoked); err != nil {
 			return State{}, err
 		}
 		if lastSeen.Valid {
@@ -257,6 +288,51 @@ func (m *Manager) loadPostgresState() (State, error) {
 		state.Clients = append(state.Clients, client)
 	}
 	if err := clientRows.Err(); err != nil {
+		return State{}, err
+	}
+
+	userRows, err := db.QueryContext(ctx, `SELECT id, username, password_hash, created_at, updated_at, last_login_at, disabled_at FROM cube_users ORDER BY id`)
+	if err != nil {
+		return State{}, err
+	}
+	defer userRows.Close()
+	for userRows.Next() {
+		var user User
+		var lastLogin sql.NullTime
+		var disabled sql.NullTime
+		if err := userRows.Scan(&user.ID, &user.Username, &user.PasswordHash, &user.CreatedAt, &user.UpdatedAt, &lastLogin, &disabled); err != nil {
+			return State{}, err
+		}
+		if lastLogin.Valid {
+			user.LastLoginAt = lastLogin.Time
+		}
+		if disabled.Valid {
+			user.DisabledAt = &disabled.Time
+		}
+		state.Users = append(state.Users, user)
+	}
+	if err := userRows.Err(); err != nil {
+		return State{}, err
+	}
+
+	// Skip already-expired sessions so dead rows never accumulate in memory.
+	sessionRows, err := db.QueryContext(ctx, `SELECT id, token_hash, user_id, created_at, expires_at, last_seen_at FROM cube_sessions WHERE expires_at > now() ORDER BY id`)
+	if err != nil {
+		return State{}, err
+	}
+	defer sessionRows.Close()
+	for sessionRows.Next() {
+		var session Session
+		var lastSeen sql.NullTime
+		if err := sessionRows.Scan(&session.ID, &session.TokenHash, &session.UserID, &session.CreatedAt, &session.ExpiresAt, &lastSeen); err != nil {
+			return State{}, err
+		}
+		if lastSeen.Valid {
+			session.LastSeenAt = lastSeen.Time
+		}
+		state.Sessions = append(state.Sessions, session)
+	}
+	if err := sessionRows.Err(); err != nil {
 		return State{}, err
 	}
 
@@ -276,7 +352,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 		return State{}, err
 	}
 
-	membershipRows, err := db.QueryContext(ctx, `SELECT workspace_id, client_id, role, created_at FROM cube_memberships ORDER BY workspace_id, client_id`)
+	membershipRows, err := db.QueryContext(ctx, `SELECT workspace_id, client_id, user_id, role, created_at FROM cube_memberships ORDER BY workspace_id, client_id`)
 	if err != nil {
 		return State{}, err
 	}
@@ -284,7 +360,7 @@ func (m *Manager) loadPostgresState() (State, error) {
 	for membershipRows.Next() {
 		var ms Membership
 		var roleText string
-		if err := membershipRows.Scan(&ms.WorkspaceID, &ms.ClientID, &roleText, &ms.CreatedAt); err != nil {
+		if err := membershipRows.Scan(&ms.WorkspaceID, &ms.ClientID, &ms.UserID, &roleText, &ms.CreatedAt); err != nil {
 			return State{}, err
 		}
 		ms.Role = WorkspaceRole(roleText)
@@ -355,6 +431,14 @@ func (m *Manager) loadPostgresState() (State, error) {
 		}
 	}
 	state.WorkspaceMigrated = migratedValue == "true"
+
+	var userDeviceMigrated string
+	if err := db.QueryRowContext(ctx, `SELECT value FROM cube_meta WHERE key = 'user_device_migrated'`).Scan(&userDeviceMigrated); err != nil {
+		if err != sql.ErrNoRows {
+			return State{}, err
+		}
+	}
+	state.UserDeviceMigrated = userDeviceMigrated == "true"
 
 	return normalizeState(state), nil
 }
@@ -465,9 +549,10 @@ func (m *Manager) savePostgresState(state State) error {
 			revoked = *client.RevokedAt
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_clients
-			(id, label, token_hash, created_at, last_seen_at, revoked_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			(id, user_id, label, token_hash, created_at, last_seen_at, revoked_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (id) DO UPDATE SET
+				user_id = CASE WHEN EXCLUDED.user_id <> '' THEN EXCLUDED.user_id ELSE cube_clients.user_id END,
 				label = EXCLUDED.label,
 				token_hash = CASE WHEN EXCLUDED.token_hash <> '' THEN EXCLUDED.token_hash ELSE cube_clients.token_hash END,
 				last_seen_at = CASE
@@ -478,11 +563,76 @@ func (m *Manager) savePostgresState(state State) error {
 				END,
 				revoked_at = COALESCE(EXCLUDED.revoked_at, cube_clients.revoked_at)`,
 			client.ID,
+			client.UserID,
 			client.Label,
 			client.TokenHash,
 			client.CreatedAt,
 			lastSeen,
 			revoked,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, user := range state.Users {
+		if user.CreatedAt.IsZero() {
+			user.CreatedAt = now
+		}
+		if user.UpdatedAt.IsZero() {
+			user.UpdatedAt = now
+		}
+		var lastLogin any
+		if !user.LastLoginAt.IsZero() {
+			lastLogin = user.LastLoginAt
+		}
+		var disabled any
+		if user.DisabledAt != nil {
+			disabled = *user.DisabledAt
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_users
+			(id, username, password_hash, created_at, updated_at, last_login_at, disabled_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO UPDATE SET
+				username = EXCLUDED.username,
+				password_hash = CASE WHEN EXCLUDED.password_hash <> '' THEN EXCLUDED.password_hash ELSE cube_users.password_hash END,
+				updated_at = EXCLUDED.updated_at,
+				last_login_at = COALESCE(EXCLUDED.last_login_at, cube_users.last_login_at),
+				disabled_at = EXCLUDED.disabled_at`,
+			user.ID,
+			user.Username,
+			user.PasswordHash,
+			user.CreatedAt,
+			user.UpdatedAt,
+			lastLogin,
+			disabled,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, session := range state.Sessions {
+		if strings.TrimSpace(session.ID) == "" || strings.TrimSpace(session.TokenHash) == "" {
+			continue
+		}
+		if session.CreatedAt.IsZero() {
+			session.CreatedAt = now
+		}
+		var lastSeen any
+		if !session.LastSeenAt.IsZero() {
+			lastSeen = session.LastSeenAt
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_sessions
+			(id, token_hash, user_id, created_at, expires_at, last_seen_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (id) DO UPDATE SET
+				expires_at = EXCLUDED.expires_at,
+				last_seen_at = COALESCE(EXCLUDED.last_seen_at, cube_sessions.last_seen_at)`,
+			session.ID,
+			session.TokenHash,
+			session.UserID,
+			session.CreatedAt,
+			session.ExpiresAt,
+			lastSeen,
 		); err != nil {
 			return err
 		}
@@ -521,7 +671,14 @@ func (m *Manager) savePostgresState(state State) error {
 	// through the dedicated deletePostgresMembership path instead, so a concurrent
 	// remove can't be resurrected by a racing save.
 	for _, ms := range state.Memberships {
-		if strings.TrimSpace(ms.WorkspaceID) == "" || strings.TrimSpace(ms.ClientID) == "" {
+		// The PK is (workspace_id, client_id). User-scoped memberships use the
+		// user id as the principal key (the manager sets ClientID=UserID when no
+		// legacy client exists), so a row always has a stable non-empty key.
+		principal := strings.TrimSpace(ms.ClientID)
+		if principal == "" {
+			principal = strings.TrimSpace(ms.UserID)
+		}
+		if strings.TrimSpace(ms.WorkspaceID) == "" || principal == "" {
 			continue
 		}
 		role := ms.Role
@@ -532,12 +689,14 @@ func (m *Manager) savePostgresState(state State) error {
 			ms.CreatedAt = now
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_memberships
-			(workspace_id, client_id, role, created_at)
-			VALUES ($1, $2, $3, $4)
+			(workspace_id, client_id, user_id, role, created_at)
+			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (workspace_id, client_id) DO UPDATE SET
+				user_id = CASE WHEN EXCLUDED.user_id <> '' THEN EXCLUDED.user_id ELSE cube_memberships.user_id END,
 				role = EXCLUDED.role`,
 			ms.WorkspaceID,
-			ms.ClientID,
+			principal,
+			ms.UserID,
 			string(role),
 			ms.CreatedAt,
 		); err != nil {
@@ -561,11 +720,15 @@ func (m *Manager) savePostgresState(state State) error {
 			expiresAt = event.ExpiresAt
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_dispatch_events
-			(id, lease_id, account_id, account_label, client_id, client_label, holder, event, generation, created_at, started_at, expires_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			(id, lease_id, account_id, account_label, client_id, client_label, user_id, username, device_id, device_label, holder, event, generation, created_at, started_at, expires_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 			ON CONFLICT (id) DO UPDATE SET
 				account_label = EXCLUDED.account_label,
 				client_label = EXCLUDED.client_label,
+				user_id = EXCLUDED.user_id,
+				username = EXCLUDED.username,
+				device_id = EXCLUDED.device_id,
+				device_label = EXCLUDED.device_label,
 				holder = EXCLUDED.holder,
 				event = EXCLUDED.event,
 				generation = EXCLUDED.generation,
@@ -578,6 +741,10 @@ func (m *Manager) savePostgresState(state State) error {
 			event.AccountLabel,
 			event.ClientID,
 			event.ClientLabel,
+			event.UserID,
+			event.Username,
+			event.DeviceID,
+			event.DeviceLabel,
 			event.Holder,
 			event.Event,
 			event.Generation,
@@ -684,6 +851,13 @@ func (m *Manager) savePostgresState(state State) error {
 	if state.WorkspaceMigrated {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_meta (key, value, updated_at)
 			VALUES ('workspace_migrated', 'true', now())
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`); err != nil {
+			return err
+		}
+	}
+	if state.UserDeviceMigrated {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_meta (key, value, updated_at)
+			VALUES ('user_device_migrated', 'true', now())
 			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`); err != nil {
 			return err
 		}
@@ -859,6 +1033,10 @@ func (m *Manager) postgresDispatchHistory(limit int, clientID string) ([]Dispatc
 		COALESCE(NULLIF(a.label, ''), d.account_label),
 		d.client_id,
 		COALESCE(NULLIF(c.label, ''), d.client_label),
+		d.user_id,
+		COALESCE(NULLIF(u.username, ''), d.username),
+		d.device_id,
+		d.device_label,
 		d.holder,
 		d.event,
 		d.generation,
@@ -867,7 +1045,8 @@ func (m *Manager) postgresDispatchHistory(limit int, clientID string) ([]Dispatc
 		d.expires_at
 	FROM cube_dispatch_events d
 	LEFT JOIN cube_accounts a ON a.id = d.account_id
-	LEFT JOIN cube_clients c ON c.id = d.client_id`
+	LEFT JOIN cube_clients c ON c.id = d.client_id
+	LEFT JOIN cube_users u ON u.id = d.user_id`
 	args := []any{}
 	if clientID != "" {
 		query += ` WHERE d.client_id = $1`
@@ -894,6 +1073,10 @@ func (m *Manager) postgresDispatchHistory(limit int, clientID string) ([]Dispatc
 			&event.AccountLabel,
 			&event.ClientID,
 			&event.ClientLabel,
+			&event.UserID,
+			&event.Username,
+			&event.DeviceID,
+			&event.DeviceLabel,
 			&event.Holder,
 			&event.Event,
 			&event.Generation,
@@ -949,6 +1132,45 @@ func (m *Manager) deletePostgresMembership(workspaceID, clientID string) error {
 		return err
 	}
 	_, err = db.ExecContext(ctx, `DELETE FROM cube_memberships WHERE workspace_id = $1 AND client_id = $2`, workspaceID, clientID)
+	return err
+}
+
+// deletePostgresSession removes a single session (logout). Like memberships,
+// sessions must be deleted directly since the generic Save is upsert-only.
+func (m *Manager) deletePostgresSession(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `DELETE FROM cube_sessions WHERE id = $1`, id)
+	return err
+}
+
+// deletePostgresUserSessions removes every session for a user (logout-everywhere
+// / on password change).
+func (m *Manager) deletePostgresUserSessions(userID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `DELETE FROM cube_sessions WHERE user_id = $1`, userID)
+	return err
+}
+
+// deletePostgresDevice marks a device revoked. Revocation retains the row for
+// audit (like client revoke), so this sets revoked_at rather than deleting.
+func (m *Manager) deletePostgresDevice(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `UPDATE cube_clients SET revoked_at = now() WHERE id = $1`, id)
 	return err
 }
 

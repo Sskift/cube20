@@ -121,6 +121,7 @@ func (m *Manager) TouchClient(id string) error {
 func clientView(client Client) ClientView {
 	return ClientView{
 		ID:         client.ID,
+		UserID:     client.UserID,
 		Label:      client.Label,
 		CreatedAt:  client.CreatedAt,
 		LastSeenAt: client.LastSeenAt,

@@ -96,6 +96,44 @@ export interface DispatchEvent {
   createdAt: string;
   startedAt?: string;
   expiresAt?: string;
+  // Website-user / device attribution (added with the user/device feature).
+  userId?: string;
+  username?: string;
+  deviceId?: string;
+  deviceLabel?: string;
+}
+
+// A website user account (USERNAME + PASSWORD, no email). `User` is the minimal
+// identity returned by login/register/me; `UserView` is the admin roster row.
+export interface User {
+  id: string;
+  username: string;
+}
+
+export interface UserView {
+  id: string;
+  username: string;
+  createdAt: string;
+  lastLoginAt?: string;
+  disabled: boolean;
+  deviceCount: number;
+}
+
+// A per-user device token. The raw token is only ever returned once, on create
+// (see DeviceCreated); thereafter only metadata is exposed.
+export interface Device {
+  id: string;
+  userId?: string;
+  label: string;
+  createdAt: string;
+  lastSeenAt?: string;
+  revokedAt?: string;
+  active: boolean;
+}
+
+export interface DeviceCreated {
+  device: Device;
+  token: string;
 }
 
 export interface Client {
@@ -128,6 +166,8 @@ export interface Membership {
   clientId: string;
   role: WorkspaceRole;
   createdAt: string;
+  // Website-user attribution; may be absent for legacy client-only members.
+  userId?: string;
 }
 
 export interface RefreshQueueItem {
@@ -217,4 +257,4 @@ export interface PersonalPayload {
 }
 
 export type AccessMode = "unknown" | "admin" | "personal";
-export type DashboardView = "accounts" | "load-balancer" | "people" | "import" | "overview" | "workspaces";
+export type DashboardView = "accounts" | "load-balancer" | "people" | "import" | "overview" | "workspaces" | "devices" | "audit";

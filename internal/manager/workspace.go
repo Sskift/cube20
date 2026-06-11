@@ -65,7 +65,7 @@ func (m *Manager) ListWorkspacesForClient(clientID string) ([]WorkspaceMembershi
 	}
 	roleByWS := map[string]WorkspaceRole{}
 	for _, ms := range state.Memberships {
-		if ms.ClientID == clientID {
+		if membershipMatches(ms, clientID) {
 			roleByWS[ms.WorkspaceID] = ms.Role
 		}
 	}
@@ -79,6 +79,16 @@ func (m *Manager) ListWorkspacesForClient(clientID string) ([]WorkspaceMembershi
 	return out, nil
 }
 
+// membershipMatches reports whether a membership belongs to the given principal,
+// which may be a user id (new model) or a device/client id (legacy). Memberships
+// carry both fields during the transition, so we match either.
+func membershipMatches(ms Membership, principal string) bool {
+	if principal == "" {
+		return false
+	}
+	return ms.UserID == principal || ms.ClientID == principal
+}
+
 // WorkspaceMembershipView pairs a workspace with the requesting client's role in
 // it — what /api/workspaces and /api/me need to surface.
 type WorkspaceMembershipView struct {
@@ -86,15 +96,17 @@ type WorkspaceMembershipView struct {
 	Role WorkspaceRole `json:"role"`
 }
 
-// SetMembership adds or updates a client's role in a workspace (upsert).
-func (m *Manager) SetMembership(workspaceID, clientID string, role WorkspaceRole) error {
+// SetMembership adds or updates a principal's role in a workspace (upsert). The
+// principal may be a user id (preferred) or a legacy device/client id; the right
+// field is populated based on which entity it names.
+func (m *Manager) SetMembership(workspaceID, principal string, role WorkspaceRole) error {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
 
 	workspaceID = strings.TrimSpace(workspaceID)
-	clientID = strings.TrimSpace(clientID)
-	if workspaceID == "" || clientID == "" {
-		return fmt.Errorf("workspace id and client id are required")
+	principal = strings.TrimSpace(principal)
+	if workspaceID == "" || principal == "" {
+		return fmt.Errorf("workspace id and principal id are required")
 	}
 	if !validWorkspaceRole(role) {
 		return fmt.Errorf("role must be admin or member")
@@ -106,26 +118,35 @@ func (m *Manager) SetMembership(workspaceID, clientID string, role WorkspaceRole
 	if !workspaceExists(state, workspaceID) {
 		return fmt.Errorf("workspace %q not found", workspaceID)
 	}
-	if !clientExists(state, clientID) {
-		return fmt.Errorf("client %q not found", clientID)
+	isUser := userExists(state, principal)
+	if !isUser && !clientExists(state, principal) {
+		return fmt.Errorf("principal %q not found", principal)
 	}
 	for i := range state.Memberships {
-		if state.Memberships[i].WorkspaceID == workspaceID && state.Memberships[i].ClientID == clientID {
+		if state.Memberships[i].WorkspaceID == workspaceID && membershipMatches(state.Memberships[i], principal) {
 			state.Memberships[i].Role = role
+			if isUser && state.Memberships[i].UserID == "" {
+				state.Memberships[i].UserID = principal
+			}
 			return m.Save(state)
 		}
 	}
-	state.Memberships = append(state.Memberships, Membership{
+	ms := Membership{
 		WorkspaceID: workspaceID,
-		ClientID:    clientID,
 		Role:        role,
 		CreatedAt:   time.Now(),
-	})
+	}
+	if isUser {
+		ms.UserID = principal
+	} else {
+		ms.ClientID = principal
+	}
+	state.Memberships = append(state.Memberships, ms)
 	return m.Save(state)
 }
 
-// RemoveMembership revokes a client's access to a workspace.
-func (m *Manager) RemoveMembership(workspaceID, clientID string) error {
+// RemoveMembership revokes a principal's access to a workspace.
+func (m *Manager) RemoveMembership(workspaceID, principal string) error {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
 
@@ -135,15 +156,23 @@ func (m *Manager) RemoveMembership(workspaceID, clientID string) error {
 	}
 	filtered := state.Memberships[:0]
 	removed := false
+	var removedKey string
 	for _, ms := range state.Memberships {
-		if ms.WorkspaceID == workspaceID && ms.ClientID == clientID {
+		if ms.WorkspaceID == workspaceID && membershipMatches(ms, principal) {
 			removed = true
+			// The PG PK is (workspace_id, client_id) where client_id holds the
+			// principal key (user id when no legacy client). Capture it for the
+			// targeted delete below.
+			removedKey = ms.ClientID
+			if removedKey == "" {
+				removedKey = ms.UserID
+			}
 			continue
 		}
 		filtered = append(filtered, ms)
 	}
 	if !removed {
-		return fmt.Errorf("client %q is not a member of workspace %q", clientID, workspaceID)
+		return fmt.Errorf("%q is not a member of workspace %q", principal, workspaceID)
 	}
 	state.Memberships = filtered
 	// On Postgres the generic Save is upsert-only and never deletes rows, so the
@@ -151,7 +180,7 @@ func (m *Manager) RemoveMembership(workspaceID, clientID string) error {
 	// DeleteAccount). On the file backend, Save rewrites the whole document, so
 	// writing the filtered slice is sufficient.
 	if strings.TrimSpace(m.DatabaseURL) != "" {
-		if err := m.deletePostgresMembership(workspaceID, clientID); err != nil {
+		if err := m.deletePostgresMembership(workspaceID, removedKey); err != nil {
 			return err
 		}
 		return nil
@@ -175,15 +204,15 @@ func (m *Manager) ListMemberships(workspaceID string) ([]Membership, error) {
 	return out, nil
 }
 
-// MembershipRole returns a client's role in a workspace and whether a membership
-// exists. This is the primitive the web layer's authorization uses.
-func (m *Manager) MembershipRole(workspaceID, clientID string) (WorkspaceRole, bool) {
+// MembershipRole returns a principal's role in a workspace and whether a
+// membership exists. This is the primitive the web layer's authorization uses.
+func (m *Manager) MembershipRole(workspaceID, principal string) (WorkspaceRole, bool) {
 	state, err := m.Load()
 	if err != nil {
 		return "", false
 	}
 	for _, ms := range state.Memberships {
-		if ms.WorkspaceID == workspaceID && ms.ClientID == clientID {
+		if ms.WorkspaceID == workspaceID && membershipMatches(ms, principal) {
 			return ms.Role, true
 		}
 	}

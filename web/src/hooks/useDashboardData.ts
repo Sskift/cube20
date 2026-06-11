@@ -9,6 +9,8 @@ import type {
   AccountStatus,
   AccountUsage,
   Client,
+  Device,
+  DeviceCreated,
   DispatchEvent,
   LoadBalanceStatus,
   Membership,
@@ -17,6 +19,9 @@ import type {
   QuotaResult,
   RefreshQueueItem,
   TranslateFn,
+  User,
+  UserView,
+  WorkspaceMembershipView,
   Workspace,
   WorkspaceRole,
 } from "../types";
@@ -26,6 +31,17 @@ export interface AccountDraft {
   status: AccountStatus;
   ownerMode: AccountOwnerMode;
   ownerClientId?: string;
+}
+
+// Filters for the admin audit (dispatches) fetch. All optional; empty values
+// are dropped from the query string.
+export interface DispatchFilters {
+  user?: string;
+  device?: string;
+  account?: string;
+  event?: string;
+  limit?: number;
+  before?: string;
 }
 
 // useDashboardData owns every piece of server state the admin dashboard renders,
@@ -50,6 +66,10 @@ export function useDashboardData(t: TranslateFn) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [createdClientToken, setCreatedClientToken] = useState("");
+  // Website-user / device feature state.
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [users, setUsers] = useState<UserView[]>([]);
   const quotaAutoKeyRef = useRef("");
 
   const loadPersonal = useCallback(async () => {
@@ -57,6 +77,24 @@ export function useDashboardData(t: TranslateFn) {
     setPersonal(payload);
     setAccessMode(payload.admin ? "admin" : "personal");
     return payload;
+  }, []);
+
+  // GET /api/auth/me returns the logged-in website user plus their devices.
+  // 401 (not logged in) is swallowed so callers can probe silently.
+  const loadAuthMe = useCallback(async () => {
+    try {
+      const me = await apiJSON<{
+        user: User;
+        devices?: Device[];
+        workspaces?: WorkspaceMembershipView[];
+      }>("/api/auth/me");
+      setCurrentUser(me.user);
+      setDevices(me.devices || []);
+      return me.user;
+    } catch {
+      setCurrentUser(null);
+      return null;
+    }
   }, []);
 
   const loadAll = useCallback(
@@ -87,10 +125,12 @@ export function useDashboardData(t: TranslateFn) {
         });
         setAccessMode("admin");
         void loadPersonal().catch(() => undefined);
+        void loadAuthMe().catch(() => undefined);
       } catch (error) {
         try {
           const payload = await loadPersonal();
           if (!payload.admin) setMessage("");
+          void loadAuthMe().catch(() => undefined);
         } catch {
           setAccessMode("unknown");
           setMessage(error instanceof Error ? error.message : t("加载失败", "Load failed"));
@@ -99,7 +139,7 @@ export function useDashboardData(t: TranslateFn) {
         setLoading(false);
       }
     },
-    [loadPersonal, selectedWorkspace, t],
+    [loadPersonal, loadAuthMe, selectedWorkspace, t],
   );
 
   const fetchQuota = useCallback(
@@ -310,9 +350,136 @@ export function useDashboardData(t: TranslateFn) {
     setClients([]);
     setRefreshQueue([]);
     setDispatches([]);
+    setCurrentUser(null);
+    setDevices([]);
+    setUsers([]);
     setAccessMode("unknown");
     setMessage(t("令牌已清除", "Token cleared"));
   }, [t]);
+
+  // ---- Auth (website user accounts) ---------------------------------------
+  const register = useCallback(
+    (username: string, password: string) =>
+      withBusy(async () => {
+        const resp = await apiJSON<{ user: User }>("/api/auth/register", {
+          method: "POST",
+          body: JSON.stringify({ username, password }),
+        });
+        setCurrentUser(resp.user);
+        setMessage(t("注册成功", "Registered"));
+        await loadAll();
+      }),
+    [withBusy, loadAll, t],
+  );
+
+  const login = useCallback(
+    (username: string, password: string) =>
+      withBusy(async () => {
+        const resp = await apiJSON<{ user: User }>("/api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ username, password }),
+        });
+        setCurrentUser(resp.user);
+        setMessage(t("已登录", "Logged in"));
+        await loadAll();
+      }),
+    [withBusy, loadAll, t],
+  );
+
+  const logout = useCallback(
+    () =>
+      withBusy(async () => {
+        try {
+          await apiJSON("/api/auth/logout", { method: "POST" });
+        } finally {
+          // Clear the stored bearer token too so cookie + token both reset.
+          saveCloudToken("");
+        }
+        setCurrentUser(null);
+        setDevices([]);
+        setUsers([]);
+        setPersonal(null);
+        setAccounts([]);
+        setClients([]);
+        setRefreshQueue([]);
+        setDispatches([]);
+        setAccessMode("unknown");
+        setMessage(t("已登出", "Logged out"));
+      }),
+    [withBusy, t],
+  );
+
+  // ---- Devices (per-user tokens) ------------------------------------------
+  const listDevices = useCallback(async () => {
+    const resp = await apiJSON<{ devices: Device[] }>("/api/devices");
+    setDevices(resp.devices || []);
+    return resp.devices || [];
+  }, []);
+
+  // createDevice returns the one-time token so the caller can reveal it once.
+  const createDevice = useCallback(
+    async (label: string): Promise<string> => {
+      const resp = await apiJSON<DeviceCreated>("/api/devices", {
+        method: "POST",
+        body: JSON.stringify({ label }),
+      });
+      setMessage(`${t("已创建设备", "Device created")} ${resp.device.label || resp.device.id}`);
+      await listDevices();
+      return resp.token;
+    },
+    [listDevices, t],
+  );
+
+  const revokeDevice = useCallback(
+    (id: string) =>
+      withBusy(async () => {
+        if (!window.confirm(`Revoke device ${id}?`)) return;
+        await apiJSON(`/api/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
+        setMessage(`${t("已吊销设备", "Device revoked")} ${id}`);
+        await listDevices();
+      }),
+    [withBusy, listDevices, t],
+  );
+
+  // ---- Users roster (admin) ------------------------------------------------
+  const loadUsers = useCallback(async () => {
+    const resp = await apiJSON<{ users: UserView[] }>("/api/users");
+    setUsers(resp.users || []);
+    return resp.users || [];
+  }, []);
+
+  // ---- Audit (dispatches with filters) ------------------------------------
+  // Builds the /api/dispatches query from optional filters. fetchDispatchPage
+  // returns the events without touching state (used for "load more"), while
+  // fetchDispatches replaces the shared slice and appendDispatches grows it.
+  const fetchDispatchPage = useCallback(async (filters: DispatchFilters = {}) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(filters.limit ?? 200));
+    if (filters.before) params.set("before", filters.before);
+    if (filters.user) params.set("user", filters.user);
+    if (filters.device) params.set("device", filters.device);
+    if (filters.account) params.set("account", filters.account);
+    if (filters.event) params.set("event", filters.event);
+    return apiJSON<DispatchEvent[]>(`/api/dispatches?${params.toString()}`);
+  }, []);
+
+  const fetchDispatches = useCallback(
+    async (filters: DispatchFilters = {}) => {
+      const events = await fetchDispatchPage(filters);
+      setDispatches(events);
+      return events;
+    },
+    [fetchDispatchPage],
+  );
+
+  // Append an older page, de-duplicating by event id so overlapping cursors are
+  // safe.
+  const appendDispatches = useCallback((older: DispatchEvent[]) => {
+    setDispatches((current) => {
+      const seen = new Set(current.map((d) => d.id));
+      return [...current, ...older.filter((d) => !seen.has(d.id))];
+    });
+  }, []);
 
   // ---- Derived values -----------------------------------------------------
   const selected = useMemo(() => accounts.find((account) => account.id === selectedId), [accounts, selectedId]);
@@ -324,6 +491,7 @@ export function useDashboardData(t: TranslateFn) {
   const lbEligiblePercent = lbTotalCount ? Math.round((eligibleCount / lbTotalCount) * 100) : 0;
   const lbAccounts = useMemo(() => [...(lb?.eligible || []), ...(lb?.excluded || [])], [lb]);
   const activeClientCount = useMemo(() => clients.filter((client) => client.active).length, [clients]);
+  const activeDeviceCount = useMemo(() => devices.filter((device) => device.active).length, [devices]);
   const personalUsage = useMemo<AccountUsage[]>(() => {
     if (!personal?.usage) return [];
     if (Array.isArray(personal.usage)) return personal.usage;
@@ -354,6 +522,9 @@ export function useDashboardData(t: TranslateFn) {
     dispatches,
     personal,
     accessMode,
+    currentUser,
+    devices,
+    users,
     // ui-ish shared state
     selectedId,
     setSelectedId,
@@ -379,6 +550,17 @@ export function useDashboardData(t: TranslateFn) {
     setAccountWorkspace,
     applyToken,
     clearToken,
+    register,
+    login,
+    logout,
+    loadAuthMe,
+    createDevice,
+    listDevices,
+    revokeDevice,
+    loadUsers,
+    fetchDispatches,
+    fetchDispatchPage,
+    appendDispatches,
     // derived
     selected,
     readyCount,
@@ -389,6 +571,7 @@ export function useDashboardData(t: TranslateFn) {
     lbEligiblePercent,
     lbAccounts,
     activeClientCount,
+    activeDeviceCount,
     personalUsage,
     refreshByAccount,
     latestDispatchByAccount,

@@ -69,6 +69,8 @@ func run(args []string) error {
 		return runConfig(m, args[1:])
 	case "cloud":
 		return runCloud(m, args[1:])
+	case "device":
+		return runDevice(m, args[1:])
 	case "clients":
 		return runClients(m, args[1:])
 	case "workspace", "workspaces":
@@ -138,11 +140,13 @@ func splitArgs(input string) []string {
 }
 
 type cloudSyncOptions struct {
-	Server    string
-	Token     string
-	Client    string
-	Workspace string
-	Interval  time.Duration
+	Server      string
+	Token       string
+	Client      string
+	Workspace   string
+	Device      string
+	DeviceLabel string
+	Interval    time.Duration
 }
 
 func runCloud(m *manager.Manager, args []string) error {
@@ -162,7 +166,7 @@ func runCloud(m *manager.Manager, args []string) error {
 	case "relogin":
 		return runCloudRelogin(m, args[1:])
 	default:
-		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token>|quota <account-id>|relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]]")
+		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token> [--device-id <id>] [--device-label <name>]|quota <account-id>|relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]]")
 	}
 }
 
@@ -238,12 +242,18 @@ func printCloudStatus(m *manager.Manager) error {
 		token = "configured"
 	}
 	fmt.Printf("token: %s\n", token)
+	if settings, err := m.DeviceSettings(); err == nil {
+		fmt.Printf("device id: %s\n", emptyDash(settings.DeviceID))
+		fmt.Printf("device label: %s\n", emptyDash(settings.DeviceLabel))
+	}
 	return nil
 }
 
 func configureCloud(m *manager.Manager, args []string) error {
 	server := ""
 	token := ""
+	deviceID := ""
+	deviceLabel := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--server":
@@ -258,14 +268,28 @@ func configureCloud(m *manager.Manager, args []string) error {
 			}
 			token = strings.TrimSpace(args[i+1])
 			i++
+		case "--device-id":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --device-id")
+			}
+			deviceID = strings.TrimSpace(args[i+1])
+			i++
+		case "--device-label":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --device-label")
+			}
+			deviceLabel = strings.TrimSpace(args[i+1])
+			i++
 		default:
 			return fmt.Errorf("unknown cloud config flag %q", args[i])
 		}
 	}
-	if server == "" && token == "" {
-		return fmt.Errorf("usage: cube cloud config --server <url> --token <token>")
+	if server == "" && token == "" && deviceID == "" && deviceLabel == "" {
+		return fmt.Errorf("usage: cube cloud config --server <url> --token <token> [--device-id <id>] [--device-label <name>]")
 	}
-	settings, err := m.UpdateCloudSettings(server, token)
+	// UpdateDeviceSettings preserves device_id/device_label (which the Manager
+	// struct does not mirror) and only overwrites non-empty values.
+	settings, err := m.UpdateDeviceSettings(server, token, deviceID, deviceLabel)
 	if err != nil {
 		return err
 	}
@@ -276,7 +300,105 @@ func configureCloud(m *manager.Manager, args []string) error {
 		tokenStatus = "configured"
 	}
 	fmt.Printf("token: %s\n", tokenStatus)
+	fmt.Printf("device id: %s\n", emptyDash(settings.DeviceID))
+	fmt.Printf("device label: %s\n", emptyDash(settings.DeviceLabel))
 	return nil
+}
+
+const deviceUsage = "usage: cube device [status|show|config --server <url> --token <cube_dev_...> [--id <deviceId>] [--label <name>]]"
+
+func runDevice(m *manager.Manager, args []string) error {
+	if len(args) == 0 {
+		return printDeviceStatus(m)
+	}
+	switch args[0] {
+	case "status", "show":
+		if len(args) != 1 {
+			return fmt.Errorf(deviceUsage)
+		}
+		return printDeviceStatus(m)
+	case "config":
+		return configureDevice(m, args[1:])
+	default:
+		return fmt.Errorf(deviceUsage)
+	}
+}
+
+func configureDevice(m *manager.Manager, args []string) error {
+	server := ""
+	token := ""
+	deviceID := ""
+	deviceLabel := ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--server":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --server")
+			}
+			server = strings.TrimSpace(args[i+1])
+			i++
+		case "--token":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --token")
+			}
+			token = strings.TrimSpace(args[i+1])
+			i++
+		case "--id", "--device-id":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for %s", args[i])
+			}
+			deviceID = strings.TrimSpace(args[i+1])
+			i++
+		case "--label", "--device-label":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for %s", args[i])
+			}
+			deviceLabel = strings.TrimSpace(args[i+1])
+			i++
+		default:
+			return fmt.Errorf("unknown device config flag %q", args[i])
+		}
+	}
+	if server == "" && token == "" && deviceID == "" && deviceLabel == "" {
+		return fmt.Errorf(deviceUsage)
+	}
+	settings, err := m.UpdateDeviceSettings(server, token, deviceID, deviceLabel)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("device config saved to %s\n", m.SettingsPath)
+	fmt.Printf("server: %s\n", emptyDash(settings.CloudURL))
+	fmt.Printf("token: %s\n", maskToken(settings.CloudToken))
+	fmt.Printf("device id: %s\n", emptyDash(settings.DeviceID))
+	fmt.Printf("device label: %s\n", emptyDash(settings.DeviceLabel))
+	return nil
+}
+
+func printDeviceStatus(m *manager.Manager) error {
+	settings, err := m.DeviceSettings()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("settings: %s\n", m.SettingsPath)
+	fmt.Printf("server: %s\n", emptyDash(settings.CloudURL))
+	fmt.Printf("token: %s\n", maskToken(settings.CloudToken))
+	fmt.Printf("device id: %s\n", emptyDash(settings.DeviceID))
+	fmt.Printf("device label: %s\n", emptyDash(settings.DeviceLabel))
+	return nil
+}
+
+// maskToken reports whether a token is set without ever printing it in full. It
+// shows a short leading fragment (e.g. the cube_dev_/cube_pat_ kind prefix) and
+// masks the remainder so the secret is never echoed.
+func maskToken(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "missing"
+	}
+	if len(token) <= 8 {
+		return "configured (****)"
+	}
+	return fmt.Sprintf("configured (%s****)", token[:8])
 }
 
 func defaultCloudSyncOptions(m *manager.Manager) cloudSyncOptions {
@@ -285,17 +407,43 @@ func defaultCloudSyncOptions(m *manager.Manager) cloudSyncOptions {
 		Token:    strings.TrimSpace(m.CloudToken),
 		Interval: 60 * time.Second,
 	}
+	// Device identity (and the CUBE_DEVICE_TOKEN alias) is not mirrored onto the
+	// Manager struct, so read it from settings.toml with env overrides applied.
+	if settings, err := m.DeviceSettings(); err == nil {
+		if value := strings.TrimSpace(settings.CloudURL); value != "" {
+			opts.Server = value
+		}
+		if value := strings.TrimSpace(settings.CloudToken); value != "" {
+			opts.Token = value
+		}
+		opts.Device = strings.TrimSpace(settings.DeviceID)
+		opts.DeviceLabel = strings.TrimSpace(settings.DeviceLabel)
+	}
 	if value := strings.TrimSpace(os.Getenv("CUBE_CLOUD_URL")); value != "" {
 		opts.Server = value
 	}
 	if value := strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")); value != "" {
 		opts.Token = value
 	}
+	// CUBE_DEVICE_TOKEN is an alias for the bearer token that WINS over
+	// CUBE_CLOUD_TOKEN when both are set.
+	if value := strings.TrimSpace(os.Getenv("CUBE_DEVICE_TOKEN")); value != "" {
+		opts.Token = value
+	}
+	if value := strings.TrimSpace(os.Getenv("CUBE_DEVICE_ID")); value != "" {
+		opts.Device = value
+	}
+	if value := strings.TrimSpace(os.Getenv("CUBE_DEVICE_LABEL")); value != "" {
+		opts.DeviceLabel = value
+	}
 	if value := strings.TrimSpace(os.Getenv("CUBE_WORKSPACE")); value != "" {
 		opts.Workspace = value
 	}
 	if host, err := os.Hostname(); err == nil {
 		opts.Client = host
+		if opts.DeviceLabel == "" {
+			opts.DeviceLabel = host
+		}
 	}
 	return opts
 }
@@ -323,6 +471,18 @@ func runReport(m *manager.Manager, args []string) error {
 				return fmt.Errorf("missing value for --client")
 			}
 			opts.Client = strings.TrimSpace(args[i+1])
+			i++
+		case "--device":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --device")
+			}
+			opts.Device = strings.TrimSpace(args[i+1])
+			i++
+		case "--device-label":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --device-label")
+			}
+			opts.DeviceLabel = strings.TrimSpace(args[i+1])
 			i++
 		case "--interval":
 			if i+1 >= len(args) {
@@ -568,6 +728,18 @@ func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, 
 			}
 			opts.Workspace = strings.TrimSpace(args[i+1])
 			i++
+		case "--device":
+			if i+1 >= len(args) {
+				return opts, nil, fmt.Errorf("missing value for --device")
+			}
+			opts.Device = strings.TrimSpace(args[i+1])
+			i++
+		case "--device-label":
+			if i+1 >= len(args) {
+				return opts, nil, fmt.Errorf("missing value for --device-label")
+			}
+			opts.DeviceLabel = strings.TrimSpace(args[i+1])
+			i++
 		case "--heartbeat", "--interval":
 			if i+1 >= len(args) {
 				return opts, nil, fmt.Errorf("missing value for %s", args[i])
@@ -599,10 +771,12 @@ func claimLeaseSnapshot(ctx context.Context, opts cloudSyncOptions) (manager.Lea
 	body := struct {
 		Client     string `json:"client"`
 		Workspace  string `json:"workspace,omitempty"`
+		DeviceId   string `json:"deviceId,omitempty"`
 		TTLSeconds int    `json:"ttlSeconds"`
 	}{
 		Client:     opts.Client,
 		Workspace:  opts.Workspace,
+		DeviceId:   opts.Device,
 		TTLSeconds: leaseTTLSeconds(opts),
 	}
 	var leaseSnapshot manager.LeaseSnapshot
@@ -702,6 +876,7 @@ func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, account
 	body := struct {
 		AccountID        string         `json:"accountId"`
 		Client           string         `json:"client"`
+		DeviceId         string         `json:"deviceId,omitempty"`
 		TTLSeconds       int            `json:"ttlSeconds"`
 		FiveHour         *quota.Window  `json:"fiveHour,omitempty"`
 		Quotas           []quota.Window `json:"quotas,omitempty"`
@@ -709,6 +884,7 @@ func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, account
 	}{
 		AccountID:  accountID,
 		Client:     opts.Client,
+		DeviceId:   opts.Device,
 		TTLSeconds: leaseTTLSeconds(opts),
 	}
 	rl := usage.LatestRateLimits(codexHome)
@@ -1235,11 +1411,14 @@ func printHelp() {
 	fmt.Println("Usage:")
 	fmt.Println("  cube help")
 	fmt.Println("  cube cloud status")
-	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...>")
+	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...> [--device-id <id>] [--device-label <name>]")
 	fmt.Println("  cube cloud quota <account-id>")
 	fmt.Println("  cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]")
-	fmt.Println("  cube run [--server <url>] [--token <token>] [--workspace <id>] [--heartbeat 20s] [-- codex args...]")
-	fmt.Println("  cube report [--daemon] [--interval 5m]")
+	fmt.Println("  cube device status")
+	fmt.Println("  cube device show")
+	fmt.Println("  cube device config --server <url> --token <cube_dev_...> [--id <deviceId>] [--label <name>]")
+	fmt.Println("  cube run [--server <url>] [--token <token>] [--workspace <id>] [--device <id>] [--device-label <name>] [--heartbeat 20s] [-- codex args...]")
+	fmt.Println("  cube report [--daemon] [--interval 5m] [--device <id>] [--device-label <name>]")
 	fmt.Println("  cube config edit")
 	fmt.Println("  cube config path")
 	fmt.Println("  cube clients list")

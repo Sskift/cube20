@@ -5,8 +5,10 @@ import {
   Database,
   FileJson,
   Gauge,
+  History,
   Info,
   Layers,
+  MonitorSmartphone,
   PanelRightClose,
   PanelRightOpen,
   RefreshCw,
@@ -23,7 +25,7 @@ import type { DashboardView } from "./types";
 import { AppLayout } from "./components/primitives";
 import { LangToggle, NavItem, ThemeToggle } from "./components/chrome";
 import { DetailsPanel } from "./components/DetailsPanel";
-import { TokenGate } from "./components/TokenGate";
+import { AuthGate } from "./components/AuthGate";
 import { AccountsView } from "./views/AccountsView";
 import { LoadBalancerView } from "./views/LoadBalancerView";
 import { PeopleView } from "./views/PeopleView";
@@ -31,6 +33,8 @@ import { ImportView } from "./views/ImportView";
 import { PersonalDashboard } from "./views/PersonalDashboard";
 import { QuotaOverview } from "./views/QuotaOverview";
 import { WorkspacesView } from "./views/WorkspacesView";
+import { DevicesView } from "./views/DevicesView";
+import { AuditView } from "./views/AuditView";
 
 // App is the thin shell: it owns only shell-level UI state (active view, the
 // responsive sidebar/aside flags, and the token input field) and delegates all
@@ -71,6 +75,7 @@ export default function App() {
     return (
       <PersonalDashboard
         busy={data.busy}
+        data={data}
         message={data.message}
         personal={data.personal}
         themeMode={themeMode}
@@ -88,15 +93,17 @@ export default function App() {
     );
   }
 
-  // No usable token yet: show the gate before anything else loads.
+  // No usable session/token yet: show the auth gate before anything else loads.
   if (!data.loading && data.accessMode === "unknown" && !data.accounts.length) {
     return (
-      <TokenGate
+      <AuthGate
         busy={data.busy}
         message={data.message}
         themeMode={themeMode}
         tokenInput={tokenInput}
         onApplyToken={() => data.applyToken(tokenInput)}
+        onLogin={data.login}
+        onRegister={data.register}
         onThemeToggle={toggleTheme}
         onTokenInput={setTokenInput}
       />
@@ -110,7 +117,9 @@ export default function App() {
     { view: "accounts", icon: <Database size={17} />, label: t("账号", "Accounts"), badge: data.accounts.length.toString() },
     { view: "overview", icon: <Gauge size={17} />, label: t("配额总览", "Quota Overview"), badge: data.refreshQueue.length.toString() },
     { view: "people", icon: <Users size={17} />, label: t("成员", "People"), badge: data.activeClientCount.toString() },
+    { view: "devices", icon: <MonitorSmartphone size={17} />, label: t("设备", "Devices"), badge: data.activeDeviceCount.toString() },
     { view: "workspaces", icon: <Layers size={17} />, label: t("工作区", "Workspaces"), badge: data.workspaces.length.toString() },
+    { view: "audit", icon: <History size={17} />, label: t("审计", "Audit") },
     { view: "import", icon: <FileJson size={17} />, label: t("导入凭据", "Import auth") },
   ];
   const navTitle = navItems.find((item) => item.view === activeView)?.label ?? "cube20";
@@ -257,7 +266,9 @@ export default function App() {
           </section>
         )}
         {activeView === "people" && <PeopleView data={data} />}
+        {activeView === "devices" && <DevicesView data={data} />}
         {activeView === "workspaces" && <WorkspacesView data={data} />}
+        {activeView === "audit" && <AuditView data={data} />}
         {activeView === "import" && <ImportView data={data} />}
 
         {data.message && (

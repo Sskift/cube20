@@ -15,6 +15,8 @@ type Settings struct {
 	SharedConfigPath string `json:"sharedConfigPath" toml:"-"`
 	CloudURL         string `json:"cloudUrl" toml:"cloud_url"`
 	CloudToken       string `json:"cloudToken" toml:"cloud_token"`
+	DeviceID         string `json:"deviceId,omitempty" toml:"device_id,omitempty"`
+	DeviceLabel      string `json:"deviceLabel,omitempty" toml:"device_label,omitempty"`
 	DatabaseURL      string `json:"databaseUrl" toml:"database_url"`
 }
 
@@ -24,6 +26,17 @@ func applyEnvironmentOverrides(settings Settings) Settings {
 	}
 	if value := strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")); value != "" {
 		settings.CloudToken = value
+	}
+	// CUBE_DEVICE_TOKEN is an alias for the cloud bearer token that WINS over
+	// CUBE_CLOUD_TOKEN when both are set; it maps to the same CloudToken field.
+	if value := strings.TrimSpace(os.Getenv("CUBE_DEVICE_TOKEN")); value != "" {
+		settings.CloudToken = value
+	}
+	if value := strings.TrimSpace(os.Getenv("CUBE_DEVICE_ID")); value != "" {
+		settings.DeviceID = value
+	}
+	if value := strings.TrimSpace(os.Getenv("CUBE_DEVICE_LABEL")); value != "" {
+		settings.DeviceLabel = value
 	}
 	if value := firstNonEmpty(os.Getenv("CUBE_DATABASE_URL"), os.Getenv("DATABASE_URL")); value != "" {
 		settings.DatabaseURL = value
@@ -82,6 +95,80 @@ func (m *Manager) UpdateCloudSettings(cloudURL, cloudToken string) (Settings, er
 	}
 	if strings.TrimSpace(cloudToken) != "" {
 		settings.CloudToken = strings.TrimSpace(cloudToken)
+	}
+	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
+		return Settings{}, errors.New("settings paths cannot be empty")
+	}
+	if err := writeSettings(m.SettingsPath, settings); err != nil {
+		return Settings{}, err
+	}
+	m.CloudURL = settings.CloudURL
+	m.CloudToken = settings.CloudToken
+	return settings, nil
+}
+
+// currentSettings reads the on-disk settings.toml (falling back to the
+// Manager-mirrored fields as defaults) WITHOUT applying environment overrides.
+// The Manager struct does not mirror the device fields, so device-aware
+// reads/writes must go through the file to avoid clobbering device_id/device_label.
+func (m *Manager) currentSettings() (Settings, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return Settings{}, err
+	}
+	defaults := Settings{
+		LiveCodexHome:    m.LiveCodexHome,
+		AccountsDir:      m.AccountsDir,
+		SharedConfigPath: m.SharedConfigPath,
+		CloudURL:         m.CloudURL,
+		CloudToken:       m.CloudToken,
+		DatabaseURL:      m.DatabaseURL,
+	}
+	data, err := os.ReadFile(m.SettingsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return defaults, nil
+	}
+	if err != nil {
+		return Settings{}, err
+	}
+	settings, _, err := parseSettingsData(data, defaults, home)
+	if err != nil {
+		return Settings{}, err
+	}
+	return settings, nil
+}
+
+// DeviceSettings returns the current settings with environment overrides applied
+// (CUBE_DEVICE_ID, CUBE_DEVICE_LABEL, CUBE_DEVICE_TOKEN). The CLI reads device
+// identity through here because the Manager struct does not mirror device fields.
+func (m *Manager) DeviceSettings() (Settings, error) {
+	settings, err := m.currentSettings()
+	if err != nil {
+		return Settings{}, err
+	}
+	return applyEnvironmentOverrides(settings), nil
+}
+
+// UpdateDeviceSettings persists the device server/token/id/label to
+// settings.toml. Like UpdateCloudSettings it only overwrites non-empty values
+// and writes atomically; it reads the existing file first so unrelated fields
+// (including device fields the Manager does not mirror) are preserved.
+func (m *Manager) UpdateDeviceSettings(server, token, deviceID, deviceLabel string) (Settings, error) {
+	settings, err := m.currentSettings()
+	if err != nil {
+		return Settings{}, err
+	}
+	if strings.TrimSpace(server) != "" {
+		settings.CloudURL = strings.TrimSpace(server)
+	}
+	if strings.TrimSpace(token) != "" {
+		settings.CloudToken = strings.TrimSpace(token)
+	}
+	if strings.TrimSpace(deviceID) != "" {
+		settings.DeviceID = strings.TrimSpace(deviceID)
+	}
+	if strings.TrimSpace(deviceLabel) != "" {
+		settings.DeviceLabel = strings.TrimSpace(deviceLabel)
 	}
 	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
 		return Settings{}, errors.New("settings paths cannot be empty")

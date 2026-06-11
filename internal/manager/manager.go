@@ -107,20 +107,27 @@ type State struct {
 	Version     int          `json:"version"`
 	Accounts    []Account    `json:"accounts"`
 	Clients     []Client     `json:"clients,omitempty"`
+	Users       []User       `json:"users,omitempty"`
+	Sessions    []Session    `json:"sessions,omitempty"`
 	Workspaces  []Workspace  `json:"workspaces,omitempty"`
 	Memberships []Membership `json:"memberships,omitempty"`
 	// WorkspaceMigrated records that the one-time legacy flat-pool migration has
 	// already run, so it never re-enrolls clients created after the upgrade. It
 	// is set the first time migrateDefaultWorkspace runs and persisted alongside
 	// the rest of the state (a row in cube_meta on Postgres).
-	WorkspaceMigrated bool                    `json:"workspaceMigrated,omitempty"`
-	Usage             map[string]AccountUsage `json:"usage,omitempty"`
-	QuotaCache        map[string]QuotaCache   `json:"quotaCache,omitempty"`
-	Dispatches        []DispatchEvent         `json:"dispatches,omitempty"`
+	WorkspaceMigrated bool `json:"workspaceMigrated,omitempty"`
+	// UserDeviceMigrated records that the one-time Client->User+Device migration
+	// has run, so existing devices created after the upgrade are not retro-fitted
+	// with synthetic users.
+	UserDeviceMigrated bool                    `json:"userDeviceMigrated,omitempty"`
+	Usage              map[string]AccountUsage `json:"usage,omitempty"`
+	QuotaCache         map[string]QuotaCache   `json:"quotaCache,omitempty"`
+	Dispatches         []DispatchEvent         `json:"dispatches,omitempty"`
 }
 
 type Client struct {
 	ID         string     `json:"id"`
+	UserID     string     `json:"userId,omitempty"`
 	Label      string     `json:"label"`
 	TokenHash  string     `json:"tokenHash,omitempty"`
 	CreatedAt  time.Time  `json:"createdAt"`
@@ -128,14 +135,58 @@ type Client struct {
 	RevokedAt  *time.Time `json:"revokedAt,omitempty"`
 }
 
+// Device is the new name for a Client: the per-machine bearer-token holder. The
+// underlying struct/table is reused unchanged (plus UserID) so the existing
+// token lifecycle keeps working verbatim during and after migration.
+type Device = Client
+
+// User is a website identity: a username + password. A user owns one or more
+// devices. There is intentionally no email or other PII — this is a small
+// internal tool.
+type User struct {
+	ID           string     `json:"id"`
+	Username     string     `json:"username"`
+	PasswordHash string     `json:"passwordHash,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	UpdatedAt    time.Time  `json:"updatedAt"`
+	LastLoginAt  time.Time  `json:"lastLoginAt,omitempty"`
+	DisabledAt   *time.Time `json:"disabledAt,omitempty"`
+}
+
+// UserView is the secret-free projection of a User for API responses.
+type UserView struct {
+	ID          string    `json:"id"`
+	Username    string    `json:"username"`
+	CreatedAt   time.Time `json:"createdAt"`
+	LastLoginAt time.Time `json:"lastLoginAt,omitempty"`
+	Disabled    bool      `json:"disabled"`
+	DeviceCount int       `json:"deviceCount"`
+}
+
+// Session is a server-stored website session. The cookie carries an opaque
+// token; only its sha256 hash is persisted so a session can be revoked by
+// deleting the row.
+type Session struct {
+	ID         string    `json:"id"`
+	TokenHash  string    `json:"tokenHash,omitempty"`
+	UserID     string    `json:"userId"`
+	CreatedAt  time.Time `json:"createdAt"`
+	ExpiresAt  time.Time `json:"expiresAt"`
+	LastSeenAt time.Time `json:"lastSeenAt,omitempty"`
+}
+
 type ClientView struct {
 	ID         string     `json:"id"`
+	UserID     string     `json:"userId,omitempty"`
 	Label      string     `json:"label"`
 	CreatedAt  time.Time  `json:"createdAt"`
 	LastSeenAt time.Time  `json:"lastSeenAt,omitempty"`
 	RevokedAt  *time.Time `json:"revokedAt,omitempty"`
 	Active     bool       `json:"active"`
 }
+
+// DeviceView is the device-facing alias of ClientView.
+type DeviceView = ClientView
 
 // WorkspaceRole is a member's role within a single workspace. Roles are stored
 // per-membership, so the same client can be an admin of one workspace and a
@@ -166,7 +217,8 @@ type Workspace struct {
 // may hold memberships in several workspaces at once.
 type Membership struct {
 	WorkspaceID string        `json:"workspaceId"`
-	ClientID    string        `json:"clientId"`
+	UserID      string        `json:"userId,omitempty"`
+	ClientID    string        `json:"clientId,omitempty"`
 	Role        WorkspaceRole `json:"role"`
 	CreatedAt   time.Time     `json:"createdAt"`
 }
@@ -178,6 +230,10 @@ type DispatchEvent struct {
 	AccountLabel string    `json:"accountLabel,omitempty"`
 	ClientID     string    `json:"clientId,omitempty"`
 	ClientLabel  string    `json:"clientLabel,omitempty"`
+	UserID       string    `json:"userId,omitempty"`
+	Username     string    `json:"username,omitempty"`
+	DeviceID     string    `json:"deviceId,omitempty"`
+	DeviceLabel  string    `json:"deviceLabel,omitempty"`
 	Holder       string    `json:"holder,omitempty"`
 	Event        string    `json:"event"`
 	Generation   int64     `json:"generation"`
@@ -376,6 +432,15 @@ func normalizeState(state State) State {
 	if state.Clients == nil {
 		state.Clients = []Client{}
 	}
+	if state.Users == nil {
+		state.Users = []User{}
+	}
+	if state.Sessions == nil {
+		state.Sessions = []Session{}
+	}
+	for i := range state.Users {
+		state.Users[i].Username = strings.ToLower(strings.TrimSpace(state.Users[i].Username))
+	}
 	if state.Workspaces == nil {
 		state.Workspaces = []Workspace{}
 	}
@@ -383,6 +448,7 @@ func normalizeState(state State) State {
 		state.Memberships = []Membership{}
 	}
 	migrateDefaultWorkspace(&state)
+	migrateUsersAndDevices(&state)
 	if state.Usage == nil {
 		state.Usage = map[string]AccountUsage{}
 	}
@@ -486,6 +552,64 @@ func hasWorkspace(workspaces []Workspace, id string) bool {
 		}
 	}
 	return false
+}
+
+// migrateUsersAndDevices is the one-time Client->User+Device migration. It runs
+// only when there are legacy clients but no users yet, gated by the
+// UserDeviceMigrated marker so devices created after the upgrade are never
+// retro-fitted with synthetic users. Each legacy client (which already IS the
+// device row) gets a synthesized User whose username derives from the client
+// label/id, the client's UserID is pointed at it, and any membership for that
+// client is given the same UserID. Token hashes are never touched, so existing
+// CLIs keep authenticating unchanged. Passwords are empty (login disabled) until
+// the user sets one through the website.
+func migrateUsersAndDevices(state *State) {
+	if state.UserDeviceMigrated {
+		return
+	}
+	if len(state.Users) > 0 || len(state.Clients) == 0 {
+		state.UserDeviceMigrated = true
+		return
+	}
+
+	usedUserIDs := map[string]bool{}
+	usedUsernames := map[string]bool{}
+	now := time.Now()
+	// One user per distinct legacy client. (In practice the live deployment has a
+	// single client; this handles N defensively.)
+	for i := range state.Clients {
+		if strings.TrimSpace(state.Clients[i].UserID) != "" {
+			continue
+		}
+		base := strings.TrimSpace(state.Clients[i].Label)
+		if base == "" {
+			base = state.Clients[i].ID
+		}
+		username := strings.ToLower(sanitizeAccountID(base))
+		if username == "" {
+			username = "user"
+		}
+		username = uniqueFromUsed(username, usedUsernames)
+		usedUsernames[username] = true
+
+		userID := uniqueFromUsed("user-"+username, usedUserIDs)
+		usedUserIDs[userID] = true
+
+		state.Users = append(state.Users, User{
+			ID:        userID,
+			Username:  username,
+			CreatedAt: state.Clients[i].CreatedAt,
+			UpdatedAt: now,
+		})
+		state.Clients[i].UserID = userID
+
+		for j := range state.Memberships {
+			if state.Memberships[j].ClientID == state.Clients[i].ID && strings.TrimSpace(state.Memberships[j].UserID) == "" {
+				state.Memberships[j].UserID = userID
+			}
+		}
+	}
+	state.UserDeviceMigrated = true
 }
 
 func validAccountStatus(status AccountStatus) bool {
