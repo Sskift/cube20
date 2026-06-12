@@ -84,7 +84,8 @@ export default function App() {
         onApplyToken={() => data.applyToken(tokenInput)}
         onClearToken={async () => {
           setTokenInput("");
-          await data.clearToken();
+          if (data.personal?.mode === "user") await data.logout();
+          else await data.clearToken();
         }}
         onRefresh={() => data.loadAll("")}
         onThemeToggle={toggleTheme}

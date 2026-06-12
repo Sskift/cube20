@@ -192,6 +192,57 @@ func TestSessionUserCanReadPersonalMe(t *testing.T) {
 	}
 }
 
+func TestSessionUserMeWinsOverDeviceBearer(t *testing.T) {
+	server, _, _, _ := newTestServer(t)
+
+	rec := doJSON(server, http.MethodPost, "/api/auth/register", `{"username":"alice","password":"secret1"}`, nil)
+	aliceCookies := sessionCookie(rec)
+	rec = doJSON(server, http.MethodPost, "/api/devices", `{"label":"alice-laptop"}`, aliceCookies)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("alice device mint status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var aliceDevice struct {
+		Token string `json:"token"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &aliceDevice)
+	if aliceDevice.Token == "" {
+		t.Fatal("alice device token is empty")
+	}
+
+	rec = doJSON(server, http.MethodPost, "/api/auth/register", `{"username":"bob","password":"secret1"}`, nil)
+	bobCookies := sessionCookie(rec)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	req.Header.Set("Authorization", "Bearer "+aliceDevice.Token)
+	for _, cookie := range bobCookies {
+		req.AddCookie(cookie)
+	}
+	resp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("mixed auth /api/me status = %d body = %s", resp.Code, resp.Body.String())
+	}
+	var me struct {
+		Mode string `json:"mode"`
+		User struct {
+			Username string `json:"username"`
+		} `json:"user"`
+		Client struct {
+			ID string `json:"id"`
+		} `json:"client"`
+	}
+	json.Unmarshal(resp.Body.Bytes(), &me)
+	if me.Mode != "user" {
+		t.Fatalf("mode = %q, want user; body = %s", me.Mode, resp.Body.String())
+	}
+	if me.User.Username != "bob" {
+		t.Errorf("username = %q, want bob", me.User.Username)
+	}
+	if me.Client.ID != "" {
+		t.Errorf("client id = %q, want empty session-user payload", me.Client.ID)
+	}
+}
+
 func TestDevicesRequireLogin(t *testing.T) {
 	server, _, _, _ := newTestServer(t)
 	rec := doJSON(server, http.MethodPost, "/api/devices", `{"label":"x"}`, nil)

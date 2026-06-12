@@ -87,13 +87,14 @@ export function useDashboardData(t: TranslateFn) {
   const loadAuthMe = useCallback(async () => {
     try {
       const me = await apiJSON<{
-        user: User;
+        user?: User;
         devices?: Device[];
         workspaces?: WorkspaceMembershipView[];
       }>("/api/auth/me");
-      setCurrentUser(me.user);
+      setCurrentUser(me.user || null);
       setDevices(me.devices || []);
-      return me.user;
+      if (me.workspaces) setWorkspaces(me.workspaces);
+      return me.user || null;
     } catch {
       setCurrentUser(null);
       return null;
@@ -351,6 +352,8 @@ export function useDashboardData(t: TranslateFn) {
     setPersonal(null);
     setAccounts([]);
     setClients([]);
+    setWorkspaces([]);
+    setSelectedWorkspace("");
     setRefreshQueue([]);
     setDispatches([]);
     setCurrentUser(null);
@@ -368,6 +371,7 @@ export function useDashboardData(t: TranslateFn) {
           method: "POST",
           body: JSON.stringify({ username, password }),
         });
+        saveCloudToken("");
         setCurrentUser(resp.user);
         setMessage(t("注册成功", "Registered"));
         await loadAll();
@@ -382,6 +386,7 @@ export function useDashboardData(t: TranslateFn) {
           method: "POST",
           body: JSON.stringify({ username, password }),
         });
+        saveCloudToken("");
         setCurrentUser(resp.user);
         setMessage(t("已登录", "Logged in"));
         await loadAll();
@@ -404,6 +409,8 @@ export function useDashboardData(t: TranslateFn) {
         setPersonal(null);
         setAccounts([]);
         setClients([]);
+        setWorkspaces([]);
+        setSelectedWorkspace("");
         setRefreshQueue([]);
         setDispatches([]);
         setAccessMode("unknown");

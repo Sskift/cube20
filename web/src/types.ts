@@ -108,6 +108,10 @@ export interface DispatchEvent {
 export interface User {
   id: string;
   username: string;
+  createdAt?: string;
+  lastLoginAt?: string;
+  disabled?: boolean;
+  deviceCount?: number;
 }
 
 export interface UserView {

@@ -265,6 +265,13 @@ func (s *Server) withAnyAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
 			return
 		}
+		if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+			if user, sessionID, ok := s.Manager.ResolveSession(cookie.Value); ok {
+				auth := requestAuth{UserID: user.ID, SessionID: sessionID}
+				next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
+				return
+			}
+		}
 		token := requestToken(r)
 		if client, ok := s.Manager.AuthenticateClientToken(token); ok {
 			auth := requestAuth{ClientID: client.ID, DeviceID: client.ID, UserID: client.UserID}
@@ -275,13 +282,6 @@ func (s *Server) withAnyAuth(next http.HandlerFunc) http.HandlerFunc {
 			_ = s.Manager.TouchClient(client.ID)
 			next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
 			return
-		}
-		if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
-			if user, sessionID, ok := s.Manager.ResolveSession(cookie.Value); ok {
-				auth := requestAuth{UserID: user.ID, SessionID: sessionID}
-				next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
-				return
-			}
 		}
 		writeError(w, http.StatusUnauthorized, "missing or invalid credentials")
 	}
