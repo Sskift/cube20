@@ -188,6 +188,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/auth/me", session(s.handleAuthMe))
 	mux.HandleFunc("/api/devices", session(s.handleDevices))
 	mux.HandleFunc("/api/devices/", session(s.handleDeviceAction))
+	mux.HandleFunc("/api/invites/", s.handleInviteAction)
 	mux.HandleFunc("/api/users", session(s.handleUsers))
 	mux.HandleFunc("/api/users/", session(s.handleUserAction))
 	mux.HandleFunc("/api/sync/push", sync(s.handleSyncPush))
@@ -1079,7 +1080,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	workspaces, err := s.Manager.ListWorkspacesForClient(auth.ClientID)
+	workspaces, err := s.Manager.ListWorkspacesForClient(auth.principal())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

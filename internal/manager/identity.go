@@ -113,6 +113,16 @@ func generateSessionToken() (string, error) {
 	return "cube_ses_" + base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
+// generateInviteToken mints the opaque token embedded in workspace invite links.
+// Only its sha256 hash is persisted.
+func generateInviteToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return "cube_inv_" + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
 // pbkdf2 parameters for password hashing. Passwords are low-entropy and chosen
 // by humans, so they need a slow KDF (unlike the high-entropy random tokens that
 // hashToken/sha256 covers). Stored format: pbkdf2$<iter>$<saltB64>$<hashB64>.

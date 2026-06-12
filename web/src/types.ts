@@ -167,11 +167,41 @@ export interface WorkspaceMembershipView extends Workspace {
 
 export interface Membership {
   workspaceId: string;
-  clientId: string;
+  clientId?: string;
+  clientLabel?: string;
   role: WorkspaceRole;
   createdAt: string;
   // Website-user attribution; may be absent for legacy client-only members.
   userId?: string;
+  username?: string;
+}
+
+export interface WorkspaceInvite {
+  id: string;
+  workspaceId: string;
+  workspaceName?: string;
+  role: WorkspaceRole;
+  createdBy?: string;
+  createdAt: string;
+  expiresAt: string;
+  revokedAt?: string;
+  usedCount: number;
+  lastUsedAt?: string;
+  valid: boolean;
+}
+
+export interface WorkspaceInviteCreated {
+  invite: WorkspaceInvite;
+  token: string;
+  url?: string;
+}
+
+export interface InvitePreview {
+  valid: boolean;
+  workspaceId: string;
+  workspaceName: string;
+  role: WorkspaceRole;
+  expiresAt: string;
 }
 
 export interface RefreshQueueItem {

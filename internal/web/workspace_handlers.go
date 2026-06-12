@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"cube20/internal/manager"
 )
@@ -110,8 +112,8 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleWorkspaceAction routes /api/workspaces/{id}/members and
-// /api/workspaces/{id}/members/{clientId}.
+// handleWorkspaceAction routes /api/workspaces/{id}/members,
+// /api/workspaces/{id}/invites, and their child resources.
 func (s *Server) handleWorkspaceAction(w http.ResponseWriter, r *http.Request) {
 	auth := authFromRequest(r)
 	path := strings.TrimPrefix(r.URL.Path, "/api/workspaces/")
@@ -119,7 +121,13 @@ func (s *Server) handleWorkspaceAction(w http.ResponseWriter, r *http.Request) {
 	// Expected shapes:
 	//   {id}/members             -> GET list, POST add/set role
 	//   {id}/members/{clientId}  -> DELETE remove
+	//   {id}/invites             -> GET list, POST create invite
+	//   {id}/invites/{inviteId}  -> DELETE revoke invite
 	if len(parts) < 2 || parts[0] == "" || parts[1] != "members" {
+		if len(parts) >= 2 && parts[0] != "" && parts[1] == "invites" {
+			s.handleWorkspaceInvites(w, r, auth, parts)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
@@ -188,4 +196,88 @@ func (s *Server) handleWorkspaceAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.NotFound(w, r)
+}
+
+func (s *Server) handleWorkspaceInvites(w http.ResponseWriter, r *http.Request, auth requestAuth, parts []string) {
+	workspaceID := parts[0]
+	if len(parts) == 2 {
+		switch r.Method {
+		case http.MethodGet:
+			if !s.requireWorkspaceAdmin(w, auth, workspaceID) {
+				return
+			}
+			invites, err := s.Manager.ListWorkspaceInvites(workspaceID)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"invites": invites})
+		case http.MethodPost:
+			if !s.requireWorkspaceAdmin(w, auth, workspaceID) {
+				return
+			}
+			var body struct {
+				Role           string `json:"role"`
+				ExpiresInHours int    `json:"expiresInHours"`
+			}
+			if r.Body != nil {
+				_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+			}
+			role := manager.WorkspaceRole(strings.TrimSpace(body.Role))
+			if role == "" {
+				role = manager.RoleMember
+			}
+			ttl := time.Duration(body.ExpiresInHours) * time.Hour
+			createdBy := auth.UserID
+			if createdBy == "" {
+				createdBy = "admin"
+			}
+			created, err := s.Manager.CreateWorkspaceInvite(workspaceID, createdBy, role, ttl)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			created.URL = inviteURL(r, created.Token)
+			writeJSON(w, http.StatusCreated, created)
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+		return
+	}
+	if len(parts) == 3 && r.Method == http.MethodDelete {
+		if !s.requireWorkspaceAdmin(w, auth, workspaceID) {
+			return
+		}
+		inviteID := strings.TrimSpace(parts[2])
+		if err := s.Manager.RevokeWorkspaceInvite(workspaceID, inviteID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "id": inviteID})
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func inviteURL(r *http.Request, token string) string {
+	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	if proto == "" {
+		if r.TLS != nil {
+			proto = "https"
+		} else {
+			proto = "http"
+		}
+	}
+	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = r.Host
+	}
+	if host == "" {
+		return "/invite/" + token
+	}
+	// Guard against invalid forwarded proto values producing surprising links.
+	if _, err := strconv.Atoi(proto); err == nil {
+		proto = "http"
+	}
+	return proto + "://" + host + "/invite/" + token
 }

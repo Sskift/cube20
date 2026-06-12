@@ -104,13 +104,14 @@ type LeaseSnapshot struct {
 }
 
 type State struct {
-	Version     int          `json:"version"`
-	Accounts    []Account    `json:"accounts"`
-	Clients     []Client     `json:"clients,omitempty"`
-	Users       []User       `json:"users,omitempty"`
-	Sessions    []Session    `json:"sessions,omitempty"`
-	Workspaces  []Workspace  `json:"workspaces,omitempty"`
-	Memberships []Membership `json:"memberships,omitempty"`
+	Version     int               `json:"version"`
+	Accounts    []Account         `json:"accounts"`
+	Clients     []Client          `json:"clients,omitempty"`
+	Users       []User            `json:"users,omitempty"`
+	Sessions    []Session         `json:"sessions,omitempty"`
+	Workspaces  []Workspace       `json:"workspaces,omitempty"`
+	Memberships []Membership      `json:"memberships,omitempty"`
+	Invites     []WorkspaceInvite `json:"invites,omitempty"`
 	// WorkspaceMigrated records that the one-time legacy flat-pool migration has
 	// already run, so it never re-enrolls clients created after the upgrade. It
 	// is set the first time migrateDefaultWorkspace runs and persisted alongside
@@ -218,9 +219,56 @@ type Workspace struct {
 type Membership struct {
 	WorkspaceID string        `json:"workspaceId"`
 	UserID      string        `json:"userId,omitempty"`
+	Username    string        `json:"username,omitempty"`
 	ClientID    string        `json:"clientId,omitempty"`
+	ClientLabel string        `json:"clientLabel,omitempty"`
 	Role        WorkspaceRole `json:"role"`
 	CreatedAt   time.Time     `json:"createdAt"`
+}
+
+// WorkspaceInvite is a reusable link that lets a new or existing website user
+// join a workspace. TokenHash stores sha256(token); the plaintext token is
+// returned once at creation time and never persisted.
+type WorkspaceInvite struct {
+	ID          string        `json:"id"`
+	WorkspaceID string        `json:"workspaceId"`
+	Role        WorkspaceRole `json:"role"`
+	TokenHash   string        `json:"tokenHash,omitempty"`
+	CreatedBy   string        `json:"createdBy,omitempty"`
+	CreatedAt   time.Time     `json:"createdAt"`
+	ExpiresAt   time.Time     `json:"expiresAt"`
+	RevokedAt   *time.Time    `json:"revokedAt,omitempty"`
+	UsedCount   int           `json:"usedCount"`
+	LastUsedAt  time.Time     `json:"lastUsedAt,omitempty"`
+}
+
+type WorkspaceInviteView struct {
+	ID            string        `json:"id"`
+	WorkspaceID   string        `json:"workspaceId"`
+	WorkspaceName string        `json:"workspaceName,omitempty"`
+	Role          WorkspaceRole `json:"role"`
+	TokenHash     string        `json:"-"`
+	CreatedBy     string        `json:"createdBy,omitempty"`
+	CreatedAt     time.Time     `json:"createdAt"`
+	ExpiresAt     time.Time     `json:"expiresAt"`
+	RevokedAt     *time.Time    `json:"revokedAt,omitempty"`
+	UsedCount     int           `json:"usedCount"`
+	LastUsedAt    time.Time     `json:"lastUsedAt,omitempty"`
+	Valid         bool          `json:"valid"`
+}
+
+type WorkspaceInviteCreated struct {
+	Invite WorkspaceInviteView `json:"invite"`
+	Token  string              `json:"token"`
+	URL    string              `json:"url,omitempty"`
+}
+
+type InvitePreview struct {
+	Valid         bool          `json:"valid"`
+	WorkspaceID   string        `json:"workspaceId"`
+	WorkspaceName string        `json:"workspaceName"`
+	Role          WorkspaceRole `json:"role"`
+	ExpiresAt     time.Time     `json:"expiresAt"`
 }
 
 type DispatchEvent struct {
@@ -446,6 +494,9 @@ func normalizeState(state State) State {
 	}
 	if state.Memberships == nil {
 		state.Memberships = []Membership{}
+	}
+	if state.Invites == nil {
+		state.Invites = []WorkspaceInvite{}
 	}
 	migrateDefaultWorkspace(&state)
 	migrateUsersAndDevices(&state)

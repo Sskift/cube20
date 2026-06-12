@@ -197,11 +197,37 @@ func (m *Manager) ListMemberships(workspaceID string) ([]Membership, error) {
 	var out []Membership
 	for _, ms := range state.Memberships {
 		if ms.WorkspaceID == workspaceID {
+			ms.Username = usernameForMembership(state, ms)
+			ms.ClientLabel = clientLabelForMembership(state, ms)
 			out = append(out, ms)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ClientID < out[j].ClientID })
 	return out, nil
+}
+
+func usernameForMembership(state State, ms Membership) string {
+	if strings.TrimSpace(ms.UserID) == "" {
+		return ""
+	}
+	for _, user := range state.Users {
+		if user.ID == ms.UserID {
+			return user.Username
+		}
+	}
+	return ""
+}
+
+func clientLabelForMembership(state State, ms Membership) string {
+	if strings.TrimSpace(ms.ClientID) == "" {
+		return ""
+	}
+	for _, client := range state.Clients {
+		if client.ID == ms.ClientID {
+			return client.Label
+		}
+	}
+	return ""
 }
 
 // MembershipRole returns a principal's role in a workspace and whether a

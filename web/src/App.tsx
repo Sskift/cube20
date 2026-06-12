@@ -35,6 +35,7 @@ import { QuotaOverview } from "./views/QuotaOverview";
 import { WorkspacesView } from "./views/WorkspacesView";
 import { DevicesView } from "./views/DevicesView";
 import { AuditView } from "./views/AuditView";
+import { InvitePage } from "./views/InvitePage";
 
 // App is the thin shell: it owns only shell-level UI state (active view, the
 // responsive sidebar/aside flags, and the token input field) and delegates all
@@ -49,6 +50,10 @@ export default function App() {
   const [asideOpen, setAsideOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => (typeof window === "undefined" ? true : window.innerWidth >= 1180));
   const [compactShell, setCompactShell] = useState(() => (typeof window === "undefined" ? false : window.innerWidth < 1180));
+  const inviteToken =
+    typeof window === "undefined" || !window.location.pathname.startsWith("/invite/")
+      ? ""
+      : decodeURIComponent(window.location.pathname.replace(/^\/invite\//, "").split("/")[0] || "");
 
   // Keep the shell layout in sync with the viewport: a roomy desktop gets the
   // sidebar rail, anything narrower collapses to the compact tab strip and never
@@ -68,6 +73,10 @@ export default function App() {
   function selectView(view: DashboardView) {
     setActiveView(view);
     if (compactShell) setSidebarOpen(false);
+  }
+
+  if (inviteToken) {
+    return <InvitePage data={data} themeMode={themeMode} token={inviteToken} onThemeToggle={toggleTheme} />;
   }
 
   // Non-admin PAT holders get the personal dashboard instead of the admin shell.

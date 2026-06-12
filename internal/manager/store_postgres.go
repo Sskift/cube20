@@ -174,6 +174,20 @@ func (m *Manager) ensurePostgres() error {
 		`CREATE INDEX IF NOT EXISTS cube_clients_user_idx ON cube_clients (user_id)`,
 		`ALTER TABLE cube_memberships ADD COLUMN IF NOT EXISTS user_id text NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS cube_memberships_user_idx ON cube_memberships (user_id)`,
+		`CREATE TABLE IF NOT EXISTS cube_workspace_invites (
+			id text PRIMARY KEY,
+			workspace_id text NOT NULL DEFAULT '',
+			role text NOT NULL DEFAULT 'member',
+			token_hash text NOT NULL DEFAULT '',
+			created_by text NOT NULL DEFAULT '',
+			created_at timestamptz NOT NULL DEFAULT now(),
+			expires_at timestamptz NOT NULL,
+			revoked_at timestamptz,
+			used_count integer NOT NULL DEFAULT 0,
+			last_used_at timestamptz
+		)`,
+		`CREATE INDEX IF NOT EXISTS cube_workspace_invites_workspace_idx ON cube_workspace_invites (workspace_id)`,
+		`CREATE INDEX IF NOT EXISTS cube_workspace_invites_token_idx ON cube_workspace_invites (token_hash)`,
 		`ALTER TABLE cube_dispatch_events ADD COLUMN IF NOT EXISTS user_id text NOT NULL DEFAULT ''`,
 		`ALTER TABLE cube_dispatch_events ADD COLUMN IF NOT EXISTS username text NOT NULL DEFAULT ''`,
 		`ALTER TABLE cube_dispatch_events ADD COLUMN IF NOT EXISTS device_id text NOT NULL DEFAULT ''`,
@@ -370,6 +384,35 @@ func (m *Manager) loadPostgresState() (State, error) {
 		state.Memberships = append(state.Memberships, ms)
 	}
 	if err := membershipRows.Err(); err != nil {
+		return State{}, err
+	}
+
+	inviteRows, err := db.QueryContext(ctx, `SELECT id, workspace_id, role, token_hash, created_by, created_at, expires_at, revoked_at, used_count, last_used_at FROM cube_workspace_invites ORDER BY id`)
+	if err != nil {
+		return State{}, err
+	}
+	defer inviteRows.Close()
+	for inviteRows.Next() {
+		var invite WorkspaceInvite
+		var roleText string
+		var revoked sql.NullTime
+		var lastUsed sql.NullTime
+		if err := inviteRows.Scan(&invite.ID, &invite.WorkspaceID, &roleText, &invite.TokenHash, &invite.CreatedBy, &invite.CreatedAt, &invite.ExpiresAt, &revoked, &invite.UsedCount, &lastUsed); err != nil {
+			return State{}, err
+		}
+		invite.Role = WorkspaceRole(roleText)
+		if !validWorkspaceRole(invite.Role) {
+			invite.Role = RoleMember
+		}
+		if revoked.Valid {
+			invite.RevokedAt = &revoked.Time
+		}
+		if lastUsed.Valid {
+			invite.LastUsedAt = lastUsed.Time
+		}
+		state.Invites = append(state.Invites, invite)
+	}
+	if err := inviteRows.Err(); err != nil {
 		return State{}, err
 	}
 
@@ -679,6 +722,60 @@ func (m *Manager) savePostgresState(state State) error {
 			ms.UserID,
 			string(role),
 			ms.CreatedAt,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, invite := range state.Invites {
+		if strings.TrimSpace(invite.ID) == "" || strings.TrimSpace(invite.WorkspaceID) == "" || strings.TrimSpace(invite.TokenHash) == "" {
+			continue
+		}
+		role := invite.Role
+		if !validWorkspaceRole(role) {
+			role = RoleMember
+		}
+		if invite.CreatedAt.IsZero() {
+			invite.CreatedAt = now
+		}
+		if invite.ExpiresAt.IsZero() {
+			invite.ExpiresAt = invite.CreatedAt.Add(defaultInviteTTL)
+		}
+		var revoked any
+		if invite.RevokedAt != nil {
+			revoked = *invite.RevokedAt
+		}
+		var lastUsed any
+		if !invite.LastUsedAt.IsZero() {
+			lastUsed = invite.LastUsedAt
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_workspace_invites
+			(id, workspace_id, role, token_hash, created_by, created_at, expires_at, revoked_at, used_count, last_used_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (id) DO UPDATE SET
+				workspace_id = EXCLUDED.workspace_id,
+				role = EXCLUDED.role,
+				token_hash = CASE WHEN EXCLUDED.token_hash <> '' THEN EXCLUDED.token_hash ELSE cube_workspace_invites.token_hash END,
+				created_by = EXCLUDED.created_by,
+				expires_at = EXCLUDED.expires_at,
+				revoked_at = COALESCE(EXCLUDED.revoked_at, cube_workspace_invites.revoked_at),
+				used_count = GREATEST(cube_workspace_invites.used_count, EXCLUDED.used_count),
+				last_used_at = CASE
+					WHEN cube_workspace_invites.last_used_at IS NULL THEN EXCLUDED.last_used_at
+					WHEN EXCLUDED.last_used_at IS NULL THEN cube_workspace_invites.last_used_at
+					WHEN EXCLUDED.last_used_at > cube_workspace_invites.last_used_at THEN EXCLUDED.last_used_at
+					ELSE cube_workspace_invites.last_used_at
+				END`,
+			invite.ID,
+			invite.WorkspaceID,
+			string(role),
+			invite.TokenHash,
+			invite.CreatedBy,
+			invite.CreatedAt,
+			invite.ExpiresAt,
+			revoked,
+			invite.UsedCount,
+			lastUsed,
 		); err != nil {
 			return err
 		}

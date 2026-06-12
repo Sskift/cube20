@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button, Card, Chip, Input } from "@heroui/react";
-import { Database, FolderPlus, Layers, Trash2, UserPlus, Users } from "lucide-react";
+import { Copy, Database, FolderPlus, Link2, Layers, Trash2, Users } from "lucide-react";
 
 import { useLang } from "../i18n";
 import { EmptyState } from "../components/primitives";
-import type { Membership, Workspace, WorkspaceRole } from "../types";
+import type { Membership, Workspace, WorkspaceInvite, WorkspaceRole } from "../types";
 import type { DashboardData } from "../hooks/useDashboardData";
 
 // The Workspaces page: a master/detail layout (left = pool list, right = the
@@ -113,13 +113,17 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
   const { t } = useLang();
   const { accounts, clients, busy } = data;
   const [members, setMembers] = useState<Membership[]>([]);
+  const [invites, setInvites] = useState<WorkspaceInvite[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const [inviteId, setInviteId] = useState("");
   const [inviteRole, setInviteRole] = useState<WorkspaceRole>("member");
+  const [freshInviteURL, setFreshInviteURL] = useState("");
+  const [freshInviteID, setFreshInviteID] = useState("");
 
   const refresh = async () => {
     try {
-      setMembers(await data.listMembers(workspace.id));
+      const [nextMembers, nextInvites] = await Promise.all([data.listMembers(workspace.id), data.listWorkspaceInvites(workspace.id)]);
+      setMembers(nextMembers);
+      setInvites(nextInvites);
     } catch {
       // surfaced via the shared message banner
     } finally {
@@ -133,14 +137,19 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
   }, [workspace.id]);
 
   const poolAccounts = accounts.filter((a) => (a.workspaceId || "default") === workspace.id);
-  const memberIds = new Set(members.map((m) => m.clientId));
-  const candidates = clients.filter((c) => c.active && !memberIds.has(c.id));
   const labelFor = (id: string) => clients.find((c) => c.id === id)?.label || id;
-  // A member is keyed by clientId today, but the user/device feature adds an
-  // optional userId. Prefer a username-style display (userId) when present and
-  // fall back to the client label so legacy client-only members keep working.
-  const memberKey = (m: Membership) => m.userId || m.clientId;
-  const memberDisplay = (m: Membership) => m.userId || labelFor(m.clientId);
+  const memberKey = (m: Membership) => m.userId || m.clientId || "";
+  const memberDisplay = (m: Membership) => m.username || m.userId || (m.clientId ? m.clientLabel || labelFor(m.clientId) : t("未知成员", "Unknown member"));
+  const copyInvite = async (url: string) => {
+    if (!url) return;
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(url);
+  };
+  const relativeTime = (value?: string) => {
+    if (!value) return "-";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString();
+  };
 
   return (
     <div className="flex flex-col gap-4">
@@ -156,6 +165,9 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
             </Chip>
             <Chip color="accent" size="sm" variant="soft">
               {members.length} {t("成员", "members")}
+            </Chip>
+            <Chip color="default" size="sm" variant="soft">
+              {invites.filter((invite) => invite.valid).length} {t("邀请", "invites")}
             </Chip>
           </div>
         </Card.Header>
@@ -203,6 +215,85 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
         </Card.Content>
       </Card>
 
+      {/* Invite links */}
+      <Card className="cube-card">
+        <Card.Header className="flex items-center gap-2 border-b border-slate-200 px-5 py-4">
+          <Link2 size={16} />
+          <h3 className="text-sm font-semibold text-slate-950">{t("邀请链接", "Invite links")}</h3>
+        </Card.Header>
+        <Card.Content className="p-0">
+          <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-4 py-3">
+            <select
+              aria-label={t("邀请角色", "invite role")}
+              className="h-8 rounded-md border border-slate-200 bg-surface px-2 text-xs text-slate-700 outline-none focus:border-slate-400"
+              value={inviteRole}
+              onChange={(event) => setInviteRole(event.currentTarget.value as WorkspaceRole)}
+            >
+              <option value="member">{t("成员", "member")}</option>
+              <option value="admin">{t("管理员", "admin")}</option>
+            </select>
+            <Button
+              className="gap-1.5"
+              isDisabled={busy}
+              size="sm"
+              variant="secondary"
+              onPress={async () => {
+                const created = await data.createWorkspaceInvite(workspace.id, inviteRole);
+                setFreshInviteURL(created.url || `${window.location.origin}/invite/${created.token}`);
+                setFreshInviteID(created.invite.id);
+                await refresh();
+              }}
+            >
+              <Link2 size={14} />
+              {t("生成链接", "Create link")}
+            </Button>
+            {freshInviteURL && (
+              <Button className="gap-1.5" size="sm" variant="primary" onPress={() => copyInvite(freshInviteURL)}>
+                <Copy size={14} />
+                {t("复制新链接", "Copy new link")}
+              </Button>
+            )}
+          </div>
+          <div className="divide-y divide-slate-100">
+            {invites.map((invite) => (
+              <div key={invite.id} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-sm font-medium text-slate-900">{invite.id}</span>
+                    <Chip color={invite.valid ? "success" : "default"} size="sm" variant="soft">
+                      {invite.valid ? t("有效", "active") : t("失效", "inactive")}
+                    </Chip>
+                    <Chip color="accent" size="sm" variant="soft">
+                      {invite.role}
+                    </Chip>
+                  </div>
+                  <div className="text-[11px] text-slate-500">
+                    {t("过期", "expires")} {relativeTime(invite.expiresAt)} · {t("使用", "uses")} {invite.usedCount}
+                  </div>
+                </div>
+                <Button
+                  aria-label={`Revoke ${invite.id}`}
+                  isDisabled={busy || !invite.valid}
+                  size="sm"
+                  variant="danger-soft"
+                  onPress={async () => {
+                    await data.revokeWorkspaceInvite(workspace.id, invite.id);
+                    if (freshInviteID === invite.id) {
+                      setFreshInviteURL("");
+                      setFreshInviteID("");
+                    }
+                    await refresh();
+                  }}
+                >
+                  <Trash2 size={13} />
+                </Button>
+              </div>
+            ))}
+            {loaded && !invites.length && <div className="px-4 py-5 text-xs text-slate-500">{t("暂无邀请链接", "No invite links")}</div>}
+          </div>
+        </Card.Content>
+      </Card>
+
       {/* Members */}
       <Card className="cube-card">
         <Card.Header className="flex items-center gap-2 border-b border-slate-200 px-5 py-4">
@@ -215,7 +306,7 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
               <div key={memberKey(m)} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5">
                 <div className="min-w-0">
                   <span className="truncate text-sm text-slate-900">{memberDisplay(m)}</span>
-                  <div className="font-mono text-[11px] text-slate-400">{m.clientId}</div>
+                  <div className="font-mono text-[11px] text-slate-400">{memberKey(m)}</div>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   <select
@@ -224,7 +315,7 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
                     value={m.role}
                     disabled={busy}
                     onChange={async (event) => {
-                      await data.setMember(workspace.id, m.clientId, event.currentTarget.value as WorkspaceRole);
+                      await data.setMember(workspace.id, memberKey(m), event.currentTarget.value as WorkspaceRole);
                       await refresh();
                     }}
                   >
@@ -232,12 +323,12 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
                     <option value="admin">{t("管理员", "admin")}</option>
                   </select>
                   <Button
-                    aria-label={`Remove ${m.clientId}`}
+                    aria-label={`Remove ${memberKey(m)}`}
                     isDisabled={busy}
                     size="sm"
                     variant="danger-soft"
                     onPress={async () => {
-                      await data.removeMember(workspace.id, m.clientId);
+                      await data.removeMember(workspace.id, memberKey(m));
                       await refresh();
                     }}
                   >
@@ -247,46 +338,6 @@ function WorkspaceDetail({ data, workspace, accountCount }: { data: DashboardDat
               </div>
             ))}
             {loaded && !members.length && <div className="px-4 py-5 text-xs text-slate-500">{t("暂无成员", "No members")}</div>}
-          </div>
-          {/* Add member */}
-          <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 px-4 py-3">
-            <select
-              aria-label={t("选择客户端", "select client")}
-              className="h-8 min-w-[11rem] rounded-md border border-slate-200 bg-surface px-2 text-xs text-slate-700 outline-none focus:border-slate-400"
-              value={inviteId}
-              onChange={(event) => setInviteId(event.currentTarget.value)}
-            >
-              <option value="">{t("选择客户端…", "select client…")}</option>
-              {candidates.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.label || c.id}
-                </option>
-              ))}
-            </select>
-            <select
-              aria-label={t("角色", "role")}
-              className="h-8 rounded-md border border-slate-200 bg-surface px-2 text-xs text-slate-700 outline-none focus:border-slate-400"
-              value={inviteRole}
-              onChange={(event) => setInviteRole(event.currentTarget.value as WorkspaceRole)}
-            >
-              <option value="member">{t("成员", "member")}</option>
-              <option value="admin">{t("管理员", "admin")}</option>
-            </select>
-            <Button
-              className="gap-1.5"
-              isDisabled={busy || !inviteId}
-              size="sm"
-              variant="secondary"
-              onPress={async () => {
-                await data.setMember(workspace.id, inviteId, inviteRole);
-                setInviteId("");
-                setInviteRole("member");
-                await refresh();
-              }}
-            >
-              <UserPlus size={14} />
-              {t("添加", "Add")}
-            </Button>
           </div>
         </Card.Content>
       </Card>

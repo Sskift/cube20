@@ -12,6 +12,7 @@ import type {
   Device,
   DeviceCreated,
   DispatchEvent,
+  InvitePreview,
   LoadBalanceStatus,
   Membership,
   Meta,
@@ -21,6 +22,8 @@ import type {
   TranslateFn,
   User,
   UserView,
+  WorkspaceInvite,
+  WorkspaceInviteCreated,
   WorkspaceMembershipView,
   Workspace,
   WorkspaceRole,
@@ -302,27 +305,76 @@ export function useDashboardData(t: TranslateFn) {
   }, []);
 
   const setMember = useCallback(
-    (workspaceId: string, clientId: string, role: WorkspaceRole) =>
+    (workspaceId: string, principalId: string, role: WorkspaceRole) =>
       withBusy(async () => {
+        const key = principalId.startsWith("user-") ? "userId" : "clientId";
         await apiJSON(`/api/workspaces/${encodeURIComponent(workspaceId)}/members`, {
           method: "POST",
-          body: JSON.stringify({ clientId, role }),
+          body: JSON.stringify({ [key]: principalId, role }),
         });
-        setMessage(`${t("成员已更新", "Member updated")} ${clientId}`);
+        setMessage(`${t("成员已更新", "Member updated")} ${principalId}`);
       }),
     [withBusy, t],
   );
 
   const removeMember = useCallback(
-    (workspaceId: string, clientId: string) =>
+    (workspaceId: string, principalId: string) =>
       withBusy(async () => {
         await apiJSON(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(clientId)}`,
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(principalId)}`,
           { method: "DELETE" },
         );
-        setMessage(`${t("成员已移除", "Member removed")} ${clientId}`);
+        setMessage(`${t("成员已移除", "Member removed")} ${principalId}`);
       }),
     [withBusy, t],
+  );
+
+  const listWorkspaceInvites = useCallback(async (workspaceId: string) => {
+    const resp = await apiJSON<{ invites: WorkspaceInvite[] }>(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/invites`,
+    );
+    return resp.invites || [];
+  }, []);
+
+  const createWorkspaceInvite = useCallback(
+    async (workspaceId: string, role: WorkspaceRole): Promise<WorkspaceInviteCreated> => {
+      setBusy(true);
+      try {
+        const created = await apiJSON<WorkspaceInviteCreated>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/invites`,
+          {
+            method: "POST",
+            body: JSON.stringify({ role, expiresInHours: 168 }),
+          },
+        );
+        setMessage(t("邀请链接已生成", "Invite link created"));
+        return created;
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : t("操作失败", "Action failed"));
+        throw error;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [t],
+  );
+
+  const revokeWorkspaceInvite = useCallback(
+    async (workspaceId: string, inviteId: string): Promise<void> => {
+      setBusy(true);
+      try {
+        await apiJSON(`/api/workspaces/${encodeURIComponent(workspaceId)}/invites/${encodeURIComponent(inviteId)}`, {
+          method: "DELETE",
+        });
+        setMessage(t("邀请已撤销", "Invite revoked"));
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : t("操作失败", "Action failed"));
+        throw error;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [t],
   );
 
   const setAccountWorkspace = useCallback(
@@ -417,6 +469,61 @@ export function useDashboardData(t: TranslateFn) {
         setMessage(t("已登出", "Logged out"));
       }),
     [withBusy, t],
+  );
+
+  // ---- Invite onboarding --------------------------------------------------
+  const previewInvite = useCallback(async (token: string) => apiJSON<InvitePreview>(`/api/invites/${encodeURIComponent(token)}`), []);
+
+  const registerWithInvite = useCallback(
+    async (token: string, username: string, password: string): Promise<PersonalPayload> => {
+      setBusy(true);
+      try {
+        const payload = await apiJSON<PersonalPayload>(`/api/invites/${encodeURIComponent(token)}/register`, {
+          method: "POST",
+          body: JSON.stringify({ username, password }),
+        });
+        saveCloudToken("");
+        setPersonal(payload);
+        setAccessMode("personal");
+        if (payload.user) setCurrentUser(payload.user);
+        if (payload.devices) setDevices(payload.devices);
+        if (payload.workspaces) setWorkspaces(payload.workspaces);
+        setMessage(t("注册成功", "Registered"));
+        return payload;
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : t("操作失败", "Action failed"));
+        throw error;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [t],
+  );
+
+  const joinInvite = useCallback(
+    async (token: string): Promise<PersonalPayload> => {
+      setBusy(true);
+      try {
+        const payload = await apiJSON<PersonalPayload>(`/api/invites/${encodeURIComponent(token)}/join`, {
+          method: "POST",
+          body: "{}",
+        });
+        saveCloudToken("");
+        setPersonal(payload);
+        setAccessMode("personal");
+        if (payload.user) setCurrentUser(payload.user);
+        if (payload.devices) setDevices(payload.devices);
+        if (payload.workspaces) setWorkspaces(payload.workspaces);
+        setMessage(t("已加入工作区", "Joined workspace"));
+        return payload;
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : t("操作失败", "Action failed"));
+        throw error;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [t],
   );
 
   // ---- Devices (per-user tokens) ------------------------------------------
@@ -557,12 +664,18 @@ export function useDashboardData(t: TranslateFn) {
     listMembers,
     setMember,
     removeMember,
+    listWorkspaceInvites,
+    createWorkspaceInvite,
+    revokeWorkspaceInvite,
     setAccountWorkspace,
     applyToken,
     clearToken,
     register,
     login,
     logout,
+    previewInvite,
+    registerWithInvite,
+    joinInvite,
     loadAuthMe,
     createDevice,
     listDevices,
