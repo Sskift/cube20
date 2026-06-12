@@ -144,6 +144,54 @@ func TestDeviceMintAndIsolation(t *testing.T) {
 	}
 }
 
+func TestSessionUserCanReadPersonalMe(t *testing.T) {
+	server, _, _, _ := newTestServer(t)
+
+	rec := doJSON(server, http.MethodPost, "/api/auth/register", `{"username":"alice","password":"secret1"}`, nil)
+	cookies := sessionCookie(rec)
+	rec = doJSON(server, http.MethodPost, "/api/devices", `{"label":"laptop"}`, cookies)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("device mint status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(server, http.MethodPost, "/api/workspaces", `{"name":"Alice Pool"}`, cookies)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("workspace create status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	rec = doJSON(server, http.MethodGet, "/api/me", "", cookies)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session /api/me status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var me struct {
+		Mode  string `json:"mode"`
+		Admin bool   `json:"admin"`
+		User  struct {
+			Username string `json:"username"`
+		} `json:"user"`
+		Devices    []struct{ Label string } `json:"devices"`
+		Workspaces []struct {
+			ID   string `json:"id"`
+			Role string `json:"role"`
+		} `json:"workspaces"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &me)
+	if me.Mode != "user" {
+		t.Errorf("mode = %q, want user", me.Mode)
+	}
+	if me.Admin {
+		t.Error("session user /api/me reported admin=true")
+	}
+	if me.User.Username != "alice" {
+		t.Errorf("username = %q, want alice", me.User.Username)
+	}
+	if len(me.Devices) != 1 || me.Devices[0].Label != "laptop" {
+		t.Errorf("devices = %+v, want one laptop", me.Devices)
+	}
+	if len(me.Workspaces) != 1 || me.Workspaces[0].Role != "admin" {
+		t.Errorf("workspaces = %+v, want one admin workspace", me.Workspaces)
+	}
+}
+
 func TestDevicesRequireLogin(t *testing.T) {
 	server, _, _, _ := newTestServer(t)
 	rec := doJSON(server, http.MethodPost, "/api/devices", `{"label":"x"}`, nil)
@@ -186,5 +234,60 @@ func TestWorkspaceAdminIsNotPlatformAdmin(t *testing.T) {
 	rec2 := do(server, http.MethodGet, "/api/users", adminToken, "")
 	if rec2.Code != http.StatusOK {
 		t.Errorf("cloud-token GET /api/users = %d, want 200", rec2.Code)
+	}
+}
+
+// A logged-in user can create a workspace and becomes its admin, then sees it
+// in their own workspace list and can manage members.
+func TestUserSelfServeWorkspace(t *testing.T) {
+	server, _, _, _ := newTestServer(t)
+	rec := doJSON(server, http.MethodPost, "/api/auth/register", `{"username":"founder","password":"secret1"}`, nil)
+	cookies := sessionCookie(rec)
+
+	// create a workspace as a normal logged-in user
+	rec = doJSON(server, http.MethodPost, "/api/workspaces", `{"name":"My Pool"}`, cookies)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("self-serve create status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var ws struct{ ID string }
+	json.Unmarshal(rec.Body.Bytes(), &ws)
+	if ws.ID == "" {
+		t.Fatal("no workspace id returned")
+	}
+
+	// it shows up in the creator's workspace list with admin role
+	rec = doJSON(server, http.MethodGet, "/api/workspaces", "", cookies)
+	var list struct {
+		Workspaces []struct {
+			ID   string `json:"id"`
+			Role string `json:"role"`
+		} `json:"workspaces"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &list)
+	found := false
+	for _, w := range list.Workspaces {
+		if w.ID == ws.ID {
+			found = true
+			if w.Role != "admin" {
+				t.Errorf("creator role = %q, want admin", w.Role)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("creator does not see own workspace: %+v", list.Workspaces)
+	}
+
+	// creator (workspace admin) can list members
+	rec = doJSON(server, http.MethodGet, "/api/workspaces/"+ws.ID+"/members", "", cookies)
+	if rec.Code != http.StatusOK {
+		t.Errorf("creator list members = %d, want 200", rec.Code)
+	}
+
+	// a non-member user cannot manage it
+	rec = doJSON(server, http.MethodPost, "/api/auth/register", `{"username":"outsider","password":"secret1"}`, nil)
+	outsider := sessionCookie(rec)
+	rec = doJSON(server, http.MethodGet, "/api/workspaces/"+ws.ID+"/members", "", outsider)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("outsider list members = %d, want 403", rec.Code)
 	}
 }

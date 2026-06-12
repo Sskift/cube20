@@ -46,6 +46,13 @@ func (m *Manager) CreateSession(userID string) (string, error) {
 	if err := m.Save(state); err != nil {
 		return "", err
 	}
+	// On Postgres the generic Save does not write sessions (resurrection
+	// safety), so insert the new session row directly.
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		if err := m.insertPostgresSession(session); err != nil {
+			return "", err
+		}
+	}
 	return token, nil
 }
 

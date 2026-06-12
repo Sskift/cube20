@@ -26,13 +26,16 @@ func do(server *Server, method, path, token, body string) *httptest.ResponseReco
 	return rec
 }
 
-// Admin token creates a workspace; a non-admin PAT cannot.
+// A bearer PAT (no session) cannot create a workspace; the admin token can.
+// (Logged-in session users also can — covered by TestUserSelfServeWorkspace.)
 func TestWorkspaceCreateRequiresAdmin(t *testing.T) {
 	server, _, adminToken, pat := newTestServer(t)
 
+	// A PAT carries no session/user identity, so the session-guarded route
+	// rejects it with 401 before the handler runs.
 	rec := do(server, http.MethodPost, "/api/workspaces", pat, `{"name":"Team A"}`)
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("PAT create status = %d body = %s, want 403", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("PAT create status = %d body = %s, want 401", rec.Code, rec.Body.String())
 	}
 
 	rec = do(server, http.MethodPost, "/api/workspaces", adminToken, `{"name":"Team A"}`)
@@ -48,50 +51,56 @@ func TestWorkspaceCreateRequiresAdmin(t *testing.T) {
 	}
 }
 
-// A plain member cannot invite others; a workspace admin can.
+// A non-member session user cannot manage a workspace's members; a workspace
+// admin can. (Workspaces are user/session-scoped now, not PAT-scoped.)
 func TestWorkspaceMemberManagementRequiresWorkspaceAdmin(t *testing.T) {
-	server, m, adminToken, pat := newTestServer(t)
+	server, _, adminToken, _ := newTestServer(t)
 
-	// Create a workspace and a second client.
+	// admin token creates a workspace and a member user
 	rec := do(server, http.MethodPost, "/api/workspaces", adminToken, `{"name":"Team A"}`)
 	var ws manager.Workspace
 	json.Unmarshal(rec.Body.Bytes(), &ws)
 
-	bob, bobPAT, err := m.CreateClient("bob")
-	if err != nil {
-		t.Fatal(err)
+	rec = doJSON(server, http.MethodPost, "/api/auth/register", `{"username":"member1","password":"secret1"}`, nil)
+	memberCookies := sessionCookie(rec)
+	var reg struct {
+		User struct{ ID string } `json:"user"`
 	}
+	json.Unmarshal(rec.Body.Bytes(), &reg)
 
-	// The default test PAT (tester) is only a member of default, NOT ws — so it
-	// must be forbidden from managing ws members.
-	rec = do(server, http.MethodPost, "/api/workspaces/"+ws.ID+"/members", pat, `{"clientId":"`+bob.ID+`","role":"member"}`)
+	// non-member session user is forbidden from managing ws members
+	rec = doJSON(server, http.MethodPost, "/api/workspaces/"+ws.ID+"/members", `{"userId":"`+reg.User.ID+`","role":"member"}`, memberCookies)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("non-member invite status = %d body = %s, want 403", rec.Code, rec.Body.String())
 	}
 
-	// Admin token can invite bob as a workspace admin.
-	rec = do(server, http.MethodPost, "/api/workspaces/"+ws.ID+"/members", adminToken, `{"clientId":"`+bob.ID+`","role":"admin"}`)
+	// admin token can add the user as a workspace admin
+	rec = do(server, http.MethodPost, "/api/workspaces/"+ws.ID+"/members", adminToken, `{"userId":"`+reg.User.ID+`","role":"admin"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin invite status = %d body = %s, want 200", rec.Code, rec.Body.String())
 	}
 
-	// Now bob (workspace admin) can invite the tester.
-	rec = do(server, http.MethodGet, "/api/workspaces/"+ws.ID+"/members", bobPAT, "")
+	// now that user (workspace admin) can list members
+	rec = doJSON(server, http.MethodGet, "/api/workspaces/"+ws.ID+"/members", "", memberCookies)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("workspace-admin list members status = %d body = %s, want 200", rec.Code, rec.Body.String())
 	}
 }
 
-// A member sees only their own workspaces via GET /api/workspaces.
+// A session user sees only their own workspaces via GET /api/workspaces; the
+// admin token sees all.
 func TestWorkspaceListScopedToMember(t *testing.T) {
-	server, m, adminToken, pat := newTestServer(t)
+	server, _, adminToken, _ := newTestServer(t)
 
 	rec := do(server, http.MethodPost, "/api/workspaces", adminToken, `{"name":"Team A"}`)
 	var wsA manager.Workspace
 	json.Unmarshal(rec.Body.Bytes(), &wsA)
-	// tester is NOT a member of wsA (only default).
 
-	rec = do(server, http.MethodGet, "/api/workspaces", pat, "")
+	// a fresh user belongs to no workspace
+	rec = doJSON(server, http.MethodPost, "/api/auth/register", `{"username":"loner","password":"secret1"}`, nil)
+	cookies := sessionCookie(rec)
+
+	rec = doJSON(server, http.MethodGet, "/api/workspaces", "", cookies)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list status = %d body = %s", rec.Code, rec.Body.String())
 	}
@@ -101,7 +110,7 @@ func TestWorkspaceListScopedToMember(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	for _, w := range resp.Workspaces {
 		if w.ID == wsA.ID {
-			t.Errorf("member should not see wsA they don't belong to: %+v", resp.Workspaces)
+			t.Errorf("non-member should not see wsA: %+v", resp.Workspaces)
 		}
 	}
 
@@ -120,7 +129,6 @@ func TestWorkspaceListScopedToMember(t *testing.T) {
 	if !found {
 		t.Errorf("admin should see wsA in full list: %+v", adminResp.Workspaces)
 	}
-	_ = m
 }
 
 // A member of one workspace cannot claim a lease scoped to a workspace they are

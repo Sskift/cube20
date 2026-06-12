@@ -54,6 +54,16 @@ type requestAuth struct {
 	SessionID string
 }
 
+// principal returns the workspace-membership key for this caller: the user id
+// for a website session, else the device/client id for a bearer token. Workspace
+// membership and role checks key on this so both auth kinds resolve correctly.
+func (a requestAuth) principal() string {
+	if a.UserID != "" {
+		return a.UserID
+	}
+	return a.ClientID
+}
+
 func (s *Server) ListenAndServe() error {
 	if s.Host == "" {
 		s.Host = "127.0.0.1"
@@ -166,6 +176,9 @@ func (s *Server) Handler() http.Handler {
 	session := func(handler http.HandlerFunc) http.HandlerFunc {
 		return s.withSessionAuth(handler)
 	}
+	anyAuth := func(handler http.HandlerFunc) http.HandlerFunc {
+		return s.withAnyAuth(handler)
+	}
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	// Website auth (session cookie). register/login are unauthenticated.
@@ -184,9 +197,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/sync/leases/", sync(s.handleSyncLeaseAction))
 	mux.HandleFunc("/api/sync/usage", sync(s.handleSyncUsage))
 	mux.HandleFunc("/api/sync/quota/", sync(s.handleSyncQuota))
-	mux.HandleFunc("/api/me", sync(s.handleMe))
-	mux.HandleFunc("/api/workspaces", sync(s.handleWorkspaces))
-	mux.HandleFunc("/api/workspaces/", sync(s.handleWorkspaceAction))
+	mux.HandleFunc("/api/me", anyAuth(s.handleMe))
+	mux.HandleFunc("/api/workspaces", session(s.handleWorkspaces))
+	mux.HandleFunc("/api/workspaces/", session(s.handleWorkspaceAction))
 	mux.HandleFunc("/api/clients", admin(s.handleClients))
 	mux.HandleFunc("/api/clients/", admin(s.handleClientAction))
 	mux.HandleFunc("/api/stats", admin(s.handleStats))
@@ -243,6 +256,34 @@ func (s *Server) withSyncAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		writeError(w, http.StatusUnauthorized, "missing or invalid PAT")
+	}
+}
+
+func (s *Server) withAnyAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if auth, ok := s.adminAuthorized(r); ok {
+			next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
+			return
+		}
+		token := requestToken(r)
+		if client, ok := s.Manager.AuthenticateClientToken(token); ok {
+			auth := requestAuth{ClientID: client.ID, DeviceID: client.ID, UserID: client.UserID}
+			if message := clientPATSyncForbidden(r); message != "" {
+				writeError(w, http.StatusForbidden, message)
+				return
+			}
+			_ = s.Manager.TouchClient(client.ID)
+			next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
+			return
+		}
+		if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+			if user, sessionID, ok := s.Manager.ResolveSession(cookie.Value); ok {
+				auth := requestAuth{UserID: user.ID, SessionID: sessionID}
+				next(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, auth)))
+				return
+			}
+		}
+		writeError(w, http.StatusUnauthorized, "missing or invalid credentials")
 	}
 }
 
@@ -934,6 +975,32 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth := authFromRequest(r)
+	if auth.UserID != "" && auth.ClientID == "" && !auth.Admin {
+		user, ok := s.Manager.GetUser(auth.UserID)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "user not found")
+			return
+		}
+		devices, err := s.Manager.ListDevices(auth.UserID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		workspaces, err := s.Manager.ListWorkspacesForClient(auth.UserID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"mode":       "user",
+			"admin":      false,
+			"user":       user,
+			"devices":    devices,
+			"workspaces": workspaces,
+		})
+		return
+	}
+
 	clients, err := s.Manager.ListClients()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

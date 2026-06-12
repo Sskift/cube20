@@ -177,6 +177,14 @@ func (m *Manager) SetUserDisabled(id string, disabled bool) error {
 		state.Sessions = dropUserSessions(state.Sessions, id)
 		return m.persistAfterSessionDelete(state, id)
 	}
+	// Re-enable: the PG generic Save uses a monotonic COALESCE for disabled_at
+	// (so a stale save can't re-enable), so clearing it requires the dedicated
+	// path.
+	if strings.TrimSpace(m.DatabaseURL) != "" {
+		if err := m.clearPostgresUserDisabled(id); err != nil {
+			return err
+		}
+	}
 	return m.Save(state)
 }
 

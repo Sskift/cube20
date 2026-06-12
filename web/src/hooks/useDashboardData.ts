@@ -76,6 +76,9 @@ export function useDashboardData(t: TranslateFn) {
     const payload = await apiJSON<PersonalPayload>("/api/me");
     setPersonal(payload);
     setAccessMode(payload.admin ? "admin" : "personal");
+    if (payload.user) setCurrentUser(payload.user);
+    if (payload.devices) setDevices(payload.devices);
+    if (payload.workspaces) setWorkspaces(payload.workspaces);
     return payload;
   }, []);
 

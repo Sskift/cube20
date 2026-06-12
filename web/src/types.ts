@@ -242,10 +242,13 @@ export interface LoadBalanceStatus {
 }
 
 export interface PersonalPayload {
-  mode: "admin" | "client";
+  mode: "admin" | "client" | "user";
   admin: boolean;
+  user?: User;
   client?: Client;
   clients?: Client[];
+  devices?: Device[];
+  workspaces?: WorkspaceMembershipView[];
   usage?: AccountUsage[] | Record<string, AccountUsage>;
   dispatches?: DispatchEvent[];
   totals?: {

@@ -597,7 +597,10 @@ func (m *Manager) savePostgresState(state State) error {
 				password_hash = CASE WHEN EXCLUDED.password_hash <> '' THEN EXCLUDED.password_hash ELSE cube_users.password_hash END,
 				updated_at = EXCLUDED.updated_at,
 				last_login_at = COALESCE(EXCLUDED.last_login_at, cube_users.last_login_at),
-				disabled_at = EXCLUDED.disabled_at`,
+				-- Monotonic disable: a stale whole-state Save (disabled_at nil) must
+				-- NOT re-enable a disabled user. Re-enabling is an explicit operation
+				-- via clearPostgresUserDisabled.
+				disabled_at = COALESCE(EXCLUDED.disabled_at, cube_users.disabled_at)`,
 			user.ID,
 			user.Username,
 			user.PasswordHash,
@@ -610,33 +613,10 @@ func (m *Manager) savePostgresState(state State) error {
 		}
 	}
 
-	for _, session := range state.Sessions {
-		if strings.TrimSpace(session.ID) == "" || strings.TrimSpace(session.TokenHash) == "" {
-			continue
-		}
-		if session.CreatedAt.IsZero() {
-			session.CreatedAt = now
-		}
-		var lastSeen any
-		if !session.LastSeenAt.IsZero() {
-			lastSeen = session.LastSeenAt
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO cube_sessions
-			(id, token_hash, user_id, created_at, expires_at, last_seen_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (id) DO UPDATE SET
-				expires_at = EXCLUDED.expires_at,
-				last_seen_at = COALESCE(EXCLUDED.last_seen_at, cube_sessions.last_seen_at)`,
-			session.ID,
-			session.TokenHash,
-			session.UserID,
-			session.CreatedAt,
-			session.ExpiresAt,
-			lastSeen,
-		); err != nil {
-			return err
-		}
-	}
+	// Sessions are intentionally NOT written by the generic whole-state Save.
+	// Creating a session uses the dedicated insertPostgresSession path and
+	// deleting one uses deletePostgresSession / deletePostgresUserSessions, so a
+	// stale bulk Save can never resurrect a logged-out session.
 
 	for _, ws := range state.Workspaces {
 		if strings.TrimSpace(ws.ID) == "" {
@@ -1158,6 +1138,41 @@ func (m *Manager) deletePostgresUserSessions(userID string) error {
 		return err
 	}
 	_, err = db.ExecContext(ctx, `DELETE FROM cube_sessions WHERE user_id = $1`, userID)
+	return err
+}
+
+// insertPostgresSession creates a single session row directly. The generic Save
+// never writes sessions, so creation must use this dedicated path.
+func (m *Manager) insertPostgresSession(s Session) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	var lastSeen any
+	if !s.LastSeenAt.IsZero() {
+		lastSeen = s.LastSeenAt
+	}
+	_, err = db.ExecContext(ctx, `INSERT INTO cube_sessions
+		(id, token_hash, user_id, created_at, expires_at, last_seen_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (id) DO NOTHING`,
+		s.ID, s.TokenHash, s.UserID, s.CreatedAt, s.ExpiresAt, lastSeen)
+	return err
+}
+
+// clearPostgresUserDisabled re-enables a user. The generic Save uses a monotonic
+// COALESCE for disabled_at (so a stale save can't re-enable), which means
+// re-enabling must clear the column explicitly here.
+func (m *Manager) clearPostgresUserDisabled(userID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := m.postgresDB(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `UPDATE cube_users SET disabled_at = NULL, updated_at = now() WHERE id = $1`, userID)
 	return err
 }
 

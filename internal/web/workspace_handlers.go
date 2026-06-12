@@ -25,7 +25,7 @@ func (s *Server) requireAccountReportAccess(w http.ResponseWriter, auth requestA
 		// leaking account existence through a distinct error here.
 		return true
 	}
-	if _, ok := s.Manager.MembershipRole(workspaceID, auth.ClientID); !ok {
+	if _, ok := s.Manager.MembershipRole(workspaceID, auth.principal()); !ok {
 		writeError(w, http.StatusForbidden, "account belongs to a workspace you are not a member of")
 		return false
 	}
@@ -33,14 +33,15 @@ func (s *Server) requireAccountReportAccess(w http.ResponseWriter, auth requestA
 }
 
 // requireWorkspaceAdmin authorizes a workspace-management action: the platform
-// admin token passes unconditionally; a client PAT passes only if it holds an
-// admin-role membership in the target workspace. Returns true when authorized;
-// on failure it writes the response and returns false.
+// admin token passes unconditionally; otherwise the caller (session user or
+// bearer device) must hold an admin-role membership in the target workspace.
+// Returns true when authorized; on failure it writes the response and returns
+// false.
 func (s *Server) requireWorkspaceAdmin(w http.ResponseWriter, auth requestAuth, workspaceID string) bool {
 	if auth.Admin {
 		return true
 	}
-	role, ok := s.Manager.MembershipRole(workspaceID, auth.ClientID)
+	role, ok := s.Manager.MembershipRole(workspaceID, auth.principal())
 	if !ok {
 		writeError(w, http.StatusForbidden, "not a member of this workspace")
 		return false
@@ -53,7 +54,7 @@ func (s *Server) requireWorkspaceAdmin(w http.ResponseWriter, auth requestAuth, 
 }
 
 // handleWorkspaces serves GET (list the caller's workspaces) and POST (create a
-// workspace — platform admin only).
+// workspace). Any logged-in user may create a workspace and becomes its admin.
 func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	auth := authFromRequest(r)
 	switch r.Method {
@@ -67,15 +68,17 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{"workspaces": list})
 			return
 		}
-		views, err := s.Manager.ListWorkspacesForClient(auth.ClientID)
+		views, err := s.Manager.ListWorkspacesForClient(auth.principal())
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"workspaces": views})
 	case http.MethodPost:
-		if !auth.Admin {
-			writeError(w, http.StatusForbidden, "creating a workspace requires the platform admin token")
+		// Any logged-in user (session) or the platform admin may create a
+		// workspace. A bearer-device caller without a user identity cannot.
+		if !auth.Admin && auth.UserID == "" {
+			writeError(w, http.StatusForbidden, "log in to create a workspace")
 			return
 		}
 		var body struct {
@@ -84,10 +87,22 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil {
 			_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
 		}
-		ws, err := s.Manager.CreateWorkspace(body.Name, "admin")
+		creator := auth.UserID
+		if creator == "" {
+			creator = "admin"
+		}
+		ws, err := s.Manager.CreateWorkspace(body.Name, creator)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
+		}
+		// The creator becomes the workspace's first admin (skip for the
+		// cloud-token admin, which has no user identity).
+		if auth.UserID != "" {
+			if err := s.Manager.SetMembership(ws.ID, auth.UserID, manager.RoleAdmin); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		writeJSON(w, http.StatusCreated, ws)
 	default:
@@ -127,23 +142,30 @@ func (s *Server) handleWorkspaceAction(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var body struct {
+				UserID   string `json:"userId"`
 				ClientID string `json:"clientId"`
 				Role     string `json:"role"`
 			}
 			if r.Body != nil {
 				_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
 			}
+			// Prefer the user id (current model); fall back to clientId for
+			// legacy callers. SetMembership resolves either to a principal.
+			principal := strings.TrimSpace(body.UserID)
+			if principal == "" {
+				principal = strings.TrimSpace(body.ClientID)
+			}
 			role := manager.WorkspaceRole(strings.TrimSpace(body.Role))
 			if role == "" {
 				role = manager.RoleMember
 			}
-			if err := s.Manager.SetMembership(workspaceID, strings.TrimSpace(body.ClientID), role); err != nil {
+			if err := s.Manager.SetMembership(workspaceID, principal, role); err != nil {
 				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"workspaceId": workspaceID,
-				"clientId":    strings.TrimSpace(body.ClientID),
+				"userId":      principal,
 				"role":        string(role),
 			})
 		default:
