@@ -282,6 +282,56 @@ func TestSessionCanManualBorrowAndReturnServerLiveAuth(t *testing.T) {
 	}
 }
 
+func TestAdminManualBorrowUsesDeviceIDAndReturnBypassesClientMismatch(t *testing.T) {
+	server, m, adminToken, _ := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/sync/manual-borrow", bytes.NewBufferString(`{
+		"account":"work",
+		"auth":{"OPENAI_API_KEY":"sk-test","note":"admin-live"},
+		"ttlSeconds":28800,
+		"holder":"manual-direct-codex",
+		"client":"D2N6M7MMCX",
+		"deviceId":"client-liushiao-local"
+	}`))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("borrow status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var lease manager.LeaseSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &lease); err != nil {
+		t.Fatalf("decode borrow response: %v", err)
+	}
+	if lease.Lease.ClientID != "client-liushiao-local" {
+		t.Fatalf("lease client = %q, want device id", lease.Lease.ClientID)
+	}
+
+	returnReq := httptest.NewRequest(http.MethodPost, "/api/sync/manual-return", bytes.NewBufferString(`{
+		"account":"work",
+		"leaseId":"`+lease.Lease.ID+`",
+		"client":"wrong-host"
+	}`))
+	returnReq.Header.Set("Authorization", "Bearer "+adminToken)
+	returnReq.Header.Set("Content-Type", "application/json")
+	returnRec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(returnRec, returnReq)
+
+	if returnRec.Code != http.StatusOK {
+		t.Fatalf("return status = %d body = %s", returnRec.Code, returnRec.Body.String())
+	}
+	account, err := m.GetAccount("work")
+	if err != nil {
+		t.Fatalf("GetAccount(work): %v", err)
+	}
+	if account.LeaseID != "" {
+		t.Fatalf("admin return left lease active despite mismatched client: %+v", account)
+	}
+}
+
 func TestPATCannotPullAuthSnapshot(t *testing.T) {
 	server, _, _, pat := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/sync/pull/work", nil)

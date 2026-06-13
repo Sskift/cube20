@@ -684,7 +684,9 @@ func (s *Server) handleSyncManualBorrow(w http.ResponseWriter, r *http.Request) 
 		AccountID  string          `json:"accountId"`
 		AccountRef string          `json:"accountRef"`
 		Auth       json.RawMessage `json:"auth"`
+		Client     string          `json:"client"`
 		ClientID   string          `json:"clientId"`
+		DeviceID   string          `json:"deviceId"`
 		Holder     string          `json:"holder"`
 		Workspace  string          `json:"workspace"`
 		TTLSeconds int             `json:"ttlSeconds"`
@@ -699,7 +701,7 @@ func (s *Server) handleSyncManualBorrow(w http.ResponseWriter, r *http.Request) 
 		clientID = strings.TrimSpace(auth.principal())
 	}
 	if auth.Admin {
-		clientID = firstText(strings.TrimSpace(body.ClientID), clientID, "admin-manual")
+		clientID = firstText(strings.TrimSpace(body.ClientID), strings.TrimSpace(body.DeviceID), strings.TrimSpace(body.Client), clientID, "admin-manual")
 	}
 	if clientID == "" {
 		writeError(w, http.StatusBadRequest, "manual borrow needs client id")
@@ -747,8 +749,10 @@ func (s *Server) handleSyncManualReturn(w http.ResponseWriter, r *http.Request) 
 	var body struct {
 		Account   string `json:"account"`
 		AccountID string `json:"accountId"`
+		Client    string `json:"client"`
 		LeaseID   string `json:"leaseId"`
 		ClientID  string `json:"clientId"`
+		DeviceID  string `json:"deviceId"`
 		Workspace string `json:"workspace"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
@@ -760,8 +764,8 @@ func (s *Server) handleSyncManualReturn(w http.ResponseWriter, r *http.Request) 
 	if clientID == "" {
 		clientID = strings.TrimSpace(auth.principal())
 	}
-	if auth.Admin && strings.TrimSpace(body.ClientID) != "" {
-		clientID = strings.TrimSpace(body.ClientID)
+	if auth.Admin {
+		clientID = ""
 	}
 	workspaceID := strings.TrimSpace(body.Workspace)
 	if !auth.Admin {
