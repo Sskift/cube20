@@ -926,7 +926,7 @@ func (s *Server) heartbeatLease(w http.ResponseWriter, r *http.Request, leaseID 
 	}
 	quotaTelemetryMissing := len(windows) == 0
 
-	lease, err := s.Manager.TouchLease(leaseID, accountID, clientID, firstText(body.Holder, body.Client), ttl)
+	lease, err := s.Manager.TouchLease(leaseID, accountID, clientID, body.Holder, ttl)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

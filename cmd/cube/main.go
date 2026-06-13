@@ -1025,6 +1025,10 @@ func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapsh
 }
 
 func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, accountID, codexHome string) (manager.Lease, bool, bool, error) {
+	return heartbeatLeaseWithTTL(ctx, opts, leaseID, accountID, codexHome, leaseTTLSeconds(opts))
+}
+
+func heartbeatLeaseWithTTL(ctx context.Context, opts cloudSyncOptions, leaseID, accountID, codexHome string, ttlSeconds int) (manager.Lease, bool, bool, error) {
 	body := struct {
 		AccountID        string         `json:"accountId"`
 		Client           string         `json:"client"`
@@ -1037,7 +1041,7 @@ func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, account
 		AccountID:  accountID,
 		Client:     opts.Client,
 		DeviceId:   opts.Device,
-		TTLSeconds: leaseTTLSeconds(opts),
+		TTLSeconds: ttlSeconds,
 	}
 	rl := usage.LatestRateLimits(codexHome)
 	body.FiveHour = rateLimitsToWindow(rl)

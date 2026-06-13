@@ -560,7 +560,7 @@ func TestAdminHeartbeatUsesDeviceIdentityForQuotaReporter(t *testing.T) {
 		"accountId":"work",
 		"client":"D2N6M7MMCX",
 		"deviceId":"client-liushiao-local",
-		"ttlSeconds":120,
+		"ttlSeconds":28800,
 		"fiveHour":{"key":"five_hour","label":"5h","usedPercent":12,"remainingPercent":88}
 	}`
 	req := httptest.NewRequest(http.MethodPatch, "/api/sync/leases/"+lease.Lease.ID, bytes.NewBufferString(body))
@@ -587,6 +587,12 @@ func TestAdminHeartbeatUsesDeviceIdentityForQuotaReporter(t *testing.T) {
 	}
 	if account.OwnerMode != manager.OwnerCloud {
 		t.Fatalf("ownerMode = %q, want cloud", account.OwnerMode)
+	}
+	if account.LeaseHolder != "manual-direct-codex" {
+		t.Fatalf("lease holder = %q, want manual-direct-codex", account.LeaseHolder)
+	}
+	if time.Until(account.LeaseExpiresAt) < 7*time.Hour {
+		t.Fatalf("lease expires at %s, want manual keepalive to preserve long ttl", account.LeaseExpiresAt)
 	}
 }
 

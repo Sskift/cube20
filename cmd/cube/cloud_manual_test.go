@@ -247,10 +247,12 @@ func TestRunCloudKeepaliveLiveIdentifiesHeartbeatsAndReportsUsage(t *testing.T) 
 				"matched": true,
 				"account": manager.AccountView{
 					Account: manager.Account{
-						ID:      "acct-live",
-						LeaseID: "lease-live",
+						ID:          "acct-live",
+						LeaseID:     "lease-live",
+						LeaseHolder: "manual-direct-codex",
 					},
 					LeaseActive: true,
+					LeaseKind:   "manual",
 				},
 			})
 		case "/api/sync/leases/lease-live":
@@ -290,8 +292,8 @@ func TestRunCloudKeepaliveLiveIdentifiesHeartbeatsAndReportsUsage(t *testing.T) 
 	if heartbeatBody.AccountID != "acct-live" || heartbeatBody.DeviceID != "dev-a" {
 		t.Fatalf("heartbeat body = %+v, want acct-live/dev-a", heartbeatBody)
 	}
-	if heartbeatBody.TTLSeconds != 120 {
-		t.Fatalf("ttlSeconds = %d, want 120", heartbeatBody.TTLSeconds)
+	if heartbeatBody.TTLSeconds != 28800 {
+		t.Fatalf("ttlSeconds = %d, want 28800 for manual keepalive", heartbeatBody.TTLSeconds)
 	}
 	if heartbeatBody.Client == "" {
 		t.Fatal("heartbeat client should be populated")

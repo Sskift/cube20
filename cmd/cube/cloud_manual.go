@@ -210,7 +210,14 @@ func keepaliveLiveOnce(ctx context.Context, m *manager.Manager, opts cloudSyncOp
 		return fmt.Errorf("matched account %s has no active lease", emptyDash(accountID))
 	}
 
-	lease, shouldSwap, telemetryMissing, err := heartbeatLease(ctx, opts, leaseID, accountID, m.LiveCodexHome)
+	ttlSeconds := leaseTTLSeconds(opts)
+	if diag.Account.LeaseKind == "manual" {
+		// Manual live leases represent direct Codex use outside cube run. A
+		// keepalive must not shrink the long manual lease to the short cube-run
+		// heartbeat TTL, so send an 8h renewal and let the server clamp it.
+		ttlSeconds = int((8 * time.Hour).Seconds())
+	}
+	lease, shouldSwap, telemetryMissing, err := heartbeatLeaseWithTTL(ctx, opts, leaseID, accountID, m.LiveCodexHome, ttlSeconds)
 	if err != nil {
 		return err
 	}

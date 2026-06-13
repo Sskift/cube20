@@ -394,7 +394,11 @@ func (m *Manager) TouchLease(leaseID, accountID, clientID, holder string, ttl ti
 		_ = m.Save(state)
 		return Lease{}, err
 	}
-	ttl = normalizeLeaseTTL(ttl)
+	if leaseKindForAccount(account, now) == "manual" {
+		ttl = normalizeManualLeaseTTL(ttl)
+	} else {
+		ttl = normalizeLeaseTTL(ttl)
+	}
 	account.LeaseHolder = firstNonEmpty(strings.TrimSpace(holder), account.LeaseHolder)
 	account.LeaseHeartbeatAt = now
 	account.LeaseExpiresAt = now.Add(ttl)
