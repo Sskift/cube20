@@ -52,6 +52,75 @@ func TestPATCanReadMe(t *testing.T) {
 	}
 }
 
+func TestPATCanIdentifyManagedAuthReadOnly(t *testing.T) {
+	server, m, _, pat := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/sync/identify-auth", bytes.NewBufferString(`{"auth":{"OPENAI_API_KEY":"sk-test"}}`))
+	req.Header.Set("Authorization", "Bearer "+pat)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Matched bool                `json:"matched"`
+		Account manager.AccountView `json:"account"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if !out.Matched || out.Account.ID != "work" {
+		t.Fatalf("identify response = %+v, want matched work account", out)
+	}
+	account, err := m.GetAccount("work")
+	if err != nil {
+		t.Fatalf("GetAccount(work): %v", err)
+	}
+	if account.OwnerMode != manager.OwnerCloud {
+		t.Fatalf("owner mode changed to %q; identify-auth must be read-only", account.OwnerMode)
+	}
+}
+
+func TestPATIdentifyAuthHidesOtherWorkspaceAccounts(t *testing.T) {
+	server, m, _, pat := newTestServer(t)
+	secretWS, err := m.CreateWorkspace("Secret Pool", "admin")
+	if err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	if _, err := m.UpsertJSONProfile(manager.JSONProfile{
+		ID:    "secret",
+		Label: "Secret",
+		Auth:  json.RawMessage(`{"OPENAI_API_KEY":"sk-secret"}`),
+	}); err != nil {
+		t.Fatalf("UpsertJSONProfile(secret): %v", err)
+	}
+	if err := m.SetAccountWorkspace("secret", secretWS.ID); err != nil {
+		t.Fatalf("SetAccountWorkspace(secret): %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sync/identify-auth", bytes.NewBufferString(`{"auth":{"OPENAI_API_KEY":"sk-secret"}}`))
+	req.Header.Set("Authorization", "Bearer "+pat)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Matched bool `json:"matched"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if out.Matched {
+		t.Fatalf("matched account outside PAT workspace: body = %s", rec.Body.String())
+	}
+}
+
 func TestPATCannotAccessAdminRoute(t *testing.T) {
 	server, _, _, pat := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
@@ -165,11 +234,12 @@ func claimLease(t *testing.T, server *Server, pat string) (leaseID, accountID st
 // heartbeatResult mirrors the heartbeatResponse wire shape: promoted lease
 // fields plus shouldSwap.
 type heartbeatResult struct {
-	ID         string `json:"id"`
-	AccountID  string `json:"accountId"`
-	ClientID   string `json:"clientId"`
-	Generation int64  `json:"generation"`
-	ShouldSwap bool   `json:"shouldSwap"`
+	ID                    string `json:"id"`
+	AccountID             string `json:"accountId"`
+	ClientID              string `json:"clientId"`
+	Generation            int64  `json:"generation"`
+	ShouldSwap            bool   `json:"shouldSwap"`
+	QuotaTelemetryMissing bool   `json:"quotaTelemetryMissing"`
 }
 
 func doHeartbeat(t *testing.T, server *Server, pat, method, path, body string) heartbeatResult {
@@ -219,6 +289,24 @@ func TestHeartbeatNoSwapWhenHealthy(t *testing.T) {
 	}
 	if out.ShouldSwap {
 		t.Fatalf("shouldSwap = true, want false for 80%% remaining")
+	}
+}
+
+func TestHeartbeatMarksMissingQuotaTelemetry(t *testing.T) {
+	server, _, _, pat := newTestServer(t)
+	leaseID, accountID := claimLease(t, server, pat)
+
+	body := `{"accountId":"` + accountID + `","client":"tester","ttlSeconds":80}`
+	out := doHeartbeat(t, server, pat, http.MethodPatch, "/api/sync/leases/"+leaseID, body)
+
+	if out.ID != leaseID {
+		t.Fatalf("lease id = %q, want %q", out.ID, leaseID)
+	}
+	if !out.QuotaTelemetryMissing {
+		t.Fatal("quotaTelemetryMissing = false, want true when heartbeat sends no quota windows")
+	}
+	if out.ShouldSwap {
+		t.Fatal("shouldSwap = true, want false solely because telemetry is missing")
 	}
 }
 

@@ -191,6 +191,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/invites/", s.handleInviteAction)
 	mux.HandleFunc("/api/users", session(s.handleUsers))
 	mux.HandleFunc("/api/users/", session(s.handleUserAction))
+	mux.HandleFunc("/api/sync/identify-auth", sync(s.handleSyncIdentifyAuth))
 	mux.HandleFunc("/api/sync/push", sync(s.handleSyncPush))
 	mux.HandleFunc("/api/sync/pull/", sync(s.handleSyncPull))
 	mux.HandleFunc("/api/sync/claim", sync(s.handleSyncClaim))
@@ -332,6 +333,11 @@ func clientPATSyncForbidden(r *http.Request) string {
 			return ""
 		}
 		return "client PATs can only claim leases with GET or POST"
+	case path == "/api/sync/identify-auth":
+		if r.Method == http.MethodPost {
+			return ""
+		}
+		return "client PATs can only identify live auth with POST"
 	case path == "/api/sync/leases":
 		if r.Method == http.MethodPost {
 			return ""
@@ -620,6 +626,42 @@ func (s *Server) handleSyncPush(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.ManagerAccountView(account))
 }
 
+func (s *Server) handleSyncIdentifyAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Auth json.RawMessage `json:"auth"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	view, matched, err := s.Manager.IdentifyAuth(body.Auth)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	auth := authFromRequest(r)
+	if matched && !auth.Admin {
+		workspaceID := strings.TrimSpace(view.WorkspaceID)
+		if workspaceID == "" {
+			workspaceID = manager.DefaultWorkspaceID
+		}
+		if _, ok := s.Manager.MembershipRole(workspaceID, auth.principal()); !ok {
+			matched = false
+			view = manager.AccountView{}
+		}
+	}
+	if !matched {
+		writeJSON(w, http.StatusOK, map[string]any{"matched": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"matched": true, "account": view})
+}
+
 func (s *Server) handleSyncPull(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -702,7 +744,8 @@ func (s *Server) handleSyncLeases(w http.ResponseWriter, r *http.Request) {
 // a shouldSwap hint telling the client to roll to a fresher account.
 type heartbeatResponse struct {
 	manager.Lease
-	ShouldSwap bool `json:"shouldSwap"`
+	ShouldSwap            bool `json:"shouldSwap"`
+	QuotaTelemetryMissing bool `json:"quotaTelemetryMissing,omitempty"`
 }
 
 // heartbeatLease is the shared handler for both lease-heartbeat routes (the
@@ -742,6 +785,7 @@ func (s *Server) heartbeatLease(w http.ResponseWriter, r *http.Request, leaseID 
 		}
 		_ = s.Manager.RecordLeasedQuota(accountID, leaseID, auth.ClientID, result, time.Now())
 	}
+	quotaTelemetryMissing := len(windows) == 0
 
 	lease, err := s.Manager.TouchLease(leaseID, accountID, auth.ClientID, firstText(body.Holder, body.Client), ttl)
 	if err != nil {
@@ -753,7 +797,7 @@ func (s *Server) heartbeatLease(w http.ResponseWriter, r *http.Request, leaseID 
 	if body.RateLimitReached {
 		swap = true
 	}
-	writeJSON(w, http.StatusOK, heartbeatResponse{Lease: lease, ShouldSwap: swap})
+	writeJSON(w, http.StatusOK, heartbeatResponse{Lease: lease, ShouldSwap: swap, QuotaTelemetryMissing: quotaTelemetryMissing})
 }
 
 func (s *Server) handleSyncLeaseAction(w http.ResponseWriter, r *http.Request) {

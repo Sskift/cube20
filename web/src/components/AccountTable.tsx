@@ -13,6 +13,7 @@ import {
   shortTime,
 } from "../lib/format";
 import type { AccountRow } from "../lib/rows";
+import type { ChipColor, TranslateFn } from "../types";
 
 // One scannable table for the whole account pool. Columns: health, quota (bar +
 // label), 5h reset countdown, lease, reason, score. Clicking a row expands a
@@ -61,6 +62,8 @@ export function AccountTable({
         const isOpen = expanded === row.id;
         const isSelected = selectedId === row.id;
         const reset = countdown(row.resetsAt, now);
+        const runtime = runtimeChip(row, t);
+        const rowReason = row.runtimeReason || row.reason;
         return (
           <div key={row.id} className={`cube-row-wrap ${isOpen ? "is-open" : ""} ${isSelected ? "is-selected" : ""}`}>
             <button
@@ -77,8 +80,8 @@ export function AccountTable({
                     {row.name}
                     {row.active && <Chip color="accent" size="sm" variant="soft">{t("活跃", "active")}</Chip>}
                     {showPool && row.eligible !== undefined && (
-                      <Chip color={row.eligible ? "success" : "warning"} size="sm" variant="soft">
-                        {row.eligible ? t("在池中", "in pool") : t("池外", "out")}
+                      <Chip color={runtime.color} size="sm" variant="soft">
+                        {runtime.label}
                       </Chip>
                     )}
                   </span>
@@ -125,7 +128,7 @@ export function AccountTable({
               </span>
             </button>
 
-            {row.reason && !isOpen && <div className="cube-row-reason">{row.reason}</div>}
+            {rowReason && !isOpen && <div className="cube-row-reason">{rowReason}</div>}
 
             {isOpen && <RowDetail row={row} now={now} />}
           </div>
@@ -141,6 +144,7 @@ function RowDetail({ row, now }: { row: AccountRow; now: number }) {
     <div className="cube-row-detail">
       <div className="cube-detail-grid">
         <Detail label={t("归属", "owner")} value={row.ownerMode === "client" ? `client ${row.leaseClientId || "-"}` : "cloud"} />
+        <Detail label={t("运行状态", "runtime")} value={runtimeChip(row, t).label} />
         <Detail label={t("代次", "gen")} value={String(row.generation)} />
         <Detail label={t("凭据", "auth")} value={row.authPresent ? t("就绪", "ready") : t("缺失", "missing")} />
         <Detail label={t("配额来源", "source")} value={row.quotaSource || "-"} />
@@ -158,7 +162,7 @@ function RowDetail({ row, now }: { row: AccountRow; now: number }) {
           value={row.leaseActive ? `${dispatchTarget(row.leaseClientId, "", row.leaseHolder)} · ${t("至", "until")} ${shortTime(row.leaseExpiresAt)}` : "-"}
         />
       </div>
-      {row.reason && <div className="cube-detail-reason">{row.reason}</div>}
+      {(row.runtimeReason || row.reason) && <div className="cube-detail-reason">{row.runtimeReason || row.reason}</div>}
       {row.dispatch && (
         <div className="cube-detail-dispatch">
           <span className="cube-cell-label">{t("最近调度", "last dispatch")}</span>
@@ -169,6 +173,26 @@ function RowDetail({ row, now }: { row: AccountRow; now: number }) {
       )}
     </div>
   );
+}
+
+function runtimeChip(row: AccountRow, t: TranslateFn): { label: string; color: ChipColor } {
+  switch (row.runtimeState) {
+    case "available":
+      return { label: t("可用", "available"), color: "success" };
+    case "leased":
+      return { label: t("租用中", "leased"), color: "accent" };
+    case "quota_cooldown":
+      return { label: t("配额冷却", "quota cooldown"), color: "danger" };
+    case "refresh_needed":
+      return { label: t("需刷新", "refresh needed"), color: "warning" };
+    case "quota_telemetry_missing":
+      return { label: t("遥测缺失", "telemetry missing"), color: "warning" };
+    case "unavailable":
+      return { label: t("不可用", "unavailable"), color: "default" };
+    default:
+      if (row.eligible) return { label: t("在池中", "in pool"), color: "success" };
+      return { label: t("池外", "out"), color: "warning" };
+  }
 }
 
 function Detail({ label, value }: { label: string; value: string }) {

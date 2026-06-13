@@ -388,6 +388,8 @@ type Manager struct {
 	// File-mode managers never open it, so db stays nil.
 	dbMu sync.Mutex
 	db   *sql.DB
+
+	quotaFetcher func(context.Context, string, time.Time) (quota.Result, error)
 }
 
 func New() (*Manager, error) {

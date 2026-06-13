@@ -89,6 +89,9 @@ func (m *Manager) ClaimLease(ctx context.Context, clientID, holder, workspaceID 
 	if err := m.RecoverExpiredLeases(ctx); err != nil {
 		return LeaseSnapshot{}, err
 	}
+	if err := m.refreshStaleQuotaBeforeClaim(ctx, workspaceID); err != nil {
+		return LeaseSnapshot{}, err
+	}
 
 	// Lock order: stateMu (outermost) THEN the cross-process file lock.
 	m.stateMu.Lock()
@@ -185,6 +188,54 @@ func (m *Manager) ClaimLease(ctx context.Context, clientID, holder, workspaceID 
 	lease := leaseFromAccount(account)
 	return LeaseSnapshot{Lease: lease, Snapshot: snapshot}, nil
 }
+
+func (m *Manager) refreshStaleQuotaBeforeClaim(ctx context.Context, workspaceID string) error {
+	state, err := m.Load()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	ids := []string{}
+	workspaceID = strings.TrimSpace(workspaceID)
+	for _, account := range state.Accounts {
+		if workspaceID != "" && workspaceOrDefault(account.WorkspaceID) != workspaceID {
+			continue
+		}
+		if account.OwnerMode != OwnerCloud || account.Status != StatusReady || !m.accountAuthPresent(account) || accountLeaseActive(account, now) {
+			continue
+		}
+		if quotaCacheNeedsClaimRefresh(state.QuotaCache[account.ID], now) {
+			ids = append(ids, account.ID)
+		}
+	}
+	for _, id := range ids {
+		_, _ = m.FetchQuota(ctx, id)
+	}
+	return nil
+}
+
+func quotaCacheNeedsClaimRefresh(cache QuotaCache, now time.Time) bool {
+	if cache.Result.Status != quota.StatusSupported {
+		return false
+	}
+	fiveHour := cache.FiveHour
+	if fiveHour == nil {
+		fiveHour = quotaFiveHour(cache.Result)
+	}
+	if quotaWindowResetPassed(fiveHour, now) {
+		return true
+	}
+	return quotaWindowResetPassed(quotaSevenDay(cache.Result), now)
+}
+
+func quotaWindowResetPassed(window *quota.Window, now time.Time) bool {
+	if window == nil {
+		return false
+	}
+	resetAt := parseRFC3339(window.ResetsAt)
+	return !resetAt.IsZero() && !resetAt.After(now)
+}
+
 func (m *Manager) TouchLease(leaseID, accountID, clientID, holder string, ttl time.Duration) (Lease, error) {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()

@@ -48,6 +48,8 @@ export interface AccountRow {
   // scoring / reasons
   score?: number;
   reason?: string;
+  runtimeState?: string;
+  runtimeReason?: string;
   quotaSource?: string;
   // raw refs for the expand detail
   dispatch?: DispatchEvent;
@@ -102,6 +104,8 @@ function lbRow(account: LoadBalanceAccount, dispatch: DispatchEvent | undefined,
     leaseExpiresAt: account.leaseExpiresAt,
     score: account.quotaScore,
     reason: account.reason,
+    runtimeState: account.runtimeState,
+    runtimeReason: account.runtimeReason,
     dispatch,
   };
 }

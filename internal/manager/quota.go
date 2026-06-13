@@ -53,7 +53,11 @@ func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, erro
 	_ = m.syncLiveAuthToManaged(account)
 	authPath := filepath.Join(account.CodexHome, authFileName)
 	beforeDigest := fileDigest(authPath)
-	result, err := quota.FetchForCodexHome(ctx, account.CodexHome, now)
+	fetcher := m.quotaFetcher
+	if fetcher == nil {
+		fetcher = quota.FetchForCodexHome
+	}
+	result, err := fetcher(ctx, account.CodexHome, now)
 	afterDigest := fileDigest(authPath)
 	authChanged := beforeDigest != "" && afterDigest != "" && beforeDigest != afterDigest
 	_ = m.recordQuotaResult(id, result, authChanged, QuotaSourceCloud, "", false)

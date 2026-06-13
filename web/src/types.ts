@@ -253,6 +253,8 @@ export interface LoadBalanceAccount {
   leaseExpiresAt?: string;
   eligible: boolean;
   reason?: string;
+  runtimeState?: string;
+  runtimeReason?: string;
   quotaStatus?: string;
   quotaRemainingDisplay?: string;
   quotaRemainingPercent?: number;

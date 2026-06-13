@@ -27,6 +27,8 @@ type LoadBalanceAccount struct {
 	LeaseExpiresAt                time.Time        `json:"leaseExpiresAt,omitempty"`
 	Eligible                      bool             `json:"eligible"`
 	Reason                        string           `json:"reason,omitempty"`
+	RuntimeState                  RuntimeState     `json:"runtimeState,omitempty"`
+	RuntimeReason                 string           `json:"runtimeReason,omitempty"`
 	QuotaStatus                   quota.Status     `json:"quotaStatus,omitempty"`
 	QuotaRemainingDisplay         string           `json:"quotaRemainingDisplay,omitempty"`
 	QuotaRemainingPercent         float64          `json:"quotaRemainingPercent,omitempty"`
@@ -47,6 +49,17 @@ type LoadBalanceStatus struct {
 	Eligible      []LoadBalanceAccount `json:"eligible"`
 	Excluded      []LoadBalanceAccount `json:"excluded"`
 }
+
+type RuntimeState string
+
+const (
+	RuntimeAvailable             RuntimeState = "available"
+	RuntimeLeased                RuntimeState = "leased"
+	RuntimeQuotaCooldown         RuntimeState = "quota_cooldown"
+	RuntimeRefreshNeeded         RuntimeState = "refresh_needed"
+	RuntimeQuotaTelemetryMissing RuntimeState = "quota_telemetry_missing"
+	RuntimeUnavailable           RuntimeState = "unavailable"
+)
 
 // LoadBalanceStatus reports pool eligibility. workspaceID scopes the view to a
 // single pool; an empty workspaceID returns every account across all pools (the
@@ -98,6 +111,8 @@ func (m *Manager) LoadBalanceStatus(workspaceID string) (LoadBalanceStatus, erro
 		evaluation := loadBalanceEligibility(account, state.QuotaCache[account.ID], now)
 		entry.Eligible = evaluation.Eligible
 		entry.Reason = evaluation.Reason
+		entry.RuntimeState = evaluation.RuntimeState
+		entry.RuntimeReason = evaluation.RuntimeReason
 		entry.QuotaStatus = evaluation.QuotaStatus
 		entry.QuotaRemainingDisplay = evaluation.QuotaRemainingDisplay
 		entry.QuotaRemainingPercent = evaluation.QuotaRemainingPercent
@@ -143,6 +158,8 @@ type loadBalanceEvaluation struct {
 	QuotaSevenDayUsedPercent      float64
 	QuotaSevenDayResetsAt         string
 	QuotaBindingWindow            string
+	RuntimeState                  RuntimeState
+	RuntimeReason                 string
 }
 
 func loadBalanceEligibility(account AccountView, cache QuotaCache, now time.Time) loadBalanceEvaluation {
@@ -167,48 +184,51 @@ func loadBalanceEligibilityForAccount(account Account, authPresent bool, cache Q
 		now,
 	)
 }
-func evaluateLoadBalanceFields(ownerMode AccountOwnerMode, status AccountStatus, authPresent, leaseActive bool, leaseExpiresAt time.Time, cache QuotaCache, now time.Time) loadBalanceEvaluation {
-	evaluation := loadBalanceQuotaEvaluation(cache, now)
+func evaluateLoadBalanceFields(ownerMode AccountOwnerMode, status AccountStatus, authPresent, leaseActive bool, leaseExpiresAt time.Time, cache QuotaCache, now time.Time) (evaluation loadBalanceEvaluation) {
+	defer func() {
+		evaluation.RuntimeState, evaluation.RuntimeReason = runtimeStateForEvaluation(evaluation)
+	}()
+	evaluation = loadBalanceQuotaEvaluation(cache, now)
 	if ownerMode != OwnerCloud {
 		evaluation.Reason = fmt.Sprintf("owner is %s", ownerMode)
-		return evaluation
+		return
 	}
 	if status != StatusReady {
 		evaluation.Reason = fmt.Sprintf("status is %s", status)
-		return evaluation
+		return
 	}
 	if !authPresent {
 		evaluation.Reason = "auth.json missing"
-		return evaluation
+		return
 	}
 	if leaseActive {
 		evaluation.Reason = fmt.Sprintf("leased until %s", leaseExpiresAt.Format(time.RFC3339))
-		return evaluation
+		return
 	}
 	if evaluation.QuotaStatus == "" {
 		evaluation.Reason = "quota not checked"
-		return evaluation
+		return
 	}
 	if evaluation.QuotaStatus != quota.StatusSupported {
 		evaluation.Reason = fmt.Sprintf("quota is %s", evaluation.QuotaStatus)
-		return evaluation
+		return
 	}
 	if cache.FiveHour == nil {
 		evaluation.Reason = "5h quota missing"
-		return evaluation
+		return
 	}
 	resetAt := parseRFC3339(cache.FiveHour.ResetsAt)
 	if resetAt.IsZero() {
 		evaluation.Reason = "5h reset unknown"
-		return evaluation
+		return
 	}
 	if !resetAt.After(now) {
 		evaluation.Reason = "5h reset passed; refresh needed"
-		return evaluation
+		return
 	}
 	if cache.FiveHour.RemainingPercent <= loadBalanceMinFiveHourRemaining {
 		evaluation.Reason = fmt.Sprintf("5h quota exhausted until %s", resetAt.Format(time.RFC3339))
-		return evaluation
+		return
 	}
 	// 7d window is present only for cloud-fetched accounts. When present and
 	// exhausted (or its reset has passed) the account cannot run even though the
@@ -218,7 +238,7 @@ func evaluateLoadBalanceFields(ownerMode AccountOwnerMode, status AccountStatus,
 		sevenReset := parseRFC3339(sevenDay.ResetsAt)
 		if !sevenReset.IsZero() && !sevenReset.After(now) {
 			evaluation.Reason = "7d reset passed; refresh needed"
-			return evaluation
+			return
 		}
 		if sevenDay.RemainingPercent <= loadBalanceMinFiveHourRemaining {
 			if sevenReset.IsZero() {
@@ -226,13 +246,32 @@ func evaluateLoadBalanceFields(ownerMode AccountOwnerMode, status AccountStatus,
 			} else {
 				evaluation.Reason = fmt.Sprintf("7d quota exhausted until %s", sevenReset.Format(time.RFC3339))
 			}
-			return evaluation
+			return
 		}
 	}
 	evaluation.Eligible = true
 	evaluation.Reason = ""
 	evaluation.QuotaScore = loadBalanceQuotaScore(*bindingWindow(cache.FiveHour, sevenDay), now)
-	return evaluation
+	return
+}
+
+func runtimeStateForEvaluation(evaluation loadBalanceEvaluation) (RuntimeState, string) {
+	if evaluation.Eligible {
+		return RuntimeAvailable, "eligible for new leases"
+	}
+	reason := strings.TrimSpace(evaluation.Reason)
+	switch {
+	case strings.HasPrefix(reason, "leased until"):
+		return RuntimeLeased, reason
+	case strings.Contains(reason, "quota exhausted"):
+		return RuntimeQuotaCooldown, reason
+	case strings.Contains(reason, "reset passed; refresh needed"):
+		return RuntimeRefreshNeeded, reason
+	case reason == "quota not checked" || reason == "5h quota missing" || reason == "5h reset unknown":
+		return RuntimeQuotaTelemetryMissing, reason
+	default:
+		return RuntimeUnavailable, reason
+	}
 }
 func loadBalanceQuotaEvaluation(cache QuotaCache, now time.Time) loadBalanceEvaluation {
 	evaluation := loadBalanceEvaluation{

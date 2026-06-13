@@ -368,3 +368,43 @@ func TestCleanupRunReleasesOnCancelledContext(t *testing.T) {
 		t.Fatalf("expected lease release despite cancelled ctx (Ctrl-C must free the lease)")
 	}
 }
+
+func TestPrepareSwapLeaseReleasesNewLeaseWhenWriteFails(t *testing.T) {
+	current := manager.LeaseSnapshot{}
+	current.Lease.ID = "lease-old"
+	current.Snapshot.ID = "acct-old"
+
+	claimed := manager.LeaseSnapshot{}
+	claimed.Lease.ID = "lease-new"
+	claimed.Snapshot.ID = "acct-new"
+	claimed.Snapshot.Auth = []byte(`{"token":"new"}`)
+
+	var released []string
+	next, err := prepareSwapLease(
+		context.Background(),
+		&manager.Manager{},
+		cloudSyncOptions{Client: "client-1"},
+		current,
+		t.TempDir(),
+		func(context.Context, cloudSyncOptions) (manager.LeaseSnapshot, error) {
+			return claimed, nil
+		},
+		func(*manager.Manager, manager.ProfileSnapshot, string) error {
+			return os.ErrPermission
+		},
+		func(ctx context.Context, opts cloudSyncOptions, leaseID, accountID string) error {
+			released = append(released, leaseID+":"+accountID)
+			return nil
+		},
+	)
+
+	if err == nil {
+		t.Fatal("prepareSwapLease() error = nil, want write failure")
+	}
+	if next.Lease.ID != current.Lease.ID {
+		t.Fatalf("next lease = %q, want old lease %q after failed prep", next.Lease.ID, current.Lease.ID)
+	}
+	if len(released) != 1 || released[0] != "lease-new:acct-new" {
+		t.Fatalf("released = %v, want only new lease released", released)
+	}
+}

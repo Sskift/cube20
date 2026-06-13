@@ -696,6 +696,63 @@ func TestShouldSwapLease(t *testing.T) {
 	}
 }
 
+func TestLoadBalanceRuntimeStateExplainsQuotaConditions(t *testing.T) {
+	now := time.Now()
+	ready := AccountView{Account: Account{OwnerMode: OwnerCloud, Status: StatusReady}, AuthPresent: true}
+
+	cooldownCache := quotaCacheForTest(3, now.Add(time.Hour))
+	cooldown := loadBalanceEligibility(ready, cooldownCache, now)
+	if cooldown.RuntimeState != RuntimeQuotaCooldown {
+		t.Fatalf("cooldown runtime state = %q, want %q (reason %q)", cooldown.RuntimeState, RuntimeQuotaCooldown, cooldown.Reason)
+	}
+	if cooldown.RuntimeReason == "" {
+		t.Fatal("cooldown runtime reason is empty")
+	}
+
+	refreshCache := quotaCacheForTest(50, now.Add(-time.Minute))
+	refresh := loadBalanceEligibility(ready, refreshCache, now)
+	if refresh.RuntimeState != RuntimeRefreshNeeded {
+		t.Fatalf("refresh runtime state = %q, want %q (reason %q)", refresh.RuntimeState, RuntimeRefreshNeeded, refresh.Reason)
+	}
+
+	missing := loadBalanceEligibility(ready, QuotaCache{}, now)
+	if missing.RuntimeState != RuntimeQuotaTelemetryMissing {
+		t.Fatalf("missing runtime state = %q, want %q (reason %q)", missing.RuntimeState, RuntimeQuotaTelemetryMissing, missing.Reason)
+	}
+}
+
+func TestClaimLeaseRefreshesStaleQuotaBeforeSelecting(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "stale", OwnerMode: OwnerCloud, Status: StatusReady})
+	saveTestQuota(t, m, "stale", 0, time.Now().Add(-time.Minute))
+
+	var refreshed []string
+	m.quotaFetcher = func(ctx context.Context, codexHome string, now time.Time) (quota.Result, error) {
+		refreshed = append(refreshed, filepath.Base(codexHome))
+		window := quota.Window{
+			Key:              "five_hour",
+			Label:            "5h",
+			UsedPercent:      20,
+			RemainingPercent: 80,
+			UsedDisplay:      "20%",
+			RemainingDisplay: "80%",
+			ResetsAt:         now.Add(time.Hour).UTC().Format(time.RFC3339),
+		}
+		return quota.Result{Status: quota.StatusSupported, Plan: "pro", Quotas: []quota.Window{window}}, nil
+	}
+
+	lease, err := m.ClaimLease(context.Background(), "client-1", "holder-1", "", time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimLease() error = %v", err)
+	}
+	if lease.Snapshot.ID != "stale" {
+		t.Fatalf("leased account = %q, want stale", lease.Snapshot.ID)
+	}
+	if len(refreshed) != 1 || refreshed[0] != "stale" {
+		t.Fatalf("refreshed = %v, want [stale]", refreshed)
+	}
+}
+
 func TestFetchQuotaSkipsNetworkWhenLeased(t *testing.T) {
 	m := newTestManager(t)
 	saveTestAccounts(t, m, Account{
@@ -869,6 +926,30 @@ func saveTestQuota(t *testing.T, m *Manager, accountID string, remaining float64
 	}
 	if err := m.Save(state); err != nil {
 		t.Fatalf("Save() error = %v", err)
+	}
+}
+
+func quotaCacheForTest(remaining float64, resetAt time.Time) QuotaCache {
+	used := 100 - remaining
+	window := quota.Window{
+		Key:              "five_hour",
+		Label:            "5h",
+		UsedPercent:      used,
+		RemainingPercent: remaining,
+		UsedDisplay:      fmt.Sprintf("%.0f%%", used),
+		RemainingDisplay: fmt.Sprintf("%.0f%%", remaining),
+		ResetsAt:         resetAt.UTC().Format(time.RFC3339),
+	}
+	return QuotaCache{
+		AccountID: "test",
+		UpdatedAt: time.Now(),
+		Result: quota.Result{
+			Status: quota.StatusSupported,
+			Plan:   "pro",
+			Quotas: []quota.Window{window},
+		},
+		FiveHour: &window,
+		Source:   QuotaSourceCloud,
 	}
 }
 

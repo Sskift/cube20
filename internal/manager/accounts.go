@@ -203,6 +203,35 @@ func (m *Manager) ExportLiveProfileSnapshot(ownerClientID string) (ProfileSnapsh
 		UpdatedAt:     updatedAt,
 	}, nil
 }
+
+// IdentifyAuth returns the managed account whose auth identity matches authRaw.
+// It is intentionally read-only: unlike UpsertProfileSnapshot it never writes
+// account files, changes ownership, or creates a new account.
+func (m *Manager) IdentifyAuth(authRaw json.RawMessage) (AccountView, bool, error) {
+	if len(authRaw) == 0 || string(authRaw) == "null" {
+		return AccountView{}, false, errors.New("auth is required")
+	}
+	var auth map[string]any
+	if err := json.Unmarshal(authRaw, &auth); err != nil {
+		return AccountView{}, false, fmt.Errorf("auth is not valid JSON: %w", err)
+	}
+	identity := authIdentity(auth)
+	if identity == "" {
+		return AccountView{}, false, nil
+	}
+	state, err := m.Load()
+	if err != nil {
+		return AccountView{}, false, err
+	}
+	for _, account := range state.Accounts {
+		existing := readAuthMetadata(filepath.Join(account.CodexHome, authFileName))
+		if authIdentity(existing) == identity {
+			return m.accountView(account), true, nil
+		}
+	}
+	return AccountView{}, false, nil
+}
+
 func (m *Manager) UpsertProfileSnapshot(snapshot ProfileSnapshot) (Account, error) {
 	// Lock order: stateMu (outermost, intra-process) THEN the cross-process file
 	// lock. UpsertJSONProfile's core is called via its unlocked variant because

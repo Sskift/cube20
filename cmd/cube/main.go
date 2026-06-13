@@ -149,6 +149,14 @@ type cloudSyncOptions struct {
 	Interval    time.Duration
 }
 
+type liveAuthDiagnosis struct {
+	AuthPath    string
+	AuthPresent bool
+	Checked     bool
+	Matched     bool
+	Account     manager.AccountView
+}
+
 func runCloud(m *manager.Manager, args []string) error {
 	if len(args) == 0 {
 		return printCloudStatus(m)
@@ -246,7 +254,85 @@ func printCloudStatus(m *manager.Manager) error {
 		fmt.Printf("device id: %s\n", emptyDash(settings.DeviceID))
 		fmt.Printf("device label: %s\n", emptyDash(settings.DeviceLabel))
 	}
+	opts := defaultCloudSyncOptions(m)
+	diag, err := identifyLiveAuth(context.Background(), m, opts)
+	printLiveAuthDiagnosis(diag, err, opts)
 	return nil
+}
+
+func identifyLiveAuth(ctx context.Context, m *manager.Manager, opts cloudSyncOptions) (liveAuthDiagnosis, error) {
+	codexHome := strings.TrimSpace(m.LiveCodexHome)
+	if codexHome == "" {
+		if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+			codexHome = filepath.Join(home, ".codex")
+		}
+	}
+	diag := liveAuthDiagnosis{AuthPath: filepath.Join(codexHome, "auth.json")}
+	authRaw, err := os.ReadFile(diag.AuthPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return diag, nil
+	}
+	if err != nil {
+		return diag, err
+	}
+	diag.AuthPresent = true
+	if strings.TrimSpace(opts.Server) == "" {
+		return diag, nil
+	}
+	var out struct {
+		Matched bool                `json:"matched"`
+		Account manager.AccountView `json:"account"`
+	}
+	body := struct {
+		Auth json.RawMessage `json:"auth"`
+	}{
+		Auth: authRaw,
+	}
+	if err := cloudJSON(ctx, http.MethodPost, opts, "/api/sync/identify-auth", body, &out); err != nil {
+		return diag, err
+	}
+	diag.Checked = true
+	diag.Matched = out.Matched
+	diag.Account = out.Account
+	return diag, nil
+}
+
+func printLiveAuthDiagnosis(diag liveAuthDiagnosis, err error, opts cloudSyncOptions) {
+	if diag.AuthPath == "" {
+		return
+	}
+	if !diag.AuthPresent {
+		fmt.Printf("live auth: missing (%s)\n", diag.AuthPath)
+		return
+	}
+	if strings.TrimSpace(opts.Server) == "" {
+		fmt.Printf("live auth: present (%s); identify skipped (cloud server missing)\n", diag.AuthPath)
+		return
+	}
+	if err != nil {
+		fmt.Printf("live auth: present (%s); identify failed: %v\n", diag.AuthPath, err)
+		return
+	}
+	if !diag.Checked {
+		fmt.Printf("live auth: present (%s); identify skipped\n", diag.AuthPath)
+		return
+	}
+	if !diag.Matched {
+		fmt.Printf("live auth: present (%s); not matched to a managed account in this workspace\n", diag.AuthPath)
+		return
+	}
+	label := strings.TrimSpace(diag.Account.Label)
+	if label == "" {
+		label = diag.Account.ID
+	}
+	lease := "none"
+	if diag.Account.LeaseActive {
+		lease = "active"
+		if diag.Account.LeaseClientID != "" {
+			lease += " by " + diag.Account.LeaseClientID
+		}
+	}
+	fmt.Printf("live auth: matches managed account %s (%s), owner=%s, lease=%s; direct codex would use it outside cube run\n", diag.Account.ID, label, emptyDash(string(diag.Account.OwnerMode)), lease)
 }
 
 func configureCloud(m *manager.Manager, args []string) error {
@@ -621,12 +707,13 @@ func runCloudRun(m *manager.Manager, args []string) error {
 
 		sid, sidErr := newestSessionID(codexHome)
 		if sidErr != nil {
-			fmt.Fprintf(os.Stderr, "cube: cannot resume after swap: %v\n", sidErr)
+			fmt.Fprintf(os.Stderr, "cube: cannot resume after swap: %v; run directory preserved at %s\n", sidErr, codexHome)
 			break
 		}
-		newLease, claimErr := claimLeaseSnapshot(ctx, opts)
-		if claimErr != nil {
-			fmt.Fprintf(os.Stderr, "cube: swap claim failed: %v\n", claimErr)
+		newLease, prepErr := prepareSwapLease(ctx, m, opts, lease, codexHome, claimLeaseSnapshot, writeSnapshotToStableHome, releaseLease)
+		if prepErr != nil {
+			fmt.Fprintf(os.Stderr, "cube: swap preparation failed: %v; keeping current lease for cleanup; run directory %s\n", prepErr, codexHome)
+			runErr = prepErr
 			break
 		}
 		// Release the OLD lease only after the NEW one is claimed so the cloud
@@ -635,10 +722,6 @@ func runCloudRun(m *manager.Manager, args []string) error {
 			fmt.Fprintf(os.Stderr, "cube: releasing prior lease failed: %v\n", relErr)
 		}
 		lease = newLease
-		if err := writeSnapshotToStableHome(m, lease.Snapshot, codexHome); err != nil {
-			runErr = err
-			break
-		}
 		fmt.Fprintf(os.Stderr, "cube: swapped to %s (%s); resuming session %s\n", lease.Snapshot.ID, lease.Lease.ID, sid)
 		args2 = []string{"resume", sid}
 	}
@@ -696,6 +779,24 @@ func cleanupRun(ctx context.Context, opts cloudSyncOptions, lease manager.LeaseS
 		releaseErr = releaseLease(cleanupCtx, opts, lease.Lease.ID, lease.Snapshot.ID)
 	}
 	return usageErr, releaseErr
+}
+
+type claimLeaseSnapshotFunc func(context.Context, cloudSyncOptions) (manager.LeaseSnapshot, error)
+type writeSnapshotFunc func(*manager.Manager, manager.ProfileSnapshot, string) error
+type releaseLeaseFunc func(context.Context, cloudSyncOptions, string, string) error
+
+func prepareSwapLease(ctx context.Context, m *manager.Manager, opts cloudSyncOptions, current manager.LeaseSnapshot, codexHome string, claim claimLeaseSnapshotFunc, write writeSnapshotFunc, release releaseLeaseFunc) (manager.LeaseSnapshot, error) {
+	next, err := claim(ctx, opts)
+	if err != nil {
+		return current, err
+	}
+	if err := write(m, next.Snapshot, codexHome); err != nil {
+		if relErr := release(ctx, opts, next.Lease.ID, next.Snapshot.ID); relErr != nil {
+			return current, fmt.Errorf("write swap snapshot failed: %w; releasing new lease failed: %v", err, relErr)
+		}
+		return current, err
+	}
+	return next, nil
 }
 
 func parseCloudRunOptions(m *manager.Manager, args []string) (cloudSyncOptions, []string, error) {
@@ -824,16 +925,21 @@ func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapsh
 		defer close(stopped)
 		ticker := time.NewTicker(opts.Interval)
 		defer ticker.Stop()
+		warnedMissingTelemetry := false
 		for {
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
-				lease, shouldSwap, err := heartbeatLease(ctx, opts, leaseSnapshot.Lease.ID, snapshot.ID, codexHome)
+				lease, shouldSwap, telemetryMissing, err := heartbeatLease(ctx, opts, leaseSnapshot.Lease.ID, snapshot.ID, codexHome)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "cube: lease heartbeat failed: %v\n", err)
 				} else if lease.Generation > 0 {
 					snapshot.Generation = lease.Generation
+				}
+				if telemetryMissing && !warnedMissingTelemetry {
+					warnedMissingTelemetry = true
+					fmt.Fprintln(os.Stderr, "cube: quota telemetry missing from codex session log; using cached cloud quota until rate_limits appear")
 				}
 				nextDigest := localFileDigest(authPath)
 				if nextDigest != "" && nextDigest != lastDigest {
@@ -872,7 +978,7 @@ func runCommandWithLease(ctx context.Context, opts cloudSyncOptions, leaseSnapsh
 	return swap, runErr, nil
 }
 
-func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, accountID, codexHome string) (manager.Lease, bool, error) {
+func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, accountID, codexHome string) (manager.Lease, bool, bool, error) {
 	body := struct {
 		AccountID        string         `json:"accountId"`
 		Client           string         `json:"client"`
@@ -894,10 +1000,11 @@ func heartbeatLease(ctx context.Context, opts cloudSyncOptions, leaseID, account
 
 	var resp struct {
 		manager.Lease
-		ShouldSwap bool `json:"shouldSwap"`
+		ShouldSwap            bool `json:"shouldSwap"`
+		QuotaTelemetryMissing bool `json:"quotaTelemetryMissing"`
 	}
 	err := cloudJSON(ctx, http.MethodPatch, opts, "/api/sync/leases/"+url.PathEscape(leaseID), body, &resp)
-	return resp.Lease, resp.ShouldSwap, err
+	return resp.Lease, resp.ShouldSwap, resp.QuotaTelemetryMissing, err
 }
 
 func pushLeasedAuthFromHome(ctx context.Context, opts cloudSyncOptions, snapshot manager.ProfileSnapshot, codexHome string) (manager.AccountView, error) {
