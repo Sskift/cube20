@@ -189,6 +189,138 @@ func (m *Manager) ClaimLease(ctx context.Context, clientID, holder, workspaceID 
 	return LeaseSnapshot{Lease: lease, Snapshot: snapshot}, nil
 }
 
+type ManualBorrowRequest struct {
+	AccountRef  string
+	Auth        json.RawMessage
+	ClientID    string
+	Holder      string
+	WorkspaceID string
+	TTL         time.Duration
+}
+
+func (m *Manager) ManualBorrowLive(ctx context.Context, request ManualBorrowRequest) (LeaseSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return LeaseSnapshot{}, err
+	}
+	accountRef := strings.TrimSpace(request.AccountRef)
+	if accountRef == "" {
+		return LeaseSnapshot{}, errors.New("manual borrow needs account id or label")
+	}
+	clientID := strings.TrimSpace(request.ClientID)
+	if clientID == "" {
+		return LeaseSnapshot{}, errors.New("manual borrow needs client id")
+	}
+	if len(request.Auth) == 0 || string(request.Auth) == "null" {
+		return LeaseSnapshot{}, errors.New("manual borrow needs auth")
+	}
+	if !json.Valid(request.Auth) {
+		return LeaseSnapshot{}, errors.New("auth is not valid JSON")
+	}
+	var liveAuth map[string]any
+	if err := json.Unmarshal(request.Auth, &liveAuth); err != nil {
+		return LeaseSnapshot{}, fmt.Errorf("auth is not valid JSON: %w", err)
+	}
+	liveIdentity := authIdentity(liveAuth)
+	if liveIdentity == "" {
+		return LeaseSnapshot{}, errors.New("auth identity is empty")
+	}
+
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	lockPath := filepath.Join(m.StateDir, "run-round-robin.lock")
+	unlock, err := m.acquireLock(lockPath)
+	if err != nil {
+		return LeaseSnapshot{}, err
+	}
+	defer unlock()
+
+	state, err := m.Load()
+	if err != nil {
+		return LeaseSnapshot{}, err
+	}
+	now := time.Now()
+	state, _, _ = expireAccountLeases(state, now)
+	index, account, err := resolveAccountReference(state, accountRef, request.WorkspaceID)
+	if err != nil {
+		_ = m.Save(state)
+		return LeaseSnapshot{}, err
+	}
+	if account.OwnerMode != OwnerCloud {
+		_ = m.Save(state)
+		return LeaseSnapshot{}, fmt.Errorf("account %s is %s-owned; manual borrow only supports cloud-owned accounts", account.ID, account.OwnerMode)
+	}
+	if account.Status != StatusReady {
+		_ = m.Save(state)
+		return LeaseSnapshot{}, fmt.Errorf("account %s status is %s", account.ID, account.Status)
+	}
+	if accountLeaseActive(account, now) {
+		_ = m.Save(state)
+		return LeaseSnapshot{}, fmt.Errorf("account %s is already leased by %s until %s", account.ID, account.LeaseClientID, account.LeaseExpiresAt.Format(time.RFC3339))
+	}
+	existingIdentity := authIdentity(readAuthMetadata(filepath.Join(account.CodexHome, authFileName)))
+	if existingIdentity != "" && existingIdentity != liveIdentity {
+		_ = m.Save(state)
+		return LeaseSnapshot{}, fmt.Errorf("live auth does not match account %s", account.ID)
+	}
+
+	leaseID, err := generateLeaseID()
+	if err != nil {
+		_ = m.Save(state)
+		return LeaseSnapshot{}, err
+	}
+	if err := m.writeProfileFiles(account, request.Auth); err != nil {
+		_ = m.Save(state)
+		return LeaseSnapshot{}, err
+	}
+	ttl := normalizeManualLeaseTTL(request.TTL)
+	account.Generation++
+	account.LeaseID = leaseID
+	account.LeaseClientID = clientID
+	account.LeaseHolder = firstNonEmpty(strings.TrimSpace(request.Holder), "manual-direct-codex")
+	account.LeaseStartedAt = now
+	account.LeaseHeartbeatAt = now
+	account.LeaseExpiresAt = now.Add(ttl)
+	account.LastError = ""
+	account.UpdatedAt = now
+	state.Accounts[index] = account
+	state.Dispatches = appendDispatchEvent(state.Dispatches, dispatchEventFromAccount(state, account, "manual_claimed", now))
+	if err := m.Save(state); err != nil {
+		return LeaseSnapshot{}, err
+	}
+
+	snapshot, err := m.ExportProfileSnapshot(account.ID)
+	if err != nil {
+		return LeaseSnapshot{}, err
+	}
+	snapshot.LeaseID = leaseID
+	snapshot.Generation = account.Generation
+	snapshot.SourceClient = account.LeaseHolder
+	return LeaseSnapshot{Lease: leaseFromAccount(account), Snapshot: snapshot}, nil
+}
+
+func resolveAccountReference(state State, ref, workspaceID string) (int, Account, error) {
+	ref = strings.TrimSpace(ref)
+	workspaceID = strings.TrimSpace(workspaceID)
+	matches := []int{}
+	for i, account := range state.Accounts {
+		if workspaceID != "" && workspaceOrDefault(account.WorkspaceID) != workspaceID {
+			continue
+		}
+		if account.ID == ref || strings.EqualFold(strings.TrimSpace(account.Label), ref) {
+			matches = append(matches, i)
+		}
+	}
+	if len(matches) == 0 {
+		return -1, Account{}, fmt.Errorf("account %q not found", ref)
+	}
+	if len(matches) > 1 {
+		return -1, Account{}, fmt.Errorf("account reference %q is ambiguous", ref)
+	}
+	index := matches[0]
+	return index, state.Accounts[index], nil
+}
+
 func (m *Manager) refreshStaleQuotaBeforeClaim(ctx context.Context, workspaceID string) error {
 	state, err := m.Load()
 	if err != nil {
@@ -351,6 +483,9 @@ func (m *Manager) UpdateLeasedProfileSnapshot(snapshot ProfileSnapshot, clientID
 var ErrLeaseNotFound = errors.New("lease not found")
 
 func (m *Manager) ReleaseLease(accountID, leaseID, clientID string) error {
+	if strings.TrimSpace(accountID) == "" && strings.TrimSpace(leaseID) == "" {
+		return fmt.Errorf("%w: missing account id or lease id", ErrLeaseNotFound)
+	}
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
 
@@ -376,6 +511,9 @@ func (m *Manager) ReleaseLease(accountID, leaseID, clientID string) error {
 		}
 		return fmt.Errorf("%w: %v", ErrLeaseNotFound, err)
 	}
+	if strings.TrimSpace(leaseID) == "" {
+		leaseID = account.LeaseID
+	}
 	if err := validateLease(account, leaseID, clientID, now); err != nil {
 		return err
 	}
@@ -385,6 +523,53 @@ func (m *Manager) ReleaseLease(accountID, leaseID, clientID string) error {
 	state.Accounts[index] = account
 	return m.Save(state)
 }
+
+// ActiveLeaseSnapshot resolves an active lease by account id/label and/or lease
+// id. It is a read-side companion to ReleaseLease, used by HTTP handlers that
+// need to accept both CLI-style precise returns and dashboard-style account
+// returns without making callers know the lease id.
+func (m *Manager) ActiveLeaseSnapshot(accountRef, leaseID, clientID, workspaceID string) (AccountView, Lease, error) {
+	accountRef = strings.TrimSpace(accountRef)
+	leaseID = strings.TrimSpace(leaseID)
+	if accountRef == "" && leaseID == "" {
+		return AccountView{}, Lease{}, fmt.Errorf("%w: missing account id or lease id", ErrLeaseNotFound)
+	}
+
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	state, err := m.Load()
+	if err != nil {
+		return AccountView{}, Lease{}, err
+	}
+	now := time.Now()
+	state, _, changed := expireAccountLeases(state, now)
+	if changed {
+		if err := m.Save(state); err != nil {
+			return AccountView{}, Lease{}, err
+		}
+	}
+
+	var account Account
+	if accountRef != "" {
+		_, account, err = resolveAccountReference(state, accountRef, workspaceID)
+	} else {
+		_, account, err = findLeaseAccount(state, "", leaseID)
+	}
+	if err != nil {
+		return AccountView{}, Lease{}, fmt.Errorf("%w: %v", ErrLeaseNotFound, err)
+	}
+	if leaseID == "" {
+		leaseID = account.LeaseID
+	}
+	if err := validateLease(account, leaseID, clientID, now); err != nil {
+		return AccountView{}, Lease{}, err
+	}
+	view := m.accountView(account)
+	decorateAccountRuntime(&view, account, state, now)
+	return view, leaseFromAccount(account), nil
+}
+
 func (m *Manager) AccountHasActiveLease(id string) (bool, error) {
 	account, err := m.GetAccount(id)
 	if err != nil {
@@ -449,6 +634,16 @@ func leaseFromAccount(account Account) Lease {
 		ExpiresAt:   account.LeaseExpiresAt,
 	}
 }
+func leaseKindForAccount(account Account, now time.Time) string {
+	if !accountLeaseActive(account, now) {
+		return ""
+	}
+	holder := strings.TrimSpace(account.LeaseHolder)
+	if strings.HasPrefix(holder, "manual:") || holder == "manual-direct-codex" || strings.HasPrefix(holder, "manual-") {
+		return "manual"
+	}
+	return "client"
+}
 func clearAccountLease(account *Account) {
 	account.LeaseID = ""
 	account.LeaseClientID = ""
@@ -466,6 +661,20 @@ func normalizeLeaseTTL(ttl time.Duration) time.Duration {
 	}
 	return ttl
 }
+
+func normalizeManualLeaseTTL(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return 8 * time.Hour
+	}
+	if ttl < 5*time.Minute {
+		return 5 * time.Minute
+	}
+	if ttl > 24*time.Hour {
+		return 24 * time.Hour
+	}
+	return ttl
+}
+
 func expireAccountLeases(state State, now time.Time) (State, []string, bool) {
 	expired := []string{}
 	changed := false

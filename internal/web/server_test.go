@@ -148,6 +148,140 @@ func TestPATCanClaimLease(t *testing.T) {
 	}
 }
 
+func TestPATCanManualBorrowAndReturnLiveAuth(t *testing.T) {
+	server, m, _, pat := newTestServer(t)
+	beforeQuota := loadWebTestState(t, m).QuotaCache["work"]
+	req := httptest.NewRequest(http.MethodPost, "/api/sync/manual-borrow", bytes.NewBufferString(`{
+		"account":"Work",
+		"auth":{"OPENAI_API_KEY":"sk-test","note":"local-live"},
+		"ttlSeconds":28800,
+		"holder":"manual-direct-codex"
+	}`))
+	req.Header.Set("Authorization", "Bearer "+pat)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("borrow status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var lease manager.LeaseSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &lease); err != nil {
+		t.Fatalf("decode borrow response: %v", err)
+	}
+	if lease.Lease.AccountID != "work" || lease.Lease.ClientID == "" || lease.Lease.ID == "" {
+		t.Fatalf("lease = %+v, want work lease for PAT client", lease.Lease)
+	}
+	account, err := m.GetAccount("work")
+	if err != nil {
+		t.Fatalf("GetAccount(work): %v", err)
+	}
+	if account.LeaseID != lease.Lease.ID || account.LeaseHolder != "manual-direct-codex" {
+		t.Fatalf("account lease fields = %+v, want manual borrow lease", account)
+	}
+	view, err := m.AccountViewByID("work")
+	if err != nil {
+		t.Fatalf("AccountViewByID(work): %v", err)
+	}
+	if view.LeaseKind != "manual" || view.RuntimeState != manager.RuntimeLeased {
+		t.Fatalf("view lease/runtime = kind:%q state:%q, want manual/leased", view.LeaseKind, view.RuntimeState)
+	}
+	if afterQuota := loadWebTestState(t, m).QuotaCache["work"]; !afterQuota.UpdatedAt.Equal(beforeQuota.UpdatedAt) {
+		t.Fatalf("quota cache updated during manual borrow: before=%s after=%s", beforeQuota.UpdatedAt, afterQuota.UpdatedAt)
+	}
+
+	returnReq := httptest.NewRequest(http.MethodPost, "/api/sync/manual-return", bytes.NewBufferString(`{"account":"Work"}`))
+	returnReq.Header.Set("Authorization", "Bearer "+pat)
+	returnReq.Header.Set("Content-Type", "application/json")
+	returnRec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(returnRec, returnReq)
+
+	if returnRec.Code != http.StatusOK {
+		t.Fatalf("return status = %d body = %s", returnRec.Code, returnRec.Body.String())
+	}
+	var returned struct {
+		Released bool                `json:"released"`
+		Account  manager.AccountView `json:"account"`
+		Lease    manager.Lease       `json:"lease"`
+	}
+	if err := json.Unmarshal(returnRec.Body.Bytes(), &returned); err != nil {
+		t.Fatalf("decode return response: %v", err)
+	}
+	if !returned.Released || returned.Account.ID != "work" || returned.Lease.ID != lease.Lease.ID {
+		t.Fatalf("return response = %+v, want released work lease %s", returned, lease.Lease.ID)
+	}
+	account, err = m.GetAccount("work")
+	if err != nil {
+		t.Fatalf("GetAccount(work) after return: %v", err)
+	}
+	if account.LeaseID != "" {
+		t.Fatalf("manual return left lease active: %+v", account)
+	}
+}
+
+func TestSessionCanManualBorrowAndReturnServerLiveAuth(t *testing.T) {
+	server, m, _, _ := newTestServer(t)
+	user, err := m.CreateUser("alice", "secret1")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := m.SetMembership(manager.DefaultWorkspaceID, user.ID, manager.RoleMember); err != nil {
+		t.Fatalf("SetMembership: %v", err)
+	}
+	sessionToken, err := m.CreateSession(user.ID)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := os.MkdirAll(m.LiveCodexHome, 0o700); err != nil {
+		t.Fatalf("MkdirAll(live): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(m.LiveCodexHome, "auth.json"), []byte(`{"OPENAI_API_KEY":"sk-test","note":"browser-live"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(live auth): %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sync/manual-borrow", bytes.NewBufferString(`{
+		"accountId":"work",
+		"ttlSeconds":28800,
+		"holder":"manual:alice"
+	}`))
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionToken})
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("borrow status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var lease manager.LeaseSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &lease); err != nil {
+		t.Fatalf("decode borrow response: %v", err)
+	}
+	if lease.Lease.ClientID != user.ID || lease.Lease.Holder != "manual:alice" {
+		t.Fatalf("lease = %+v, want session user manual lease", lease.Lease)
+	}
+
+	returnReq := httptest.NewRequest(http.MethodPost, "/api/sync/manual-return", bytes.NewBufferString(`{"accountId":"work"}`))
+	returnReq.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionToken})
+	returnReq.Header.Set("Content-Type", "application/json")
+	returnRec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(returnRec, returnReq)
+
+	if returnRec.Code != http.StatusOK {
+		t.Fatalf("return status = %d body = %s", returnRec.Code, returnRec.Body.String())
+	}
+	account, err := m.GetAccount("work")
+	if err != nil {
+		t.Fatalf("GetAccount(work): %v", err)
+	}
+	if account.LeaseID != "" {
+		t.Fatalf("session return left lease active: %+v", account)
+	}
+}
+
 func TestPATCannotPullAuthSnapshot(t *testing.T) {
 	server, _, _, pat := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/sync/pull/work", nil)
@@ -436,6 +570,15 @@ func newWebTestManager(t *testing.T) *manager.Manager {
 		t.Fatalf("Ensure() error = %v", err)
 	}
 	return m
+}
+
+func loadWebTestState(t *testing.T, m *manager.Manager) manager.State {
+	t.Helper()
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	return state
 }
 
 // TestManagerAccountViewReturnsView confirms ManagerAccountView returns the

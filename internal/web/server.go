@@ -192,6 +192,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/users", session(s.handleUsers))
 	mux.HandleFunc("/api/users/", session(s.handleUserAction))
 	mux.HandleFunc("/api/sync/identify-auth", sync(s.handleSyncIdentifyAuth))
+	mux.HandleFunc("/api/sync/manual-borrow", anyAuth(s.handleSyncManualBorrow))
+	mux.HandleFunc("/api/sync/manual-return", anyAuth(s.handleSyncManualReturn))
 	mux.HandleFunc("/api/sync/push", sync(s.handleSyncPush))
 	mux.HandleFunc("/api/sync/pull/", sync(s.handleSyncPull))
 	mux.HandleFunc("/api/sync/claim", sync(s.handleSyncClaim))
@@ -338,6 +340,16 @@ func clientPATSyncForbidden(r *http.Request) string {
 			return ""
 		}
 		return "client PATs can only identify live auth with POST"
+	case path == "/api/sync/manual-borrow":
+		if r.Method == http.MethodPost {
+			return ""
+		}
+		return "client PATs can only borrow live auth with POST"
+	case path == "/api/sync/manual-return":
+		if r.Method == http.MethodPost {
+			return ""
+		}
+		return "client PATs can only return manual leases with POST"
 	case path == "/api/sync/leases":
 		if r.Method == http.MethodPost {
 			return ""
@@ -660,6 +672,123 @@ func (s *Server) handleSyncIdentifyAuth(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"matched": true, "account": view})
+}
+
+func (s *Server) handleSyncManualBorrow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Account    string          `json:"account"`
+		AccountID  string          `json:"accountId"`
+		AccountRef string          `json:"accountRef"`
+		Auth       json.RawMessage `json:"auth"`
+		ClientID   string          `json:"clientId"`
+		Holder     string          `json:"holder"`
+		Workspace  string          `json:"workspace"`
+		TTLSeconds int             `json:"ttlSeconds"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	auth := authFromRequest(r)
+	clientID := strings.TrimSpace(auth.ClientID)
+	if clientID == "" {
+		clientID = strings.TrimSpace(auth.principal())
+	}
+	if auth.Admin {
+		clientID = firstText(strings.TrimSpace(body.ClientID), clientID, "admin-manual")
+	}
+	if clientID == "" {
+		writeError(w, http.StatusBadRequest, "manual borrow needs client id")
+		return
+	}
+	authRaw := body.Auth
+	if len(authRaw) == 0 || string(authRaw) == "null" {
+		snapshot, err := s.Manager.ExportLiveProfileSnapshot(clientID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		authRaw = snapshot.Auth
+	}
+	workspaceID := strings.TrimSpace(body.Workspace)
+	if !auth.Admin {
+		resolved, err := s.Manager.ResolveWorkspaceForClient(clientID, workspaceID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		workspaceID = resolved
+	}
+	accountRef := firstText(strings.TrimSpace(body.Account), strings.TrimSpace(body.AccountID), strings.TrimSpace(body.AccountRef))
+	lease, err := s.Manager.ManualBorrowLive(r.Context(), manager.ManualBorrowRequest{
+		AccountRef:  accountRef,
+		Auth:        authRaw,
+		ClientID:    clientID,
+		Holder:      body.Holder,
+		WorkspaceID: workspaceID,
+		TTL:         time.Duration(body.TTLSeconds) * time.Second,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, lease)
+}
+
+func (s *Server) handleSyncManualReturn(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		Account   string `json:"account"`
+		AccountID string `json:"accountId"`
+		LeaseID   string `json:"leaseId"`
+		ClientID  string `json:"clientId"`
+		Workspace string `json:"workspace"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	auth := authFromRequest(r)
+	clientID := strings.TrimSpace(auth.ClientID)
+	if clientID == "" {
+		clientID = strings.TrimSpace(auth.principal())
+	}
+	if auth.Admin && strings.TrimSpace(body.ClientID) != "" {
+		clientID = strings.TrimSpace(body.ClientID)
+	}
+	workspaceID := strings.TrimSpace(body.Workspace)
+	if !auth.Admin {
+		resolved, err := s.Manager.ResolveWorkspaceForClient(clientID, workspaceID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		workspaceID = resolved
+	}
+	accountRef := firstText(strings.TrimSpace(body.Account), strings.TrimSpace(body.AccountID))
+	account, lease, err := s.Manager.ActiveLeaseSnapshot(accountRef, body.LeaseID, clientID, workspaceID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.Manager.ReleaseLease(account.ID, lease.ID, clientID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"released":  true,
+		"accountId": account.ID,
+		"leaseId":   lease.ID,
+		"account":   account,
+		"lease":     lease,
+	})
 }
 
 func (s *Server) handleSyncPull(w http.ResponseWriter, r *http.Request) {

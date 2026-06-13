@@ -286,7 +286,7 @@ func (m *Manager) ResolveWorkspaceForClient(clientID, requested string) (string,
 	}
 	var memberOf []string
 	for _, ms := range state.Memberships {
-		if ms.ClientID == clientID {
+		if membershipMatches(ms, clientID) {
 			memberOf = append(memberOf, ms.WorkspaceID)
 		}
 	}

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { apiJSON, saveCloudToken } from "../api";
 import { accountName } from "../lib/format";
+import { DEFAULT_MANUAL_LEASE_TTL_SECONDS, manualLeaseHolder } from "../lib/manualLease";
 import type {
   AccessMode,
   Account,
@@ -390,6 +391,39 @@ export function useDashboardData(t: TranslateFn) {
     [withBusy, loadAll, t],
   );
 
+  const manualBorrowAccount = useCallback(
+    (accountId: string) =>
+      withBusy(async () => {
+        await apiJSON("/api/sync/manual-borrow", {
+          method: "POST",
+          body: JSON.stringify({
+            accountId,
+            ttlSeconds: DEFAULT_MANUAL_LEASE_TTL_SECONDS,
+            holder: manualLeaseHolder(currentUser?.username),
+          }),
+        });
+        setMessage(t("已手工租用账号", "Account manually borrowed"));
+        await loadAll(accountId);
+      }),
+    [withBusy, currentUser?.username, loadAll, t],
+  );
+
+  const manualReturnAccount = useCallback(
+    (accountId: string) =>
+      withBusy(async () => {
+        await apiJSON("/api/sync/manual-return", {
+          method: "POST",
+          body: JSON.stringify({
+            accountId,
+            holder: manualLeaseHolder(currentUser?.username),
+          }),
+        });
+        setMessage(t("账号已归还", "Account returned"));
+        await loadAll(accountId);
+      }),
+    [withBusy, currentUser?.username, loadAll, t],
+  );
+
   const applyToken = useCallback(
     async (token: string) => {
       saveCloudToken(token);
@@ -668,6 +702,8 @@ export function useDashboardData(t: TranslateFn) {
     createWorkspaceInvite,
     revokeWorkspaceInvite,
     setAccountWorkspace,
+    manualBorrowAccount,
+    manualReturnAccount,
     applyToken,
     clearToken,
     register,

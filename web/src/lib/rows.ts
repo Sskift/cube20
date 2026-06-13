@@ -45,6 +45,7 @@ export interface AccountRow {
   leaseClientId?: string;
   leaseHolder?: string;
   leaseExpiresAt?: string;
+  leaseKind?: string;
   // scoring / reasons
   score?: number;
   reason?: string;
@@ -102,6 +103,7 @@ function lbRow(account: LoadBalanceAccount, dispatch: DispatchEvent | undefined,
     leaseClientId: account.leaseClientId,
     leaseHolder: account.leaseHolder,
     leaseExpiresAt: account.leaseExpiresAt,
+    leaseKind: account.leaseKind,
     score: account.quotaScore,
     reason: account.reason,
     runtimeState: account.runtimeState,

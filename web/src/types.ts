@@ -23,6 +23,9 @@ export interface Account {
   leaseClientId?: string;
   leaseHolder?: string;
   leaseExpiresAt?: string;
+  leaseKind?: string;
+  runtimeState?: string;
+  runtimeReason?: string;
   authPresent: boolean;
   authPath: string;
   configPresent: boolean;
@@ -233,6 +236,7 @@ export interface RefreshQueueItem {
   leaseClientId?: string;
   leaseHolder?: string;
   leaseExpiresAt?: string;
+  leaseKind?: string;
 }
 
 export interface LoadBalanceAccount {
@@ -251,6 +255,7 @@ export interface LoadBalanceAccount {
   leaseClientId?: string;
   leaseHolder?: string;
   leaseExpiresAt?: string;
+  leaseKind?: string;
   eligible: boolean;
   reason?: string;
   runtimeState?: string;

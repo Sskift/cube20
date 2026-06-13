@@ -22,6 +22,7 @@ type LoadBalanceAccount struct {
 	OwnerClientID                 string           `json:"ownerClientId,omitempty"`
 	Generation                    int64            `json:"generation"`
 	LeaseActive                   bool             `json:"leaseActive"`
+	LeaseKind                     string           `json:"leaseKind,omitempty"`
 	LeaseClientID                 string           `json:"leaseClientId,omitempty"`
 	LeaseHolder                   string           `json:"leaseHolder,omitempty"`
 	LeaseExpiresAt                time.Time        `json:"leaseExpiresAt,omitempty"`
@@ -104,6 +105,7 @@ func (m *Manager) LoadBalanceStatus(workspaceID string) (LoadBalanceStatus, erro
 			OwnerClientID:  account.OwnerClientID,
 			Generation:     account.Generation,
 			LeaseActive:    account.LeaseActive,
+			LeaseKind:      account.LeaseKind,
 			LeaseClientID:  account.LeaseClientID,
 			LeaseHolder:    account.LeaseHolder,
 			LeaseExpiresAt: account.LeaseExpiresAt,
@@ -141,6 +143,16 @@ func (m *Manager) LoadBalanceStatus(workspaceID string) (LoadBalanceStatus, erro
 		return status.Excluded[i].ID < status.Excluded[j].ID
 	})
 	return status, nil
+}
+
+func decorateAccountRuntime(view *AccountView, account Account, state State, now time.Time) {
+	if view == nil {
+		return
+	}
+	evaluation := loadBalanceEligibilityForAccount(account, view.AuthPresent, state.QuotaCache[account.ID], now)
+	view.RuntimeState = evaluation.RuntimeState
+	view.RuntimeReason = evaluation.RuntimeReason
+	view.LeaseKind = leaseKindForAccount(account, now)
 }
 
 type loadBalanceEvaluation struct {

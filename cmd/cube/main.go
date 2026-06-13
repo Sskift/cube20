@@ -71,6 +71,11 @@ func run(args []string) error {
 		return runCloud(m, args[1:])
 	case "device":
 		return runDevice(m, args[1:])
+	case "doctor":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: cube doctor")
+		}
+		return printCloudStatus(m)
 	case "clients":
 		return runClients(m, args[1:])
 	case "workspace", "workspaces":
@@ -173,8 +178,12 @@ func runCloud(m *manager.Manager, args []string) error {
 		return runCloudQuota(m, args[1:])
 	case "relogin":
 		return runCloudRelogin(m, args[1:])
+	case "borrow-live":
+		return runCloudBorrowLive(m, args[1:])
+	case "return-live":
+		return runCloudReturnLive(m, args[1:])
 	default:
-		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token> [--device-id <id>] [--device-label <name>]|quota <account-id>|relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]]")
+		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token> [--device-id <id>] [--device-label <name>]|quota <account-id>|relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]|borrow-live --account <id-or-label> [--ttl 8h] [--holder manual-direct-codex]|return-live [--account <id-or-label>] [--lease <lease-id>]]")
 	}
 }
 
@@ -255,6 +264,7 @@ func printCloudStatus(m *manager.Manager) error {
 		fmt.Printf("device label: %s\n", emptyDash(settings.DeviceLabel))
 	}
 	opts := defaultCloudSyncOptions(m)
+	fmt.Printf("workspace: %s\n", emptyDash(opts.Workspace))
 	diag, err := identifyLiveAuth(context.Background(), m, opts)
 	printLiveAuthDiagnosis(diag, err, opts)
 	return nil
@@ -284,9 +294,13 @@ func identifyLiveAuth(ctx context.Context, m *manager.Manager, opts cloudSyncOpt
 		Account manager.AccountView `json:"account"`
 	}
 	body := struct {
-		Auth json.RawMessage `json:"auth"`
+		Auth      json.RawMessage `json:"auth"`
+		Workspace string          `json:"workspace,omitempty"`
+		DeviceID  string          `json:"deviceId,omitempty"`
 	}{
-		Auth: authRaw,
+		Auth:      authRaw,
+		Workspace: opts.Workspace,
+		DeviceID:  opts.Device,
 	}
 	if err := cloudJSON(ctx, http.MethodPost, opts, "/api/sync/identify-auth", body, &out); err != nil {
 		return diag, err
@@ -1517,10 +1531,13 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  cube help")
+	fmt.Println("  cube doctor")
 	fmt.Println("  cube cloud status")
 	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...> [--device-id <id>] [--device-label <name>]")
 	fmt.Println("  cube cloud quota <account-id>")
 	fmt.Println("  cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]")
+	fmt.Println("  cube cloud borrow-live --account <id-or-label> [--ttl 8h] [--holder manual-direct-codex]")
+	fmt.Println("  cube cloud return-live [--account <id-or-label>] [--lease <lease-id>]")
 	fmt.Println("  cube device status")
 	fmt.Println("  cube device show")
 	fmt.Println("  cube device config --server <url> --token <cube_dev_...> [--id <deviceId>] [--label <name>]")

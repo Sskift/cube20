@@ -77,14 +77,17 @@ type Account struct {
 
 type AccountView struct {
 	Account
-	AuthPresent   bool      `json:"authPresent"`
-	AuthPath      string    `json:"authPath"`
-	AuthUpdated   time.Time `json:"authUpdated,omitempty"`
-	ConfigPresent bool      `json:"configPresent"`
-	ConfigPath    string    `json:"configPath"`
-	ConfigUpdated time.Time `json:"configUpdated,omitempty"`
-	Active        bool      `json:"active"`
-	LeaseActive   bool      `json:"leaseActive"`
+	AuthPresent   bool         `json:"authPresent"`
+	AuthPath      string       `json:"authPath"`
+	AuthUpdated   time.Time    `json:"authUpdated,omitempty"`
+	ConfigPresent bool         `json:"configPresent"`
+	ConfigPath    string       `json:"configPath"`
+	ConfigUpdated time.Time    `json:"configUpdated,omitempty"`
+	Active        bool         `json:"active"`
+	LeaseActive   bool         `json:"leaseActive"`
+	LeaseKind     string       `json:"leaseKind,omitempty"`
+	RuntimeState  RuntimeState `json:"runtimeState,omitempty"`
+	RuntimeReason string       `json:"runtimeReason,omitempty"`
 }
 
 type Lease struct {

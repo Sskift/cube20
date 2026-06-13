@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { Chip } from "@heroui/react";
-import { ChevronDown } from "lucide-react";
+import { Button, Chip } from "@heroui/react";
+import { ChevronDown, KeyRound, Undo2 } from "lucide-react";
 
 import { useLang } from "../i18n";
 import { useNow } from "../hooks/useNow";
+import { isManualLease } from "../lib/manualLease";
 import {
   countdown,
   dispatchEventLabel,
@@ -27,12 +28,20 @@ export function AccountTable({
   showPool = false,
   selectedId,
   onSelect,
+  busy = false,
+  liveAuthReady = false,
+  onManualBorrow,
+  onManualReturn,
 }: {
   rows: AccountRow[];
   showScore?: boolean;
   showPool?: boolean;
   selectedId?: string;
   onSelect?: (id: string) => void;
+  busy?: boolean;
+  liveAuthReady?: boolean;
+  onManualBorrow?: (id: string) => void | Promise<void>;
+  onManualReturn?: (id: string) => void | Promise<void>;
 }) {
   const { t } = useLang();
   const [expanded, setExpanded] = useState<string>("");
@@ -130,7 +139,16 @@ export function AccountTable({
 
             {rowReason && !isOpen && <div className="cube-row-reason">{rowReason}</div>}
 
-            {isOpen && <RowDetail row={row} now={now} />}
+            {isOpen && (
+              <RowDetail
+                row={row}
+                now={now}
+                busy={busy}
+                liveAuthReady={liveAuthReady}
+                onManualBorrow={onManualBorrow}
+                onManualReturn={onManualReturn}
+              />
+            )}
           </div>
         );
       })}
@@ -138,7 +156,21 @@ export function AccountTable({
   );
 }
 
-function RowDetail({ row, now }: { row: AccountRow; now: number }) {
+function RowDetail({
+  row,
+  now,
+  busy,
+  liveAuthReady,
+  onManualBorrow,
+  onManualReturn,
+}: {
+  row: AccountRow;
+  now: number;
+  busy: boolean;
+  liveAuthReady: boolean;
+  onManualBorrow?: (id: string) => void | Promise<void>;
+  onManualReturn?: (id: string) => void | Promise<void>;
+}) {
   const { t } = useLang();
   return (
     <div className="cube-row-detail">
@@ -162,6 +194,13 @@ function RowDetail({ row, now }: { row: AccountRow; now: number }) {
           value={row.leaseActive ? `${dispatchTarget(row.leaseClientId, "", row.leaseHolder)} · ${t("至", "until")} ${shortTime(row.leaseExpiresAt)}` : "-"}
         />
       </div>
+      <ManualLeaseActions
+        row={row}
+        busy={busy}
+        liveAuthReady={liveAuthReady}
+        onManualBorrow={onManualBorrow}
+        onManualReturn={onManualReturn}
+      />
       {(row.runtimeReason || row.reason) && <div className="cube-detail-reason">{row.runtimeReason || row.reason}</div>}
       {row.dispatch && (
         <div className="cube-detail-dispatch">
@@ -173,6 +212,53 @@ function RowDetail({ row, now }: { row: AccountRow; now: number }) {
       )}
     </div>
   );
+}
+
+function ManualLeaseActions({
+  row,
+  busy,
+  liveAuthReady,
+  onManualBorrow,
+  onManualReturn,
+}: {
+  row: AccountRow;
+  busy: boolean;
+  liveAuthReady: boolean;
+  onManualBorrow?: (id: string) => void | Promise<void>;
+  onManualReturn?: (id: string) => void | Promise<void>;
+}) {
+  const { t } = useLang();
+  const manual = isManualLease(row);
+
+  if (!row.leaseActive && onManualBorrow) {
+    return (
+      <div className="cube-detail-actions">
+        <Button
+          className="gap-1.5"
+          isDisabled={busy || !liveAuthReady}
+          size="sm"
+          variant="primary"
+          onPress={() => onManualBorrow(row.id)}
+        >
+          <KeyRound size={14} />
+          {t("手工租用当前 live auth", "Borrow current live auth")}
+        </Button>
+      </div>
+    );
+  }
+
+  if (manual && onManualReturn) {
+    return (
+      <div className="cube-detail-actions">
+        <Button className="gap-1.5" isDisabled={busy} size="sm" variant="danger-soft" onPress={() => onManualReturn(row.id)}>
+          <Undo2 size={14} />
+          {t("归还", "Return")}
+        </Button>
+      </div>
+    );
+  }
+
+  return null;
 }
 
 function runtimeChip(row: AccountRow, t: TranslateFn): { label: string; color: ChipColor } {

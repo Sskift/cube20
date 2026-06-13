@@ -354,6 +354,81 @@ func TestDispatchHistoryRecordsClaimAndRelease(t *testing.T) {
 	}
 }
 
+func TestManualBorrowLiveLeasesAccountWithoutRefreshingQuota(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "manual", Label: "137740870@qq.com"})
+	saveTestQuota(t, m, "manual", 42, time.Now().Add(-time.Hour))
+	beforeQuota := loadTestState(t, m).QuotaCache["manual"]
+
+	auth := json.RawMessage(`{"OPENAI_API_KEY":"sk-test-manual","note":"local-live"}`)
+	lease, err := m.ManualBorrowLive(context.Background(), ManualBorrowRequest{
+		AccountRef:  "manual",
+		Auth:        auth,
+		ClientID:    "client-liushiao-local",
+		Holder:      "manual-direct-codex",
+		WorkspaceID: DefaultWorkspaceID,
+		TTL:         8 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("ManualBorrowLive() error = %v", err)
+	}
+
+	if lease.Lease.AccountID != "manual" || lease.Lease.ClientID != "client-liushiao-local" {
+		t.Fatalf("lease = %+v, want manual leased by client-liushiao-local", lease.Lease)
+	}
+	if lease.Snapshot.Generation != 2 {
+		t.Fatalf("generation = %d, want 2", lease.Snapshot.Generation)
+	}
+	account := getTestAccount(t, m, "manual")
+	if account.LeaseID == "" || account.LeaseID != lease.Lease.ID {
+		t.Fatalf("account lease id = %q, want %q", account.LeaseID, lease.Lease.ID)
+	}
+	if account.LeaseHolder != "manual-direct-codex" {
+		t.Fatalf("holder = %q, want manual-direct-codex", account.LeaseHolder)
+	}
+	if time.Until(account.LeaseExpiresAt) < 7*time.Hour {
+		t.Fatalf("lease expires too soon: %s", account.LeaseExpiresAt)
+	}
+	if got := string(readTestAuth(t, m, "manual")); !strings.Contains(got, `"note": "local-live"`) {
+		t.Fatalf("auth was not updated from live auth: %s", got)
+	}
+	afterQuota := loadTestState(t, m).QuotaCache["manual"]
+	if !afterQuota.UpdatedAt.Equal(beforeQuota.UpdatedAt) || afterQuota.Source != beforeQuota.Source {
+		t.Fatalf("quota cache changed: before=%+v after=%+v", beforeQuota, afterQuota)
+	}
+
+	events, err := m.DispatchHistory(10, "")
+	if err != nil {
+		t.Fatalf("DispatchHistory() error = %v", err)
+	}
+	if len(events) == 0 || events[0].Event != "manual_claimed" {
+		t.Fatalf("latest dispatch event = %+v, want manual_claimed", events)
+	}
+}
+
+func TestManualBorrowLiveRejectsMismatchedAuth(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{ID: "manual"})
+
+	_, err := m.ManualBorrowLive(context.Background(), ManualBorrowRequest{
+		AccountRef:  "manual",
+		Auth:        json.RawMessage(`{"OPENAI_API_KEY":"sk-test-other"}`),
+		ClientID:    "client-1",
+		WorkspaceID: DefaultWorkspaceID,
+		TTL:         time.Hour,
+	})
+	if err == nil {
+		t.Fatal("ManualBorrowLive() error = nil, want identity mismatch")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("ManualBorrowLive() error = %v, want identity mismatch", err)
+	}
+	account := getTestAccount(t, m, "manual")
+	if account.LeaseID != "" {
+		t.Fatalf("mismatched auth created lease: %+v", account)
+	}
+}
+
 func TestRecoverExpiredLeasesMovesReadyAccountToRecovering(t *testing.T) {
 	m := newTestManager(t)
 	expiredAt := time.Now().Add(-time.Minute)
@@ -896,10 +971,7 @@ func saveTestAccounts(t *testing.T, m *Manager, accounts ...Account) {
 func saveTestQuota(t *testing.T, m *Manager, accountID string, remaining float64, resetAt time.Time) {
 	t.Helper()
 
-	state, err := m.Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
+	state := loadTestState(t, m)
 	if state.QuotaCache == nil {
 		state.QuotaCache = map[string]QuotaCache{}
 	}
@@ -927,6 +999,16 @@ func saveTestQuota(t *testing.T, m *Manager, accountID string, remaining float64
 	if err := m.Save(state); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
+}
+
+func loadTestState(t *testing.T, m *Manager) State {
+	t.Helper()
+
+	state, err := m.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	return state
 }
 
 func quotaCacheForTest(remaining float64, resetAt time.Time) QuotaCache {

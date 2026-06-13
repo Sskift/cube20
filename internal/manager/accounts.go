@@ -226,7 +226,9 @@ func (m *Manager) IdentifyAuth(authRaw json.RawMessage) (AccountView, bool, erro
 	for _, account := range state.Accounts {
 		existing := readAuthMetadata(filepath.Join(account.CodexHome, authFileName))
 		if authIdentity(existing) == identity {
-			return m.accountView(account), true, nil
+			view := m.accountView(account)
+			decorateAccountRuntime(&view, account, state, time.Now())
+			return view, true, nil
 		}
 	}
 	return AccountView{}, false, nil
@@ -434,7 +436,9 @@ func (m *Manager) listAccountsLocked() ([]AccountView, error) {
 
 	views := make([]AccountView, 0, len(state.Accounts))
 	for _, account := range state.Accounts {
-		views = append(views, m.accountView(account))
+		view := m.accountView(account)
+		decorateAccountRuntime(&view, account, state, time.Now())
+		views = append(views, view)
 	}
 	sort.Slice(views, func(i, j int) bool {
 		return views[i].ID < views[j].ID
@@ -532,7 +536,9 @@ func (m *Manager) AccountViewByID(id string) (AccountView, error) {
 	}
 	for _, account := range state.Accounts {
 		if account.ID == id {
-			return m.accountView(account), nil
+			view := m.accountView(account)
+			decorateAccountRuntime(&view, account, state, time.Now())
+			return view, nil
 		}
 	}
 	return AccountView{}, fmt.Errorf("%w: %q", ErrAccountNotFound, id)
@@ -709,6 +715,7 @@ func (m *Manager) accountView(account Account) AccountView {
 	}
 	view.Active = m.isAccountActive(account)
 	view.LeaseActive = accountLeaseActive(account, time.Now())
+	view.LeaseKind = leaseKindForAccount(account, time.Now())
 	return view
 }
 func (m *Manager) isAccountActive(account Account) bool {

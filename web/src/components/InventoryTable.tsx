@@ -113,6 +113,8 @@ function InventoryDetail({ account, t }: { account: Account; t: (zh: string, en:
         <Detail label={t("Codex 目录", "codex home")} value={account.codexHome || "—"} />
         <Detail label={t("凭据路径", "auth path")} value={account.authPath || "—"} />
         <Detail label={t("配置路径", "config path")} value={account.configPath || "—"} />
+        <Detail label={t("运行状态", "runtime")} value={account.runtimeState || "—"} />
+        <Detail label={t("租约类型", "lease kind")} value={account.leaseKind || "—"} />
         <Detail
           label={t("租约", "lease")}
           value={account.leaseActive ? `${account.leaseClientId || account.leaseHolder || "client"} · ${t("至", "until")} ${shortTime(account.leaseExpiresAt)}` : t("空闲", "idle")}

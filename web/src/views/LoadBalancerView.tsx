@@ -112,7 +112,15 @@ export function LoadBalancerView({ data }: { data: DashboardData }) {
           </Chip>
         </Card.Header>
         <Card.Content className="p-3 sm:p-4">
-          <AccountTable rows={rows} showScore showPool />
+          <AccountTable
+            rows={rows}
+            showScore
+            showPool
+            busy={data.busy}
+            liveAuthReady={!!data.meta?.liveAuthPresent}
+            onManualBorrow={data.manualBorrowAccount}
+            onManualReturn={data.manualReturnAccount}
+          />
         </Card.Content>
       </Card>
 

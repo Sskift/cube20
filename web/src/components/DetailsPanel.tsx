@@ -111,6 +111,8 @@ export function DetailsPanel({
                 <SignalLine label={t("配额来源", "quota source")} value={refresh?.quotaSource ? `${refresh.quotaSource}${refresh.quotaReporterClientId ? ` · ${refresh.quotaReporterClientId}` : ""}` : quota?.source || "-"} />
                 <SignalLine label={t("代次", "generation")} value={(selected.generation || 0).toString()} />
                 <SignalLine label={t("归属", "owner")} value={selected.ownerMode === "client" ? `client ${selected.ownerClientId || "-"}` : "cloud"} />
+                <SignalLine label={t("运行状态", "runtime")} value={selected.runtimeState || "-"} />
+                <SignalLine label={t("租约类型", "lease kind")} value={selected.leaseKind || "-"} />
                 <SignalLine label={t("租约", "lease")} value={selected.leaseActive ? `${selected.leaseClientId || selected.leaseHolder || "client"} ${t("至", "until")} ${shortTime(selected.leaseExpiresAt)}` : "-"} />
               </Card.Content>
             </Card>
