@@ -231,9 +231,13 @@ function ManualLeaseActions({
   const manual = isManualLease(row);
 
   if (!row.leaseActive && onManualBorrow) {
+    const disabledReason = !liveAuthReady
+      ? t("服务端没有 live auth；请在本机使用 cube cloud borrow-live", "No server live auth; use cube cloud borrow-live on this machine")
+      : "";
     return (
       <div className="cube-detail-actions">
         <Button
+          aria-label={disabledReason || undefined}
           className="gap-1.5"
           isDisabled={busy || !liveAuthReady}
           size="sm"
@@ -243,6 +247,7 @@ function ManualLeaseActions({
           <KeyRound size={14} />
           {t("手工租用当前 live auth", "Borrow current live auth")}
         </Button>
+        {disabledReason && <span className="cube-detail-action-hint">{disabledReason}</span>}
       </div>
     );
   }

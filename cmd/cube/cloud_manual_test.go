@@ -220,3 +220,83 @@ func TestRunCloudReturnLiveUsesExplicitAccountAndLeaseWithoutLiveAuth(t *testing
 		t.Errorf("auth = %s, want omitted", body.Auth)
 	}
 }
+
+func TestRunCloudKeepaliveLiveIdentifiesHeartbeatsAndReportsUsage(t *testing.T) {
+	live := t.TempDir()
+	authRaw := []byte(`{"tokens":{"id_token":"live"}}`)
+	if err := os.WriteFile(filepath.Join(live, "auth.json"), authRaw, 0o600); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+
+	var paths []string
+	var heartbeatBody struct {
+		AccountID  string `json:"accountId"`
+		Client     string `json:"client"`
+		DeviceID   string `json:"deviceId"`
+		TTLSeconds int    `json:"ttlSeconds"`
+	}
+	var usageBody struct {
+		AccountID string `json:"accountId"`
+		LeaseID   string `json:"leaseId"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		switch r.URL.Path {
+		case "/api/sync/identify-auth":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"matched": true,
+				"account": manager.AccountView{
+					Account: manager.Account{
+						ID:      "acct-live",
+						LeaseID: "lease-live",
+					},
+					LeaseActive: true,
+				},
+			})
+		case "/api/sync/leases/lease-live":
+			if r.Method != http.MethodPatch {
+				t.Fatalf("heartbeat method = %q, want PATCH", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&heartbeatBody); err != nil {
+				t.Fatalf("decode heartbeat: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(manager.Lease{ID: "lease-live", AccountID: "acct-live", ClientID: "dev-a"})
+		case "/api/sync/usage":
+			if r.Method != http.MethodPost {
+				t.Fatalf("usage method = %q, want POST", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&usageBody); err != nil {
+				t.Fatalf("decode usage: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	err := runCloudKeepaliveLive(&manager.Manager{
+		LiveCodexHome: live,
+		CloudURL:      srv.URL,
+		CloudToken:    "cube_dev_test",
+	}, []string{"--interval", "30s", "--device", "dev-a"})
+	if err != nil {
+		t.Fatalf("runCloudKeepaliveLive: %v", err)
+	}
+	wantPaths := []string{"POST /api/sync/identify-auth", "PATCH /api/sync/leases/lease-live", "POST /api/sync/usage"}
+	if !slices.Equal(paths, wantPaths) {
+		t.Fatalf("paths = %v, want %v", paths, wantPaths)
+	}
+	if heartbeatBody.AccountID != "acct-live" || heartbeatBody.DeviceID != "dev-a" {
+		t.Fatalf("heartbeat body = %+v, want acct-live/dev-a", heartbeatBody)
+	}
+	if heartbeatBody.TTLSeconds != 120 {
+		t.Fatalf("ttlSeconds = %d, want 120", heartbeatBody.TTLSeconds)
+	}
+	if heartbeatBody.Client == "" {
+		t.Fatal("heartbeat client should be populated")
+	}
+	if usageBody.AccountID != "acct-live" || usageBody.LeaseID != "lease-live" {
+		t.Fatalf("usage body = %+v, want acct-live/lease-live", usageBody)
+	}
+}

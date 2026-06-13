@@ -889,6 +889,8 @@ func (s *Server) heartbeatLease(w http.ResponseWriter, r *http.Request, leaseID 
 	var body struct {
 		AccountID        string         `json:"accountId"`
 		Client           string         `json:"client"`
+		ClientID         string         `json:"clientId"`
+		DeviceID         string         `json:"deviceId"`
 		Holder           string         `json:"holder"`
 		TTLSeconds       int            `json:"ttlSeconds"`
 		FiveHour         *quota.Window  `json:"fiveHour"`
@@ -900,6 +902,10 @@ func (s *Server) heartbeatLease(w http.ResponseWriter, r *http.Request, leaseID 
 	}
 	ttl := time.Duration(body.TTLSeconds) * time.Second
 	accountID := strings.TrimSpace(body.AccountID)
+	clientID := strings.TrimSpace(auth.ClientID)
+	if auth.Admin {
+		clientID = firstText(strings.TrimSpace(body.ClientID), strings.TrimSpace(body.DeviceID), strings.TrimSpace(body.Client))
+	}
 
 	// Best-effort: persist the client-reported quota windows without flipping the
 	// account's owner mode. Newer clients send the full window set in Quotas
@@ -916,11 +922,11 @@ func (s *Server) heartbeatLease(w http.ResponseWriter, r *http.Request, leaseID 
 			Status: quota.StatusSupported,
 			Quotas: windows,
 		}
-		_ = s.Manager.RecordLeasedQuota(accountID, leaseID, auth.ClientID, result, time.Now())
+		_ = s.Manager.RecordLeasedQuota(accountID, leaseID, clientID, result, time.Now())
 	}
 	quotaTelemetryMissing := len(windows) == 0
 
-	lease, err := s.Manager.TouchLease(leaseID, accountID, auth.ClientID, firstText(body.Holder, body.Client), ttl)
+	lease, err := s.Manager.TouchLease(leaseID, accountID, clientID, firstText(body.Holder, body.Client), ttl)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1007,6 +1013,9 @@ func (s *Server) handleSyncUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		AccountID string        `json:"accountId"`
+		Client    string        `json:"client"`
+		ClientID  string        `json:"clientId"`
+		DeviceID  string        `json:"deviceId"`
 		LeaseID   string        `json:"leaseId"`
 		RunID     string        `json:"runId"`
 		Usage     usage.Summary `json:"usage"`
@@ -1019,7 +1028,11 @@ func (s *Server) handleSyncUsage(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAccountReportAccess(w, auth, body.AccountID) {
 		return
 	}
-	if err := s.Manager.RecordUsageWithContext(body.AccountID, auth.ClientID, body.LeaseID, body.RunID, body.Usage); err != nil {
+	clientID := strings.TrimSpace(auth.ClientID)
+	if auth.Admin {
+		clientID = firstText(strings.TrimSpace(body.ClientID), strings.TrimSpace(body.DeviceID), strings.TrimSpace(body.Client))
+	}
+	if err := s.Manager.RecordUsageWithContext(body.AccountID, clientID, body.LeaseID, body.RunID, body.Usage); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

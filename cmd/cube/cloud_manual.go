@@ -30,6 +30,14 @@ type cloudReturnLiveOptions struct {
 	LeaseID string
 }
 
+type cloudKeepaliveLiveOptions struct {
+	Interval    time.Duration
+	Watch       bool
+	Workspace   string
+	Device      string
+	DeviceLabel string
+}
+
 type manualBorrowRequest struct {
 	Account     string          `json:"account"`
 	Auth        json.RawMessage `json:"auth"`
@@ -148,6 +156,78 @@ func runCloudReturnLive(m *manager.Manager, args []string) error {
 	return nil
 }
 
+func runCloudKeepaliveLive(m *manager.Manager, args []string) error {
+	manual, err := parseCloudKeepaliveLiveOptions(args)
+	if err != nil {
+		return err
+	}
+	opts := defaultCloudSyncOptions(m)
+	if manual.Interval > 0 {
+		opts.Interval = manual.Interval
+	}
+	if manual.Workspace != "" {
+		opts.Workspace = manual.Workspace
+	}
+	if manual.Device != "" {
+		opts.Device = manual.Device
+	}
+	if manual.DeviceLabel != "" {
+		opts.DeviceLabel = manual.DeviceLabel
+	}
+	if opts.Server == "" {
+		return fmt.Errorf("missing cloud server; run cube cloud config --server <url> --token <token>, or set CUBE_CLOUD_URL")
+	}
+	if opts.Interval < 5*time.Second {
+		return fmt.Errorf("--interval must be at least 5s")
+	}
+
+	ctx := context.Background()
+	if !manual.Watch {
+		return keepaliveLiveOnce(ctx, m, opts)
+	}
+	for {
+		if err := keepaliveLiveOnce(ctx, m, opts); err != nil {
+			return err
+		}
+		time.Sleep(opts.Interval)
+	}
+}
+
+func keepaliveLiveOnce(ctx context.Context, m *manager.Manager, opts cloudSyncOptions) error {
+	diag, err := identifyLiveAuth(ctx, m, opts)
+	if err != nil {
+		return err
+	}
+	if !diag.AuthPresent {
+		return fmt.Errorf("live auth missing at %s", diag.AuthPath)
+	}
+	if !diag.Matched {
+		return fmt.Errorf("live auth is not matched to a managed account")
+	}
+	accountID := strings.TrimSpace(diag.Account.ID)
+	leaseID := strings.TrimSpace(diag.Account.LeaseID)
+	if accountID == "" || leaseID == "" || !diag.Account.LeaseActive {
+		return fmt.Errorf("matched account %s has no active lease", emptyDash(accountID))
+	}
+
+	lease, shouldSwap, telemetryMissing, err := heartbeatLease(ctx, opts, leaseID, accountID, m.LiveCodexHome)
+	if err != nil {
+		return err
+	}
+	if err := pushUsageFromHome(ctx, opts, accountID, leaseID, "", m.LiveCodexHome); err != nil {
+		return err
+	}
+	fmt.Printf("keepalive %s lease=%s ttl=%s", accountID, lease.ID, time.Until(lease.ExpiresAt).Round(time.Second))
+	if telemetryMissing {
+		fmt.Print(" telemetry=missing")
+	}
+	if shouldSwap {
+		fmt.Print(" swap=true")
+	}
+	fmt.Println()
+	return nil
+}
+
 func parseCloudBorrowLiveOptions(args []string) (cloudBorrowLiveOptions, error) {
 	opts := cloudBorrowLiveOptions{
 		TTL:    defaultManualLiveTTL,
@@ -212,6 +292,50 @@ func parseCloudReturnLiveOptions(args []string) (cloudReturnLiveOptions, error) 
 		default:
 			return opts, fmt.Errorf("unknown return-live flag %q", args[i])
 		}
+	}
+	return opts, nil
+}
+
+func parseCloudKeepaliveLiveOptions(args []string) (cloudKeepaliveLiveOptions, error) {
+	opts := cloudKeepaliveLiveOptions{Interval: 60 * time.Second}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--watch", "--daemon":
+			opts.Watch = true
+		case "--interval", "--heartbeat":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing value for %s", args[i])
+			}
+			interval, err := time.ParseDuration(args[i+1])
+			if err != nil {
+				return opts, fmt.Errorf("invalid %s %q", args[i], args[i+1])
+			}
+			opts.Interval = interval
+			i++
+		case "--workspace":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing value for --workspace")
+			}
+			opts.Workspace = strings.TrimSpace(args[i+1])
+			i++
+		case "--device", "--device-id":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing value for %s", args[i])
+			}
+			opts.Device = strings.TrimSpace(args[i+1])
+			i++
+		case "--device-label":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing value for --device-label")
+			}
+			opts.DeviceLabel = strings.TrimSpace(args[i+1])
+			i++
+		default:
+			return opts, fmt.Errorf("unknown keepalive-live flag %q", args[i])
+		}
+	}
+	if opts.Interval <= 0 {
+		return opts, fmt.Errorf("--interval must be positive")
 	}
 	return opts, nil
 }

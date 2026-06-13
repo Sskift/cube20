@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -538,6 +539,54 @@ func TestHeartbeatLeasedQuotaKeepsCloudOwner(t *testing.T) {
 	}
 	if cache.Source != manager.QuotaSourceClient {
 		t.Fatalf("quota cache source = %q, want %q", cache.Source, manager.QuotaSourceClient)
+	}
+}
+
+func TestAdminHeartbeatUsesDeviceIdentityForQuotaReporter(t *testing.T) {
+	server, m, adminToken, _ := newTestServer(t)
+	lease, err := m.ManualBorrowLive(context.Background(), manager.ManualBorrowRequest{
+		AccountRef:  "work",
+		Auth:        json.RawMessage(`{"OPENAI_API_KEY":"sk-test","note":"admin-heartbeat"}`),
+		ClientID:    "client-liushiao-local",
+		Holder:      "manual-direct-codex",
+		WorkspaceID: manager.DefaultWorkspaceID,
+		TTL:         8 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("ManualBorrowLive: %v", err)
+	}
+
+	body := `{
+		"accountId":"work",
+		"client":"D2N6M7MMCX",
+		"deviceId":"client-liushiao-local",
+		"ttlSeconds":120,
+		"fiveHour":{"key":"five_hour","label":"5h","usedPercent":12,"remainingPercent":88}
+	}`
+	req := httptest.NewRequest(http.MethodPatch, "/api/sync/leases/"+lease.Lease.ID, bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	state := loadWebTestState(t, m)
+	cache := state.QuotaCache["work"]
+	if cache.Source != manager.QuotaSourceClient {
+		t.Fatalf("quota source = %q, want client", cache.Source)
+	}
+	if cache.ReporterClientID != "client-liushiao-local" {
+		t.Fatalf("reporter = %q, want client-liushiao-local", cache.ReporterClientID)
+	}
+	account, err := m.GetAccount("work")
+	if err != nil {
+		t.Fatalf("GetAccount(work): %v", err)
+	}
+	if account.OwnerMode != manager.OwnerCloud {
+		t.Fatalf("ownerMode = %q, want cloud", account.OwnerMode)
 	}
 }
 

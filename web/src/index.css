@@ -1469,8 +1469,15 @@ textarea {
 .cube-detail-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 0.5rem;
   margin-top: 0.5rem;
+}
+
+.cube-detail-action-hint {
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  line-height: 1.4;
 }
 
 .cube-detail-dispatch {

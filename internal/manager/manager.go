@@ -375,6 +375,7 @@ type Manager struct {
 	SharedConfigPath string
 	CloudURL         string
 	CloudToken       string
+	Workspace        string
 	DatabaseURL      string
 
 	// stateMu serializes file-mode state mutations within this process. The
@@ -421,6 +422,7 @@ func New() (*Manager, error) {
 		SharedConfigPath: settings.SharedConfigPath,
 		CloudURL:         settings.CloudURL,
 		CloudToken:       settings.CloudToken,
+		Workspace:        settings.Workspace,
 		DatabaseURL:      settings.DatabaseURL,
 	}, nil
 }

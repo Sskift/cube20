@@ -127,8 +127,12 @@ parse_args() {
 
 build_binary() {
   log "Building linux/amd64 binary: ${LOCAL_BIN}"
+  local commit build_date ldflags
+  commit="$(git rev-parse --short HEAD 2>/dev/null || printf 'unknown')"
+  build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ldflags="-X main.buildCommit=${commit} -X main.buildDate=${build_date}"
   run_cmd mkdir -p "$(dirname "${LOCAL_BIN}")"
-  run_cmd env GOOS=linux GOARCH=amd64 go build -o "${LOCAL_BIN}" ./cmd/cube
+  run_cmd env GOOS=linux GOARCH=amd64 go build -ldflags "${ldflags}" -o "${LOCAL_BIN}" ./cmd/cube
 }
 
 upload_binary() {

@@ -112,6 +112,35 @@ func TestPrintCloudStatusShowsWorkspace(t *testing.T) {
 	}
 }
 
+func TestDefaultCloudSyncOptionsUsesPersistedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	m := &manager.Manager{
+		StateDir:      filepath.Join(root, "state"),
+		StatePath:     filepath.Join(root, "state", "state.json"),
+		SettingsPath:  filepath.Join(root, "state", "settings.toml"),
+		AccountsDir:   filepath.Join(root, "accounts"),
+		LiveCodexHome: filepath.Join(root, "live"),
+	}
+	if err := m.Ensure(); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if _, err := m.UpdateDeviceSettings("http://cube.local", "cube-token", "dev-a", "host-a", "ws-a"); err != nil {
+		t.Fatalf("UpdateDeviceSettings: %v", err)
+	}
+
+	opts := defaultCloudSyncOptions(m)
+
+	if opts.Workspace != "ws-a" {
+		t.Fatalf("workspace = %q, want ws-a", opts.Workspace)
+	}
+	if opts.Device != "dev-a" {
+		t.Fatalf("device = %q, want dev-a", opts.Device)
+	}
+	if opts.DeviceLabel != "host-a" {
+		t.Fatalf("device label = %q, want host-a", opts.DeviceLabel)
+	}
+}
+
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stdout

@@ -53,6 +53,12 @@ func run(args []string) error {
 		printHelp()
 		return nil
 	}
+	if args[0] == "version" || args[0] == "--version" {
+		if len(args) != 1 {
+			return fmt.Errorf("usage: cube version")
+		}
+		return printVersion()
+	}
 
 	m, err := manager.New()
 	if err != nil {
@@ -182,8 +188,10 @@ func runCloud(m *manager.Manager, args []string) error {
 		return runCloudBorrowLive(m, args[1:])
 	case "return-live":
 		return runCloudReturnLive(m, args[1:])
+	case "keepalive-live":
+		return runCloudKeepaliveLive(m, args[1:])
 	default:
-		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token> [--device-id <id>] [--device-label <name>]|quota <account-id>|relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]|borrow-live --account <id-or-label> [--ttl 8h] [--holder manual-direct-codex]|return-live [--account <id-or-label>] [--lease <lease-id>]]")
+		return fmt.Errorf("usage: cube cloud [status|config --server <url> --token <token> [--device-id <id>] [--device-label <name>] [--workspace <id>]|quota <account-id>|relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]|borrow-live --account <id-or-label> [--ttl 8h] [--holder manual-direct-codex]|return-live [--account <id-or-label>] [--lease <lease-id>]|keepalive-live [--watch] [--interval 60s]]")
 	}
 }
 
@@ -354,6 +362,7 @@ func configureCloud(m *manager.Manager, args []string) error {
 	token := ""
 	deviceID := ""
 	deviceLabel := ""
+	workspace := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--server":
@@ -380,16 +389,22 @@ func configureCloud(m *manager.Manager, args []string) error {
 			}
 			deviceLabel = strings.TrimSpace(args[i+1])
 			i++
+		case "--workspace":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --workspace")
+			}
+			workspace = strings.TrimSpace(args[i+1])
+			i++
 		default:
 			return fmt.Errorf("unknown cloud config flag %q", args[i])
 		}
 	}
-	if server == "" && token == "" && deviceID == "" && deviceLabel == "" {
-		return fmt.Errorf("usage: cube cloud config --server <url> --token <token> [--device-id <id>] [--device-label <name>]")
+	if server == "" && token == "" && deviceID == "" && deviceLabel == "" && workspace == "" {
+		return fmt.Errorf("usage: cube cloud config --server <url> --token <token> [--device-id <id>] [--device-label <name>] [--workspace <id>]")
 	}
 	// UpdateDeviceSettings preserves device_id/device_label (which the Manager
 	// struct does not mirror) and only overwrites non-empty values.
-	settings, err := m.UpdateDeviceSettings(server, token, deviceID, deviceLabel)
+	settings, err := m.UpdateDeviceSettings(server, token, deviceID, deviceLabel, workspace)
 	if err != nil {
 		return err
 	}
@@ -402,10 +417,11 @@ func configureCloud(m *manager.Manager, args []string) error {
 	fmt.Printf("token: %s\n", tokenStatus)
 	fmt.Printf("device id: %s\n", emptyDash(settings.DeviceID))
 	fmt.Printf("device label: %s\n", emptyDash(settings.DeviceLabel))
+	fmt.Printf("workspace: %s\n", emptyDash(settings.Workspace))
 	return nil
 }
 
-const deviceUsage = "usage: cube device [status|show|config --server <url> --token <cube_dev_...> [--id <deviceId>] [--label <name>]]"
+const deviceUsage = "usage: cube device [status|show|config --server <url> --token <cube_dev_...> [--id <deviceId>] [--label <name>] [--workspace <id>]]"
 
 func runDevice(m *manager.Manager, args []string) error {
 	if len(args) == 0 {
@@ -429,6 +445,7 @@ func configureDevice(m *manager.Manager, args []string) error {
 	token := ""
 	deviceID := ""
 	deviceLabel := ""
+	workspace := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--server":
@@ -455,14 +472,20 @@ func configureDevice(m *manager.Manager, args []string) error {
 			}
 			deviceLabel = strings.TrimSpace(args[i+1])
 			i++
+		case "--workspace":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --workspace")
+			}
+			workspace = strings.TrimSpace(args[i+1])
+			i++
 		default:
 			return fmt.Errorf("unknown device config flag %q", args[i])
 		}
 	}
-	if server == "" && token == "" && deviceID == "" && deviceLabel == "" {
+	if server == "" && token == "" && deviceID == "" && deviceLabel == "" && workspace == "" {
 		return fmt.Errorf(deviceUsage)
 	}
-	settings, err := m.UpdateDeviceSettings(server, token, deviceID, deviceLabel)
+	settings, err := m.UpdateDeviceSettings(server, token, deviceID, deviceLabel, workspace)
 	if err != nil {
 		return err
 	}
@@ -471,6 +494,7 @@ func configureDevice(m *manager.Manager, args []string) error {
 	fmt.Printf("token: %s\n", maskToken(settings.CloudToken))
 	fmt.Printf("device id: %s\n", emptyDash(settings.DeviceID))
 	fmt.Printf("device label: %s\n", emptyDash(settings.DeviceLabel))
+	fmt.Printf("workspace: %s\n", emptyDash(settings.Workspace))
 	return nil
 }
 
@@ -484,6 +508,7 @@ func printDeviceStatus(m *manager.Manager) error {
 	fmt.Printf("token: %s\n", maskToken(settings.CloudToken))
 	fmt.Printf("device id: %s\n", emptyDash(settings.DeviceID))
 	fmt.Printf("device label: %s\n", emptyDash(settings.DeviceLabel))
+	fmt.Printf("workspace: %s\n", emptyDash(settings.Workspace))
 	return nil
 }
 
@@ -518,6 +543,7 @@ func defaultCloudSyncOptions(m *manager.Manager) cloudSyncOptions {
 		}
 		opts.Device = strings.TrimSpace(settings.DeviceID)
 		opts.DeviceLabel = strings.TrimSpace(settings.DeviceLabel)
+		opts.Workspace = strings.TrimSpace(settings.Workspace)
 	}
 	if value := strings.TrimSpace(os.Getenv("CUBE_CLOUD_URL")); value != "" {
 		opts.Server = value
@@ -577,6 +603,12 @@ func runReport(m *manager.Manager, args []string) error {
 				return fmt.Errorf("missing value for --device")
 			}
 			opts.Device = strings.TrimSpace(args[i+1])
+			i++
+		case "--workspace":
+			if i+1 >= len(args) {
+				return fmt.Errorf("missing value for --workspace")
+			}
+			opts.Workspace = strings.TrimSpace(args[i+1])
 			i++
 		case "--device-label":
 			if i+1 >= len(args) {
@@ -1346,11 +1378,17 @@ func pushUsageFromHome(ctx context.Context, opts cloudSyncOptions, accountID, le
 	summary := usage.SummarizeCodexHome(codexHome, time.Now())
 	body := struct {
 		AccountID string        `json:"accountId"`
+		Client    string        `json:"client,omitempty"`
+		ClientID  string        `json:"clientId,omitempty"`
+		DeviceID  string        `json:"deviceId,omitempty"`
 		LeaseID   string        `json:"leaseId,omitempty"`
 		RunID     string        `json:"runId,omitempty"`
 		Usage     usage.Summary `json:"usage"`
 	}{
 		AccountID: accountID,
+		Client:    opts.Client,
+		ClientID:  opts.Device,
+		DeviceID:  opts.Device,
 		LeaseID:   leaseID,
 		RunID:     runID,
 		Usage:     summary,
@@ -1531,18 +1569,20 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  cube help")
+	fmt.Println("  cube version")
 	fmt.Println("  cube doctor")
 	fmt.Println("  cube cloud status")
-	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...> [--device-id <id>] [--device-label <name>]")
+	fmt.Println("  cube cloud config --server <url> --token <cube_pat_...> [--device-id <id>] [--device-label <name>] [--workspace <id>]")
 	fmt.Println("  cube cloud quota <account-id>")
 	fmt.Println("  cube cloud relogin <account-id> [--status ready|drain] [--owner cloud|client] [--auth-file <path>]")
 	fmt.Println("  cube cloud borrow-live --account <id-or-label> [--ttl 8h] [--holder manual-direct-codex]")
 	fmt.Println("  cube cloud return-live [--account <id-or-label>] [--lease <lease-id>]")
+	fmt.Println("  cube cloud keepalive-live [--watch] [--interval 60s]")
 	fmt.Println("  cube device status")
 	fmt.Println("  cube device show")
-	fmt.Println("  cube device config --server <url> --token <cube_dev_...> [--id <deviceId>] [--label <name>]")
+	fmt.Println("  cube device config --server <url> --token <cube_dev_...> [--id <deviceId>] [--label <name>] [--workspace <id>]")
 	fmt.Println("  cube run [--server <url>] [--token <token>] [--workspace <id>] [--device <id>] [--device-label <name>] [--heartbeat 20s] [-- codex args...]")
-	fmt.Println("  cube report [--daemon] [--interval 5m] [--device <id>] [--device-label <name>]")
+	fmt.Println("  cube report [--daemon] [--interval 5m] [--workspace <id>] [--device <id>] [--device-label <name>]")
 	fmt.Println("  cube config edit")
 	fmt.Println("  cube config path")
 	fmt.Println("  cube clients list")

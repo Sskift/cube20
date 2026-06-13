@@ -17,6 +17,7 @@ type Settings struct {
 	CloudToken       string `json:"cloudToken" toml:"cloud_token"`
 	DeviceID         string `json:"deviceId,omitempty" toml:"device_id,omitempty"`
 	DeviceLabel      string `json:"deviceLabel,omitempty" toml:"device_label,omitempty"`
+	Workspace        string `json:"workspace,omitempty" toml:"workspace,omitempty"`
 	DatabaseURL      string `json:"databaseUrl" toml:"database_url"`
 }
 
@@ -38,6 +39,9 @@ func applyEnvironmentOverrides(settings Settings) Settings {
 	if value := strings.TrimSpace(os.Getenv("CUBE_DEVICE_LABEL")); value != "" {
 		settings.DeviceLabel = value
 	}
+	if value := strings.TrimSpace(os.Getenv("CUBE_WORKSPACE")); value != "" {
+		settings.Workspace = value
+	}
 	if value := firstNonEmpty(os.Getenv("CUBE_DATABASE_URL"), os.Getenv("DATABASE_URL")); value != "" {
 		settings.DatabaseURL = value
 	}
@@ -55,6 +59,7 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir, sharedConfigPath st
 		SharedConfigPath: m.SharedConfigPath,
 		CloudURL:         m.CloudURL,
 		CloudToken:       m.CloudToken,
+		Workspace:        m.Workspace,
 		DatabaseURL:      m.DatabaseURL,
 	}
 	if strings.TrimSpace(liveCodexHome) != "" {
@@ -75,6 +80,7 @@ func (m *Manager) UpdateSettings(liveCodexHome, accountsDir, sharedConfigPath st
 	m.SharedConfigPath = settings.SharedConfigPath
 	m.CloudURL = settings.CloudURL
 	m.CloudToken = settings.CloudToken
+	m.Workspace = settings.Workspace
 	m.DatabaseURL = settings.DatabaseURL
 	if err := m.Ensure(); err != nil {
 		return Settings{}, err
@@ -88,6 +94,7 @@ func (m *Manager) UpdateCloudSettings(cloudURL, cloudToken string) (Settings, er
 		SharedConfigPath: m.SharedConfigPath,
 		CloudURL:         m.CloudURL,
 		CloudToken:       m.CloudToken,
+		Workspace:        m.Workspace,
 		DatabaseURL:      m.DatabaseURL,
 	}
 	if strings.TrimSpace(cloudURL) != "" {
@@ -104,6 +111,7 @@ func (m *Manager) UpdateCloudSettings(cloudURL, cloudToken string) (Settings, er
 	}
 	m.CloudURL = settings.CloudURL
 	m.CloudToken = settings.CloudToken
+	m.Workspace = settings.Workspace
 	return settings, nil
 }
 
@@ -122,6 +130,7 @@ func (m *Manager) currentSettings() (Settings, error) {
 		SharedConfigPath: m.SharedConfigPath,
 		CloudURL:         m.CloudURL,
 		CloudToken:       m.CloudToken,
+		Workspace:        m.Workspace,
 		DatabaseURL:      m.DatabaseURL,
 	}
 	data, err := os.ReadFile(m.SettingsPath)
@@ -153,7 +162,7 @@ func (m *Manager) DeviceSettings() (Settings, error) {
 // settings.toml. Like UpdateCloudSettings it only overwrites non-empty values
 // and writes atomically; it reads the existing file first so unrelated fields
 // (including device fields the Manager does not mirror) are preserved.
-func (m *Manager) UpdateDeviceSettings(server, token, deviceID, deviceLabel string) (Settings, error) {
+func (m *Manager) UpdateDeviceSettings(server, token, deviceID, deviceLabel, workspace string) (Settings, error) {
 	settings, err := m.currentSettings()
 	if err != nil {
 		return Settings{}, err
@@ -170,6 +179,9 @@ func (m *Manager) UpdateDeviceSettings(server, token, deviceID, deviceLabel stri
 	if strings.TrimSpace(deviceLabel) != "" {
 		settings.DeviceLabel = strings.TrimSpace(deviceLabel)
 	}
+	if strings.TrimSpace(workspace) != "" {
+		settings.Workspace = strings.TrimSpace(workspace)
+	}
 	if settings.LiveCodexHome == "" || settings.AccountsDir == "" {
 		return Settings{}, errors.New("settings paths cannot be empty")
 	}
@@ -178,6 +190,7 @@ func (m *Manager) UpdateDeviceSettings(server, token, deviceID, deviceLabel stri
 	}
 	m.CloudURL = settings.CloudURL
 	m.CloudToken = settings.CloudToken
+	m.Workspace = settings.Workspace
 	return settings, nil
 }
 func (m *Manager) ReadSettingsText() (string, error) {
@@ -192,6 +205,7 @@ func (m *Manager) ReadSettingsText() (string, error) {
 			SharedConfigPath: m.SharedConfigPath,
 			CloudURL:         m.CloudURL,
 			CloudToken:       m.CloudToken,
+			Workspace:        m.Workspace,
 			DatabaseURL:      m.DatabaseURL,
 		}
 		if err := writeSettings(m.SettingsPath, settings); err != nil {
@@ -216,6 +230,7 @@ func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
 		SharedConfigPath: m.SharedConfigPath,
 		CloudURL:         m.CloudURL,
 		CloudToken:       m.CloudToken,
+		Workspace:        m.Workspace,
 		DatabaseURL:      m.DatabaseURL,
 	}, home)
 	if err != nil {
@@ -233,6 +248,7 @@ func (m *Manager) WriteSettingsText(raw string) (Settings, error) {
 	m.SharedConfigPath = settings.SharedConfigPath
 	m.CloudURL = settings.CloudURL
 	m.CloudToken = settings.CloudToken
+	m.Workspace = settings.Workspace
 	m.DatabaseURL = settings.DatabaseURL
 	if err := m.Ensure(); err != nil {
 		return Settings{}, err
@@ -249,6 +265,7 @@ func defaultSettings(home string) Settings {
 		AccountsDir:   filepath.Join(home, defaultAccountsDirName),
 		CloudURL:      strings.TrimSpace(os.Getenv("CUBE_CLOUD_URL")),
 		CloudToken:    strings.TrimSpace(os.Getenv("CUBE_CLOUD_TOKEN")),
+		Workspace:     strings.TrimSpace(os.Getenv("CUBE_WORKSPACE")),
 		DatabaseURL:   firstNonEmpty(os.Getenv("CUBE_DATABASE_URL"), os.Getenv("DATABASE_URL")),
 	}
 }
@@ -296,6 +313,7 @@ func parseSettingsData(data []byte, defaults Settings, home string) (Settings, b
 	settings.AccountsDir = expandPath(settings.AccountsDir, home)
 	settings.CloudURL = strings.TrimSpace(settings.CloudURL)
 	settings.CloudToken = strings.TrimSpace(settings.CloudToken)
+	settings.Workspace = strings.TrimSpace(settings.Workspace)
 	settings.DatabaseURL = strings.TrimSpace(settings.DatabaseURL)
 	return settings, changed, nil
 }
