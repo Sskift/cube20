@@ -333,6 +333,8 @@ type RefreshQueueItem struct {
 	SevenDayRemainingPercent float64          `json:"sevenDayRemainingPercent,omitempty"`
 	SevenDayUsedPercent      float64          `json:"sevenDayUsedPercent,omitempty"`
 	BindingWindow            string           `json:"bindingWindow,omitempty"`
+	ResetCreditsAvailable    *int             `json:"resetCreditsAvailable,omitempty"`
+	ResetCreditsTotal        *int             `json:"resetCreditsTotal,omitempty"`
 	QuotaStatus              quota.Status     `json:"quotaStatus,omitempty"`
 	RefreshOrderReason       string           `json:"refreshOrderReason,omitempty"`
 	OwnerMode                AccountOwnerMode `json:"ownerMode,omitempty"`
@@ -393,7 +395,8 @@ type Manager struct {
 	dbMu sync.Mutex
 	db   *sql.DB
 
-	quotaFetcher func(context.Context, string, time.Time) (quota.Result, error)
+	quotaFetcher  func(context.Context, string, time.Time) (quota.Result, error)
+	quotaResetter func(context.Context, string, time.Time) (quota.Result, error)
 }
 
 func New() (*Manager, error) {

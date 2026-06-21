@@ -138,6 +138,12 @@ func (m *Manager) RefreshQueue() ([]RefreshQueueItem, error) {
 			item.SevenDayRemainingPercent = sevenDay.RemainingPercent
 			item.SevenDayUsedPercent = sevenDay.UsedPercent
 		}
+		if cache.Result.ResetCredits != nil {
+			available := cache.Result.ResetCredits.Available
+			total := cache.Result.ResetCredits.Total
+			item.ResetCreditsAvailable = &available
+			item.ResetCreditsTotal = &total
+		}
 		if binding := bindingWindow(cache.FiveHour, sevenDay); binding != nil {
 			item.ResetsAt = binding.ResetsAt
 			item.RemainingDisplay = binding.RemainingDisplay

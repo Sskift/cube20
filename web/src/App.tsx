@@ -257,6 +257,7 @@ export default function App() {
             if (data.selected) data.saveAccount(data.selected.id, draft);
           }}
           onDelete={(account) => data.deleteAccount(account)}
+          onResetRateLimit={(id) => data.resetRateLimit(id)}
         />
       }
       asideOpen={asideOpen}

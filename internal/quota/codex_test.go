@@ -213,6 +213,39 @@ func TestFetchForCodexHome_DirectAccessTokenSkipsRefresh(t *testing.T) {
 	}
 }
 
+func TestFetchForCodexHome_ReportsRateLimitResetCredits(t *testing.T) {
+	var auth authFileShape
+	auth.Tokens.AccessToken = "already-valid-token"
+	home := writeAuthJSON(t, auth)
+
+	stubSeams(t,
+		func(ctx context.Context, authPath string, raw []byte, refreshToken string) (refreshResponse, error) {
+			t.Fatalf("refresh must not be called when access token is present")
+			return refreshResponse{}, nil
+		},
+		func(ctx context.Context, accessToken, accountID string) (*usageResponse, error) {
+			return &usageResponse{
+				PlanType: "pro",
+				ResetCredits: &ResetCredits{
+					Available: 2,
+					Total:     4,
+				},
+			}, nil
+		},
+	)
+
+	result, err := FetchForCodexHome(context.Background(), home, time.Unix(0, 0).UTC())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.ResetCredits == nil {
+		t.Fatal("ResetCredits is nil, want usage response reset credits")
+	}
+	if result.ResetCredits.Available != 2 || result.ResetCredits.Total != 4 {
+		t.Fatalf("ResetCredits = %+v, want available=2 total=4", result.ResetCredits)
+	}
+}
+
 // TestFetchForCodexHome_MissingAuthFile: no auth.json → not_configured.
 func TestFetchForCodexHome_MissingAuthFile(t *testing.T) {
 	home := t.TempDir() // no auth.json written

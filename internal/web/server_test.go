@@ -28,6 +28,27 @@ func TestAdminTokenCanAccessAdminRoute(t *testing.T) {
 	}
 }
 
+func TestAdminCanRequestRateLimitReset(t *testing.T) {
+	server, _, adminToken, _ := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/work/rate-limit-reset", bytes.NewBufferString(`{}`))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var result quota.Result
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if result.Status != quota.StatusUnsupported {
+		t.Fatalf("status = %q, want %q (body %s)", result.Status, quota.StatusUnsupported, rec.Body.String())
+	}
+}
+
 func TestMissingTokenCannotAccessAdminRoute(t *testing.T) {
 	server, _, _, _ := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)

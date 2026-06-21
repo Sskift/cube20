@@ -106,6 +106,8 @@ The dashboard `Load Balancer` page shows:
 
 - Routing map: in-pool/out-of-pool state, quota, score, reset, and recipient.
 - 5h reset order: next quota reset sequence.
+- Reset-credit count: remaining Codex manual reset credits, with an admin
+  action in account details to consume one server-side reset credit.
 - Dispatch history: recent account-to-client dispatch events.
 
 Heartbeat responses can include a swap hint when an active account is near

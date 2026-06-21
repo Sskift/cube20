@@ -1479,6 +1479,21 @@ func (s *Server) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
+	case "rate-limit-reset":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		result, err := s.Manager.ConsumeRateLimitReset(r.Context(), id)
+		if err != nil {
+			if result.Status != "" {
+				writeJSON(w, http.StatusOK, result)
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	case "usage":
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")

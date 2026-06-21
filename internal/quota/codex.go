@@ -2,7 +2,9 @@ package quota
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,10 +18,12 @@ import (
 )
 
 const (
-	primaryUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
-	fallbackUsageURL = "https://chatgpt.com/api/codex/usage"
-	refreshTokenURL  = "https://auth.openai.com/oauth/token"
-	refreshClientID  = "app_EMoamEEZ73f0CkXaXp7hrann"
+	primaryUsageURL         = "https://chatgpt.com/backend-api/wham/usage"
+	fallbackUsageURL        = "https://chatgpt.com/api/codex/usage"
+	primaryResetConsumeURL  = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+	fallbackResetConsumeURL = "https://chatgpt.com/api/codex/rate-limit-reset-credits/consume"
+	refreshTokenURL         = "https://auth.openai.com/oauth/token"
+	refreshClientID         = "app_EMoamEEZ73f0CkXaXp7hrann"
 )
 
 type Status string
@@ -33,12 +37,13 @@ const (
 )
 
 type Result struct {
-	Status  Status   `json:"status"`
-	Plan    string   `json:"plan,omitempty"`
-	Account string   `json:"account,omitempty"`
-	Source  string   `json:"source,omitempty"`
-	Detail  string   `json:"detail,omitempty"`
-	Quotas  []Window `json:"quotas,omitempty"`
+	Status       Status        `json:"status"`
+	Plan         string        `json:"plan,omitempty"`
+	Account      string        `json:"account,omitempty"`
+	Source       string        `json:"source,omitempty"`
+	Detail       string        `json:"detail,omitempty"`
+	ResetCredits *ResetCredits `json:"resetCredits,omitempty"`
+	Quotas       []Window      `json:"quotas,omitempty"`
 }
 
 type Window struct {
@@ -50,6 +55,68 @@ type Window struct {
 	UsedDisplay      string  `json:"usedDisplay,omitempty"`
 	RemainingDisplay string  `json:"remainingDisplay,omitempty"`
 	Stale            bool    `json:"stale,omitempty"`
+}
+
+type ResetCredits struct {
+	Available int           `json:"available"`
+	Total     int           `json:"total,omitempty"`
+	Credits   []ResetCredit `json:"credits,omitempty"`
+}
+
+type ResetCredit struct {
+	GrantedAt string `json:"grantedAt,omitempty"`
+	ExpiresAt string `json:"expiresAt,omitempty"`
+	Status    string `json:"status,omitempty"`
+}
+
+func (credits *ResetCredits) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Available      *int          `json:"available"`
+		AvailableCount *int          `json:"available_count"`
+		Total          *int          `json:"total"`
+		TotalCount     *int          `json:"total_count"`
+		Credits        []ResetCredit `json:"credits"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.AvailableCount != nil {
+		credits.Available = *raw.AvailableCount
+	} else if raw.Available != nil {
+		credits.Available = *raw.Available
+	}
+	if raw.TotalCount != nil {
+		credits.Total = *raw.TotalCount
+	} else if raw.Total != nil {
+		credits.Total = *raw.Total
+	} else if len(raw.Credits) > credits.Total {
+		credits.Total = len(raw.Credits)
+	}
+	credits.Credits = raw.Credits
+	if credits.Available < 0 {
+		credits.Available = 0
+	}
+	if credits.Total < credits.Available {
+		credits.Total = credits.Available
+	}
+	return nil
+}
+
+func (credit *ResetCredit) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		GrantedAt      string `json:"grantedAt"`
+		GrantedAtSnake string `json:"granted_at"`
+		ExpiresAt      string `json:"expiresAt"`
+		ExpiresAtSnake string `json:"expires_at"`
+		Status         string `json:"status"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	credit.GrantedAt = firstNonBlank(raw.GrantedAt, raw.GrantedAtSnake)
+	credit.ExpiresAt = firstNonBlank(raw.ExpiresAt, raw.ExpiresAtSnake)
+	credit.Status = strings.TrimSpace(raw.Status)
+	return nil
 }
 
 type authFileShape struct {
@@ -80,6 +147,8 @@ type usageResponse struct {
 		PrimaryWindow   *usageWindow `json:"primary_window"`
 		SecondaryWindow *usageWindow `json:"secondary_window"`
 	} `json:"rate_limit"`
+	ResetCredits        *ResetCredits `json:"rate_limit_reset_credits"`
+	ResetCreditsCamel   *ResetCredits `json:"rateLimitResetCredits"`
 	CodeReviewRateLimit struct {
 		PrimaryWindow *usageWindow `json:"primary_window"`
 	} `json:"code_review_rate_limit"`
@@ -196,6 +265,71 @@ func FetchForCodexHome(ctx context.Context, codexHome string, now time.Time) (Re
 	result.Account = accountFromIDToken(auth.Tokens.IDToken)
 	result.Source = "chatgpt.com/backend-api"
 	result.Quotas = windowsFromResponse(response, now)
+	result.ResetCredits = resetCreditsFromResponse(response)
+	return result, nil
+}
+
+func ConsumeRateLimitResetForCodexHome(ctx context.Context, codexHome string, now time.Time) (Result, error) {
+	result := Result{
+		Status: StatusNotConfigured,
+		Detail: "auth.json is missing",
+	}
+
+	authPath := filepath.Join(codexHome, "auth.json")
+	data, err := os.ReadFile(authPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return result, nil
+	}
+	if err != nil {
+		result.Status = StatusError
+		result.Detail = "could not read auth.json"
+		return result, err
+	}
+
+	var auth authFileShape
+	if err := json.Unmarshal(data, &auth); err != nil {
+		result.Status = StatusError
+		result.Detail = "auth.json is not valid JSON"
+		return result, err
+	}
+
+	accessToken := strings.TrimSpace(auth.Tokens.AccessToken)
+	if accessToken == "" {
+		if strings.TrimSpace(auth.OpenAIAPIKey) != "" {
+			result.Status = StatusUnsupported
+			result.Detail = "API-key Codex auth cannot consume ChatGPT Codex reset credits."
+			return result, nil
+		}
+		result.Detail = "auth.json has no OAuth access token"
+		return result, nil
+	}
+	accountID := strings.TrimSpace(auth.Tokens.AccountID)
+	idempotencyKey, err := newRedeemRequestID()
+	if err != nil {
+		result.Status = StatusError
+		result.Detail = "could not create reset request id"
+		return result, err
+	}
+	if err := consumeResetCredit(ctx, accessToken, accountID, idempotencyKey); err != nil {
+		result.Status = StatusError
+		result.Source = "chatgpt.com/backend-api"
+		result.Detail = sanitizeErr(err)
+		return result, err
+	}
+
+	response, err := fetchUsageFn(ctx, accessToken, accountID)
+	if err != nil {
+		result.Status = StatusError
+		result.Source = "chatgpt.com/backend-api"
+		result.Detail = sanitizeErr(err)
+		return result, err
+	}
+	result.Status = StatusSupported
+	result.Plan = response.PlanType
+	result.Account = accountFromIDToken(auth.Tokens.IDToken)
+	result.Source = "chatgpt.com/backend-api"
+	result.Quotas = windowsFromResponse(response, now)
+	result.ResetCredits = resetCreditsFromResponse(response)
 	return result, nil
 }
 
@@ -210,19 +344,90 @@ func fetchUsage(ctx context.Context, accessToken, accountID string) (*usageRespo
 	return nil, err
 }
 
+func consumeResetCredit(ctx context.Context, accessToken, accountID, redeemRequestID string) error {
+	err := doConsumeResetCredit(ctx, primaryResetConsumeURL, accessToken, accountID, redeemRequestID)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, errNotFound) {
+		return doConsumeResetCredit(ctx, fallbackResetConsumeURL, accessToken, accountID, redeemRequestID)
+	}
+	return err
+}
+
+func doConsumeResetCredit(ctx context.Context, endpoint, accessToken, accountID, redeemRequestID string) error {
+	payload, err := json.Marshal(map[string]string{
+		"redeem_request_id": redeemRequestID,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	setCodexHeaders(req, accessToken, accountID)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+	case http.StatusNotFound:
+		return errNotFound
+	case http.StatusUnauthorized:
+		return errUnauthorized
+	case http.StatusForbidden:
+		return errors.New("forbidden")
+	case http.StatusTooManyRequests:
+		return errors.New("rate limited; try again later")
+	default:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		detail := strings.TrimSpace(string(body))
+		if detail == "" {
+			return fmt.Errorf("codex reset returned HTTP %d", resp.StatusCode)
+		}
+		return fmt.Errorf("codex reset returned HTTP %d: %s", resp.StatusCode, detail)
+	}
+
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return err
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return nil
+	}
+	var out struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return fmt.Errorf("invalid reset response: %w", err)
+	}
+	switch strings.TrimSpace(out.Code) {
+	case "", "reset", "already_redeemed":
+		return nil
+	case "nothing_to_reset":
+		return errors.New("nothing to reset")
+	case "no_credit":
+		return errors.New("no reset credits available")
+	default:
+		return fmt.Errorf("unexpected reset response code %q", out.Code)
+	}
+}
+
 func doUsage(ctx context.Context, endpoint, accessToken, accountID string) (*usageResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "cube20/0.1")
-	if accountID != "" {
-		req.Header.Set("X-Account-Id", accountID)
-		req.Header.Set("ChatClaude-Account-Id", accountID)
-		req.Header.Set("ChatGPT-Account-Id", accountID)
-	}
+	setCodexHeaders(req, accessToken, accountID)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -381,6 +586,16 @@ func windowsFromResponse(response *usageResponse, now time.Time) []Window {
 	return windows
 }
 
+func resetCreditsFromResponse(response *usageResponse) *ResetCredits {
+	if response == nil {
+		return nil
+	}
+	if response.ResetCredits != nil {
+		return response.ResetCredits
+	}
+	return response.ResetCreditsCamel
+}
+
 func normalizeWindow(key, label string, input *usageWindow, now time.Time) Window {
 	used := clamp(input.UsedPercent)
 	remaining := clamp(100 - used)
@@ -400,6 +615,31 @@ func normalizeWindow(key, label string, input *usageWindow, now time.Time) Windo
 	return window
 }
 
+func setCodexHeaders(req *http.Request, accessToken, accountID string) {
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("OpenAI-Beta", "codex-1")
+	req.Header.Set("Originator", "Codex Desktop")
+	req.Header.Set("User-Agent", "cube20/0.1")
+	if accountID != "" {
+		req.Header.Set("X-Account-Id", accountID)
+		req.Header.Set("ChatClaude-Account-Id", accountID)
+		req.Header.Set("ChatGPT-Account-Id", accountID)
+		req.Header.Set("ChatGPT-Account-ID", accountID)
+	}
+}
+
+func newRedeemRequestID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(b[:])
+	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32], nil
+}
+
 func clamp(value float64) float64 {
 	if value < 0 {
 		return 0
@@ -408,6 +648,15 @@ func clamp(value float64) float64 {
 		return 100
 	}
 	return value
+}
+
+func firstNonBlank(values ...string) string {
+	for _, value := range values {
+		if text := strings.TrimSpace(value); text != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 func sanitizeErr(err error) string {

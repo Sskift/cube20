@@ -42,6 +42,8 @@ type LoadBalanceAccount struct {
 	QuotaSevenDayUsedPercent      float64          `json:"quotaSevenDayUsedPercent,omitempty"`
 	QuotaSevenDayResetsAt         string           `json:"quotaSevenDayResetsAt,omitempty"`
 	QuotaBindingWindow            string           `json:"quotaBindingWindow,omitempty"`
+	ResetCreditsAvailable         *int             `json:"resetCreditsAvailable,omitempty"`
+	ResetCreditsTotal             *int             `json:"resetCreditsTotal,omitempty"`
 }
 type LoadBalanceStatus struct {
 	Policy        string               `json:"policy"`
@@ -127,6 +129,8 @@ func (m *Manager) LoadBalanceStatus(workspaceID string) (LoadBalanceStatus, erro
 		entry.QuotaSevenDayUsedPercent = evaluation.QuotaSevenDayUsedPercent
 		entry.QuotaSevenDayResetsAt = evaluation.QuotaSevenDayResetsAt
 		entry.QuotaBindingWindow = evaluation.QuotaBindingWindow
+		entry.ResetCreditsAvailable = evaluation.ResetCreditsAvailable
+		entry.ResetCreditsTotal = evaluation.ResetCreditsTotal
 		if entry.Eligible {
 			status.Eligible = append(status.Eligible, entry)
 		} else {
@@ -170,6 +174,8 @@ type loadBalanceEvaluation struct {
 	QuotaSevenDayUsedPercent      float64
 	QuotaSevenDayResetsAt         string
 	QuotaBindingWindow            string
+	ResetCreditsAvailable         *int
+	ResetCreditsTotal             *int
 	RuntimeState                  RuntimeState
 	RuntimeReason                 string
 }
@@ -296,6 +302,12 @@ func loadBalanceQuotaEvaluation(cache QuotaCache, now time.Time) loadBalanceEval
 		evaluation.QuotaSevenDayRemainingPercent = clampPercent(sevenDay.RemainingPercent)
 		evaluation.QuotaSevenDayUsedPercent = clampPercent(sevenDay.UsedPercent)
 		evaluation.QuotaSevenDayResetsAt = sevenDay.ResetsAt
+	}
+	if cache.Result.ResetCredits != nil {
+		available := cache.Result.ResetCredits.Available
+		total := cache.Result.ResetCredits.Total
+		evaluation.ResetCreditsAvailable = &available
+		evaluation.ResetCreditsTotal = &total
 	}
 	binding := bindingWindow(cache.FiveHour, sevenDay)
 	if binding == nil {

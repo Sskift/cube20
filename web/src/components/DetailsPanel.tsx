@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Button, Card, Input } from "@heroui/react";
-import { Database, Save, Trash2 } from "lucide-react";
+import { Database, RotateCcw, Save, Trash2 } from "lucide-react";
 
 import { useLang } from "../i18n";
 import { dispatchEventLabel, dispatchTarget, shortTime } from "../lib/format";
@@ -26,6 +26,7 @@ export function DetailsPanel({
   dispatch,
   onSave,
   onDelete,
+  onResetRateLimit,
 }: {
   selected?: Account;
   busy: boolean;
@@ -34,11 +35,27 @@ export function DetailsPanel({
   dispatch?: DispatchEvent;
   onSave: (draft: { label: string; status: AccountStatus; ownerMode: AccountOwnerMode; ownerClientId?: string }) => void;
   onDelete: (account: Account) => void;
+  onResetRateLimit?: (id: string) => void | Promise<void>;
 }) {
   const { t } = useLang();
   const [label, setLabel] = useState(selected?.label || "");
   const [status, setStatus] = useState<AccountStatus>(selected?.status || "ready");
   const [ownerMode, setOwnerMode] = useState<AccountOwnerMode>(selected?.ownerMode || "cloud");
+  const resetCreditsAvailable = quota?.resetCredits?.available ?? refresh?.resetCreditsAvailable;
+  const resetCreditsTotal = quota?.resetCredits?.total ?? refresh?.resetCreditsTotal;
+  const resetCreditValue =
+    typeof resetCreditsAvailable === "number"
+      ? resetCreditsTotal && resetCreditsTotal > resetCreditsAvailable
+        ? `${resetCreditsAvailable} / ${resetCreditsTotal}`
+        : resetCreditsAvailable.toString()
+      : t("未检测", "not checked");
+  const resetDisabled =
+    busy ||
+    !selected ||
+    !onResetRateLimit ||
+    typeof resetCreditsAvailable !== "number" ||
+    resetCreditsAvailable <= 0 ||
+    selected.ownerMode === "client";
 
   useEffect(() => {
     if (!selected) return;
@@ -109,6 +126,21 @@ export function DetailsPanel({
                 <SignalLine label={t("7d 配额", "7d quota")} value={refresh?.sevenDayRemainingDisplay ? `${refresh.sevenDayRemainingDisplay} ${t("剩余", "left")}` : "-"} />
                 <SignalLine label={t("7d 刷新", "7d reset")} value={refresh?.sevenDayResetsAt ? shortTime(refresh.sevenDayResetsAt) : "-"} />
                 <SignalLine label={t("配额来源", "quota source")} value={refresh?.quotaSource ? `${refresh.quotaSource}${refresh.quotaReporterClientId ? ` · ${refresh.quotaReporterClientId}` : ""}` : quota?.source || "-"} />
+                <SignalLine label={t("主动重置", "manual reset")} value={resetCreditValue} />
+                <Button
+                  className="gap-2"
+                  isDisabled={resetDisabled}
+                  size="sm"
+                  variant="secondary"
+                  onPress={() => {
+                    if (!selected || !onResetRateLimit) return;
+                    const ok = window.confirm(t("将消耗 1 次 Codex 主动额度重置，继续吗？", "Consume 1 Codex rate-limit reset credit?"));
+                    if (ok) void onResetRateLimit(selected.id);
+                  }}
+                >
+                  <RotateCcw size={14} />
+                  {t("重置额度", "Reset usage")}
+                </Button>
                 <SignalLine label={t("代次", "generation")} value={(selected.generation || 0).toString()} />
                 <SignalLine label={t("归属", "owner")} value={selected.ownerMode === "client" ? `client ${selected.ownerClientId || "-"}` : "cloud"} />
                 <SignalLine label={t("运行状态", "runtime")} value={selected.runtimeState || "-"} />

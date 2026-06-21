@@ -189,6 +189,7 @@ function RowDetail({
               : "-"
           }
         />
+        <Detail label={t("主动重置", "manual reset")} value={resetCreditSummary(row.resetCreditsAvailable, row.resetCreditsTotal, t)} />
         <Detail
           label={t("当前租约", "current lease")}
           value={row.leaseActive ? `${dispatchTarget(row.leaseClientId, "", row.leaseHolder)} · ${t("至", "until")} ${shortTime(row.leaseExpiresAt)}` : "-"}
@@ -212,6 +213,12 @@ function RowDetail({
       )}
     </div>
   );
+}
+
+function resetCreditSummary(available: number | undefined, total: number | undefined, t: TranslateFn) {
+  if (typeof available !== "number") return t("未检测", "not checked");
+  if (typeof total === "number" && total > available) return `${available} / ${total}`;
+  return available.toString();
 }
 
 function ManualLeaseActions({

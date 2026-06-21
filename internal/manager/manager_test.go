@@ -871,6 +871,73 @@ func TestFetchQuotaSkipsNetworkWhenLeased(t *testing.T) {
 	}
 }
 
+func TestConsumeRateLimitResetUsesManagedAccountWithoutTouchingAuth(t *testing.T) {
+	m := newTestManager(t)
+	saveTestAccounts(t, m, Account{
+		ID:               "acct",
+		OwnerMode:        OwnerCloud,
+		Status:           StatusReady,
+		Generation:       4,
+		LeaseID:          "lease-active",
+		LeaseClientID:    "c1",
+		LeaseStartedAt:   time.Now().Add(-time.Minute),
+		LeaseHeartbeatAt: time.Now().Add(-30 * time.Second),
+		LeaseExpiresAt:   time.Now().Add(time.Hour),
+	})
+
+	account := getTestAccount(t, m, "acct")
+	authBefore := readTestAuth(t, m, "acct")
+	var resetHome string
+	m.quotaFetcher = func(ctx context.Context, codexHome string, now time.Time) (quota.Result, error) {
+		t.Fatalf("ConsumeRateLimitReset must not use the normal quota fetcher")
+		return quota.Result{}, nil
+	}
+	m.quotaResetter = func(ctx context.Context, codexHome string, now time.Time) (quota.Result, error) {
+		resetHome = codexHome
+		window := quota.Window{
+			Key:              "five_hour",
+			Label:            "5h",
+			UsedPercent:      0,
+			RemainingPercent: 100,
+			UsedDisplay:      "0%",
+			RemainingDisplay: "100%",
+			ResetsAt:         now.Add(5 * time.Hour).UTC().Format(time.RFC3339),
+		}
+		return quota.Result{
+			Status: quota.StatusSupported,
+			Plan:   "pro",
+			ResetCredits: &quota.ResetCredits{
+				Available: 1,
+				Total:     3,
+			},
+			Quotas: []quota.Window{window},
+		}, nil
+	}
+
+	result, err := m.ConsumeRateLimitReset(context.Background(), "acct")
+	if err != nil {
+		t.Fatalf("ConsumeRateLimitReset() error = %v", err)
+	}
+	if resetHome != account.CodexHome {
+		t.Fatalf("resetter codexHome = %q, want managed account home %q", resetHome, account.CodexHome)
+	}
+	if result.ResetCredits == nil || result.ResetCredits.Available != 1 {
+		t.Fatalf("ResetCredits = %+v, want available=1", result.ResetCredits)
+	}
+	if authAfter := readTestAuth(t, m, "acct"); !bytes.Equal(authAfter, authBefore) {
+		t.Fatal("auth.json changed; reset flow touched local managed auth unexpectedly")
+	}
+	after := getTestAccount(t, m, "acct")
+	if after.Generation != 4 {
+		t.Fatalf("generation = %d, want 4 (reset flow must not rewrite auth)", after.Generation)
+	}
+	state := loadTestState(t, m)
+	cache := state.QuotaCache["acct"]
+	if cache.Result.ResetCredits == nil || cache.Result.ResetCredits.Available != 1 {
+		t.Fatalf("cached ResetCredits = %+v, want available=1", cache.Result.ResetCredits)
+	}
+}
+
 func TestUpdateLeasedProfileSnapshotRejectsGenerationConflict(t *testing.T) {
 	m := newTestManager(t)
 	saveTestAccounts(t, m, Account{

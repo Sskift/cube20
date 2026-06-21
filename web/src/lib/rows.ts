@@ -40,6 +40,8 @@ export interface AccountRow {
   sevenDayPercent?: number;
   sevenDayLabel?: string;
   sevenDayResetsAt?: string;
+  resetCreditsAvailable?: number;
+  resetCreditsTotal?: number;
   // lease
   leaseActive: boolean;
   leaseClientId?: string;
@@ -99,6 +101,8 @@ function lbRow(account: LoadBalanceAccount, dispatch: DispatchEvent | undefined,
     sevenDayPercent: account.quotaSevenDayRemainingPercent,
     sevenDayLabel: account.quotaSevenDayRemainingDisplay,
     sevenDayResetsAt: account.quotaSevenDayResetsAt,
+    resetCreditsAvailable: account.resetCreditsAvailable,
+    resetCreditsTotal: account.resetCreditsTotal,
     leaseActive: !!account.leaseActive,
     leaseClientId: account.leaseClientId,
     leaseHolder: account.leaseHolder,

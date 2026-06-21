@@ -182,6 +182,25 @@ export function useDashboardData(t: TranslateFn) {
     [t],
   );
 
+  const resetRateLimit = useCallback(
+    (id: string) =>
+      withBusy(async () => {
+        const result = await apiJSON<QuotaResult>(`/api/accounts/${encodeURIComponent(id)}/rate-limit-reset`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        setQuotas((current) => ({ ...current, [id]: result }));
+        const queue = await apiJSON<RefreshQueueItem[]>("/api/refresh-queue");
+        setRefreshQueue(queue);
+        if (result.status !== "supported") {
+          throw new Error(result.detail || t("主动重置失败", "Rate-limit reset failed"));
+        }
+        setMessage(t("已主动重置额度", "Rate limit reset consumed"));
+        await loadAll(id);
+      }),
+    [withBusy, loadAll, t],
+  );
+
   // ---- Lifecycle: initial load + 3-minute quota polling -------------------
   useEffect(() => {
     void loadAll();
@@ -689,6 +708,7 @@ export function useDashboardData(t: TranslateFn) {
     // actions
     loadAll,
     fetchQuota,
+    resetRateLimit,
     saveAccount,
     deleteAccount,
     uploadFiles,

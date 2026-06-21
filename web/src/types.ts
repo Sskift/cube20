@@ -51,11 +51,24 @@ export interface QuotaItem {
   resetsAt?: string;
 }
 
+export interface ResetCredit {
+  grantedAt?: string;
+  expiresAt?: string;
+  status?: string;
+}
+
+export interface ResetCredits {
+  available: number;
+  total?: number;
+  credits?: ResetCredit[];
+}
+
 export interface QuotaResult {
   status: string;
   plan?: string;
   source?: string;
   detail?: string;
+  resetCredits?: ResetCredits;
   quotas?: QuotaItem[];
 }
 
@@ -225,6 +238,8 @@ export interface RefreshQueueItem {
   sevenDayRemainingDisplay?: string;
   sevenDayRemainingPercent?: number;
   sevenDayUsedPercent?: number;
+  resetCreditsAvailable?: number;
+  resetCreditsTotal?: number;
   bindingWindow?: string;
   quotaStatus?: string;
   refreshOrderReason?: string;
@@ -272,6 +287,8 @@ export interface LoadBalanceAccount {
   quotaSevenDayUsedPercent?: number;
   quotaSevenDayResetsAt?: string;
   quotaBindingWindow?: string;
+  resetCreditsAvailable?: number;
+  resetCreditsTotal?: number;
 }
 
 export interface LoadBalanceStatus {

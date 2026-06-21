@@ -322,6 +322,10 @@ process.
 For cloud-owned accounts, dashboard refresh and `cube cloud quota <id>` are
 server-side refreshes. For client-owned accounts, those same cloud reads return
 the latest client-reported cache instead of refreshing the server copy.
+When the upstream Codex usage response includes reset-credit telemetry, the
+dashboard surfaces the remaining manual reset count and lets an admin consume
+one reset credit from the account detail panel. The reset action uses the
+server-managed account snapshot and does not rewrite local Codex auth.
 
 ## Cloud API
 
@@ -394,7 +398,7 @@ from an API key.
 `cube run` summarizes the temporary Codex session JSONL files after Codex exits
 and uploads today, seven-day, all-time, and per-model token totals to the cloud.
 The dashboard shows the cleaned account view, connected clients, per-account
-usage, dispatch history, and the 5h quota refresh queue.
+usage, dispatch history, reset-credit count, and the 5h quota refresh queue.
 
 Postgres deployments also keep per-run/per-model rows in `cube_usage_events`.
 The current dashboard still reads the compact `cube_usage` summary; the event

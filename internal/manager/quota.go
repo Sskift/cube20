@@ -64,6 +64,28 @@ func (m *Manager) FetchQuota(ctx context.Context, id string) (quota.Result, erro
 	return result, err
 }
 
+func (m *Manager) ConsumeRateLimitReset(ctx context.Context, id string) (quota.Result, error) {
+	account, err := m.GetAccount(id)
+	if err != nil {
+		return quota.Result{}, err
+	}
+	if account.OwnerMode == OwnerClient {
+		return quota.Result{
+			Status: quota.StatusError,
+			Source: "client report",
+			Detail: "client-owned account; reset must be performed by the owning device",
+		}, fmt.Errorf("client-owned account")
+	}
+	now := time.Now()
+	resetter := m.quotaResetter
+	if resetter == nil {
+		resetter = quota.ConsumeRateLimitResetForCodexHome
+	}
+	result, err := resetter(ctx, account.CodexHome, now)
+	_ = m.recordQuotaResult(id, result, false, QuotaSourceCloud, "", false)
+	return result, err
+}
+
 // leaseActiveFresh reloads the account and reports whether it is currently
 // lease-active. In file mode the reload runs under the round-robin lock so a
 // concurrent lease write is observed; the lock is always released before the
